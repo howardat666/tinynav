@@ -8,6 +8,8 @@
 - 新增 `rtk_fusion_node.py`：融合 `/slam/odometry` 和 `/rtk/odom`，输出 `/slam/odometry_fused`。
 - TinyNav 导航节点默认行为不变；RTK 模式下通过参数或脚本让控制/导航消费 `/slam/odometry_fused`。
 - RTK 状态不好时自动退回 VIO，不让定位跳变直接影响底盘。
+- 建图/采集阶段记录 RTK topic，先保存原始 RTK odom，不做复杂地图地理坐标绑定。
+- 特征少/VIO 不稳时，建图可以选择使用 `/slam/odometry_fused` 作为 keyframe odom。
 
 ## 1. RTK Bridge 必须稳定
 
@@ -28,10 +30,11 @@
 
 ## 2. RTK/VIO 融合定位
 
-新增：
+已新增：
 
 - `rtk/rtk_fusion_node.py`
   - 输入：`/slam/odometry`、`/rtk/odom`。
+  - 输入：`/fix`。
   - 输出：`/slam/odometry_fused`、`/rtk/fusion_status`。
 
 第一版融合策略：
@@ -40,6 +43,7 @@
 - RTK 负责低频全局位置修正。
 - 维护一个慢变化 offset，把 VIO 世界坐标逐步拉向 RTK 世界坐标。
 - RTK 状态不好时不融合。
+- `/fix.status.status` 不达标时不融合。
 - RTK 跳变过大、速度不合理、时间戳太旧时拒绝本帧。
 - heading 未实测确认前，只融合位置，不融合 yaw。
 
@@ -51,12 +55,14 @@
 
 ## 3. 接入 TinyNav 导航
 
-准备写/改：
+已写/改：
 
 - `tinynav/platforms/cmd_vel_control.py`
   - 把 odom topic 参数化。
   - 默认仍是 `/slam/odometry`。
   - RTK 模式传入 `/slam/odometry_fused`。
+准备写/改：
+
 - 可选：`tinynav/core/map_node.py`
   - continuous odom topic 参数化。
   - 默认仍是 `/slam/odometry`。
@@ -70,7 +76,7 @@
 
 ## 4. MVP 启动脚本
 
-新增：
+已新增：
 
 - `scripts/run_rtk.sh`
   - 只启动 `rtk_bridge_node.py`，方便单独调试 RTK。
@@ -79,6 +85,24 @@
   - 启动 `rtk_fusion_node.py`。
   - 启动 TinyNav perception/planning/map/control。
   - 控制节点订阅 `/slam/odometry_fused`。
+  - 默认 6 个 tmux pane，不启动 RViz/POI；需要时用 `RUN_RVIZ=1`、`RUN_POIS=1`。
+
+## 5. 建图/采集记录 RTK
+
+已写/改：
+
+- `tinynav/core/build_map_node.py`
+  - 订阅 `/rtk/odom`。
+  - 保存 `rtk_continuous_odom.npy`。
+  - `--use_rtk_fused_odom_for_mapping` 打开时，用最近的 `/slam/odometry_fused` 替代 raw keyframe odom。
+- `scripts/run_rosbag_record.sh`
+  - 录制 `/fix`、`/rtk/odom`、`/rtk/status`、`/rtk/fusion_status`。
+
+后续再做：
+
+- 保存 RTK origin LLA。
+- 估计并保存 map 和 RTK 坐标系对齐关系。
+- 经纬度 POI。
 
 验收标准：
 
@@ -91,7 +115,7 @@
 
 - RTK logger 和完整离线分析工具。
 - RTK 与 TinyNav 坐标系的独立 alignment 节点。
-- 建图阶段保存 `rtk_origin_lla.npy`、`rtk_poses.npy`、`map_rtk_alignment.npy`。
+- 建图阶段保存 `rtk_origin_lla.npy` 和 `map_rtk_alignment.npy`。
 - 经纬度 POI 和 app 前端显示。
 - 完整 RViz/PlotJuggler 调试面板。
 

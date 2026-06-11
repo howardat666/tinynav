@@ -17,9 +17,12 @@ class CmdVelControlNode(Node):
     def __init__(self):
         super().__init__('cmd_vel_control_node')
         self.logger = self.get_logger()  # Use ROS2 logger
+        self.declare_parameter("odom_topic", "/slam/odometry")
+        odom_topic = self.get_parameter("odom_topic").value
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.pose_sub = self.create_subscription(Odometry, '/slam/odometry', self.pose_callback, 10)
+        self.pose_sub = self.create_subscription(Odometry, odom_topic, self.pose_callback, 10)
         self.create_subscription(Path, '/planning/trajectory_path', self.path_callback, 10)
+        self.logger.info(f"cmd_vel_control using odom topic: {odom_topic}")
         self.T_robot_to_camera = np.array([
             [0, -1, 0, 0],
             [0, 0, -1, 0],

@@ -51,6 +51,9 @@ class BuildMapArgs:
     # Minimum growth in keyframe count before running global pose-graph solve + TF republish.
     # Mirrors COLMAP IncrementalPipeline::ba_global_frames_ratio (default 1.1).
     global_frames_ratio: float = 1.1
+    use_rtk_fused_odom_for_mapping: bool = False
+    fused_odom_topic: str = "/slam/odometry_fused"
+    fused_odom_max_age_s: float = 0.2
 
 
 def check_global_frames_ratio(num_frames: int, prev_num_frames: int, frames_ratio: float) -> bool:
@@ -557,12 +560,20 @@ class BuildMapNode(Node):
         map_save_path: str,
         verbose_timer: bool = True,
         global_frames_ratio: float = 1.1,
+        use_rtk_fused_odom_for_mapping: bool = False,
+        fused_odom_topic: str = "/slam/odometry_fused",
+        fused_odom_max_age_s: float = 0.2,
     ):
         super().__init__('build_map_node')
         if global_frames_ratio < 1.0:
             raise ValueError(f"global_frames_ratio must be >= 1.0, got {global_frames_ratio}")
         self.verbose_timer = verbose_timer
         self.global_frames_ratio = global_frames_ratio
+        self.use_rtk_fused_odom_for_mapping = use_rtk_fused_odom_for_mapping
+        self.fused_odom_max_age_ns = int(fused_odom_max_age_s * 1e9)
+        self.fused_odom_buffer: Dict[int, np.ndarray] = {}
+        self.fused_keyframe_count = 0
+        self.raw_keyframe_count = 0
         # Keyframe count at the last global refinement (COLMAP: ba_prev_num_reg_frames).
         self._global_prev_num_frames = 0
         self.logger = logging.getLogger(__name__)
@@ -583,6 +594,10 @@ class BuildMapNode(Node):
         self.keyframe_odom_sub = Subscriber(self, Odometry, '/slam/keyframe_odom')
         self.rgb_image_sub = Subscriber(self, Image, '/camera/camera/color/image_raw')
         self.continuous_odom_sub = self.create_subscription(Odometry, '/slam/odometry', self.continuous_odom_callback, 100)
+        self.rtk_odom_sub = self.create_subscription(Odometry, '/rtk/odom', self.rtk_odom_callback, 20)
+        if self.use_rtk_fused_odom_for_mapping:
+            self.fused_odom_sub = self.create_subscription(Odometry, fused_odom_topic, self.fused_odom_callback, 100)
+            self.get_logger().info(f"Mapping will use nearest fused odom from {fused_odom_topic}")
 
         self.marker_pub = self.create_publisher(MarkerArray, '/mapping/pointcloud_markers', 10)
         self.local_map_pub = self.create_publisher(PointCloud2, "/mapping/local_map", 10)
@@ -606,6 +621,7 @@ class BuildMapNode(Node):
         self.relative_pose_constraint = []
         self.last_keyframe_timestamp = None
         self.continuous_odom_recorder = OdomPoseRecorder(map_save_path, "mapping")
+        self.rtk_odom_recorder = OdomPoseRecorder(map_save_path, "rtk")
 
         os.makedirs(f"{map_save_path}", exist_ok=True)
         self.db = TinyNavDB(map_save_path)
@@ -679,6 +695,34 @@ class BuildMapNode(Node):
     def continuous_odom_callback(self, odom_msg: Odometry):
         self.continuous_odom_recorder.record_odometry_msg(odom_msg)
 
+    def rtk_odom_callback(self, odom_msg: Odometry):
+        self.rtk_odom_recorder.record_odometry_msg(odom_msg)
+
+    def fused_odom_callback(self, odom_msg: Odometry):
+        timestamp_ns = int(odom_msg.header.stamp.sec * 1e9) + int(odom_msg.header.stamp.nanosec)
+        pose, _ = msg2np(odom_msg)
+        self.fused_odom_buffer[timestamp_ns] = pose
+        if len(self.fused_odom_buffer) > 5000:
+            oldest = sorted(self.fused_odom_buffer.keys())[:1000]
+            for key in oldest:
+                del self.fused_odom_buffer[key]
+
+    def get_mapping_odom(self, keyframe_timestamp_ns: int, keyframe_odom_msg: Odometry) -> np.ndarray:
+        raw_odom, _ = msg2np(keyframe_odom_msg)
+        if not self.use_rtk_fused_odom_for_mapping or not self.fused_odom_buffer:
+            self.raw_keyframe_count += 1
+            return raw_odom
+        nearest_timestamp = min(self.fused_odom_buffer.keys(), key=lambda t: abs(t - keyframe_timestamp_ns))
+        age_ns = abs(nearest_timestamp - keyframe_timestamp_ns)
+        if age_ns > self.fused_odom_max_age_ns:
+            self.raw_keyframe_count += 1
+            self.get_logger().warning(
+                f"No fused odom close to keyframe; age={age_ns / 1e9:.3f}s, using raw keyframe odom"
+            )
+            return raw_odom
+        self.fused_keyframe_count += 1
+        return self.fused_odom_buffer[nearest_timestamp]
+
     def mapping_stop_callback(self, msg: Bool):
         if msg.data:
             self.get_logger().info("Received benchmark stop signal, starting save process...")
@@ -714,7 +758,7 @@ class BuildMapNode(Node):
                 self.get_logger().error(f"Keyframe timestamp mismatch: {keyframe_image_timestamp} != {keyframe_odom_timestamp} != {keyframe_depth_timestamp}")
 
             depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding="32FC1")
-            odom, _ = msg2np(keyframe_odom_msg)
+            odom = self.get_mapping_odom(keyframe_image_timestamp, keyframe_odom_msg)
             infra1_image = self.bridge.imgmsg_to_cv2(keyframe_image_msg, desired_encoding="mono8")
             rgb_image = self.bridge.imgmsg_to_cv2(rgb_image_msg, desired_encoding="bgr8")
 
@@ -838,6 +882,7 @@ class BuildMapNode(Node):
 
         # Save continuous poses
         self.continuous_odom_recorder.save_to_disk()
+        self.rtk_odom_recorder.save_to_disk()
 
         with self.stage_timer.timed("final_pose_graph"):
             self.pose_graph_used_pose = solve_pose_graph(self.pose_graph_used_pose, self.relative_pose_constraint)
@@ -847,6 +892,15 @@ class BuildMapNode(Node):
         self._global_prev_num_frames = len(self.pose_graph_used_pose)
 
         np.save(f"{self.map_save_path}/poses.npy", self.pose_graph_used_pose, allow_pickle = True)
+        np.save(
+            f"{self.map_save_path}/rtk_mapping_stats.npy",
+            {
+                "use_rtk_fused_odom_for_mapping": self.use_rtk_fused_odom_for_mapping,
+                "fused_keyframe_count": self.fused_keyframe_count,
+                "raw_keyframe_count": self.raw_keyframe_count,
+            },
+            allow_pickle=True,
+        )
         np.save(f"{self.map_save_path}/intrinsics.npy", self.K)
         np.save(f"{self.map_save_path}/baseline.npy", self.baseline)
         print(f"T_rgb_to_infra1: {self.T_rgb_to_infra1}")
@@ -1013,6 +1067,9 @@ if __name__ == '__main__':
         parsed_args.map_save_path,
         verbose_timer=parsed_args.verbose_timer,
         global_frames_ratio=parsed_args.global_frames_ratio,
+        use_rtk_fused_odom_for_mapping=parsed_args.use_rtk_fused_odom_for_mapping,
+        fused_odom_topic=parsed_args.fused_odom_topic,
+        fused_odom_max_age_s=parsed_args.fused_odom_max_age_s,
     )
     image_transports_node = ImageTransportsNode()
     exec_.add_node(player_node)
