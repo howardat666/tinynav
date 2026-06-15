@@ -22,6 +22,15 @@
 115200
 ```
 
+当前推荐的数据流：
+
+```text
+NTRIP caster -> RTCM -> /dev/ttyTHS1 -> RTK board
+RTK board -> NMEA -> /dev/ttyCH341USB0 -> rtk_bridge_node.py
+```
+
+如果使用同一个串口收发，也可以通过 ROS 参数覆盖 `serial_port`、`rtcm_serial_port`、`baud`、`rtcm_baud`。
+
 运行前传入 NTRIP 账号和密码：
 
 ```bash
@@ -50,15 +59,28 @@ bash /tinynav/scripts/run_rtk.sh
 uv run python /tinynav/rtk/rtk_bridge_node.py --ros-args -p ntrip_enabled:=false
 ```
 
-主要输出：
+主要输出 topic：
 
-- `/fix`
-- `/heading`
-- `/vel`
-- `/time_reference`
-- `/rtk/odom`
-- `/rtk/path`
-- `/rtk/status`
+| Topic | 类型 | 作用 | 发布频率/触发条件 |
+| --- | --- | --- | --- |
+| `/rtk/io_status` | `std_msgs/String` JSON | 串口/NTRIP/RTCM 调试状态，重点看 `last_nmea_age_s`、`last_rtcm_age_s`、`rtcm_written_bytes`、`rtcm_dropped_bytes`、`ntrip_gga_source` | 固定 1 Hz |
+| `/rtk/status` | `std_msgs/String` JSON | 定位状态摘要，重点看 `accepted`、`gga_quality`、卫星数、HDOP、经纬度、ENU、最近 GGA | 固定 1 Hz |
+| `/rtk/nmea_sentence` | `std_msgs/String` | 过滤后的 NMEA 句子镜像，默认只转发 GGA，便于观察定位输入 | 每收到匹配 `raw_sentence_types` 的 NMEA 就发布；默认约等于 GGA 频率 |
+| `/fix` | `sensor_msgs/NavSatFix` | 从 GGA 解析出的经纬度、高程和 GNSS 状态 | 每收到一条带经纬度的 GGA 就发布；室内 GGA 为空时不发布 |
+| `/time_reference` | `sensor_msgs/TimeReference` | GGA UTC 时间参考 | 跟 `/fix` 一样，由有效 GGA 触发 |
+| `/vel` | `geometry_msgs/TwistStamped` | 从 RMC 解析的地速和航向速度分量 | 每收到一条有效 RMC 就发布 |
+| `/heading` | `geometry_msgs/QuaternionStamped` | 从 HDT/THS 解析的 heading | 每收到一条 HDT 或 THS 就发布 |
+| `/rtk/odom` | `nav_msgs/Odometry` | 经纬度转换到本地 ENU 后的 RTK 里程计 | 每收到一条达到 `min_navsat_status` 的 GGA 就发布 |
+| `/rtk/path` | `nav_msgs/Path` | `/rtk/odom` 的轨迹累计 | 跟 `/rtk/odom` 一样 |
+
+频率说明：
+
+- `/rtk/status` 和 `/rtk/io_status` 是定时 1 Hz，室内无定位也会发布。
+- `/rtk/nmea_sentence` 由 `raw_sentence_types` 过滤后发布，默认 `GGA`。要转发全部 NMEA，可传 `-p raw_sentence_types:=ALL`；要同时看 GGA/RMC/THS，可传 `-p raw_sentence_types:=GGA,RMC,THS`。
+- `/tmp/rtk_nmea` 始终镜像全部收到的 NMEA，适合本机快速看原始串口输出。
+- `/fix`、`/time_reference` 依赖 GGA 里有经纬度；室内常见 `$GNGGA,xxxx,,,,,0,...` 不会发布 `/fix`。
+- `/rtk/odom`、`/rtk/path` 还需要 GGA 状态达到 `min_navsat_status`。默认 `min_navsat_status=STATUS_FIX`，即普通 fix/dgps/float/fixed 都可产生 odom；如果要只接受 RTK fixed/float，可提高该参数。
+- NTRIP GGA 回传周期由 `ntrip_gga_period_s` 决定，默认 1 Hz。`ntrip_gga_source=live` 表示正在用实时 GGA 给 caster；`initial` 表示当前实时 GGA 没有经纬度，只能用初始 GGA。
 
 ## 1. 采数据
 
@@ -92,6 +114,7 @@ bash /tinynav/scripts/run_rosbag_record.sh
 检查 RTK 是否正在被录：
 
 ```bash
+ros2 topic echo /rtk/io_status --field data
 ros2 topic echo /rtk/status
 ros2 topic echo /rtk/odom
 ```
@@ -217,7 +240,9 @@ RTK 淡出条件：
 RTK 输入：
 
 ```bash
+ros2 topic echo /rtk/io_status --field data
 ros2 topic echo /rtk/status
+ros2 topic echo /rtk/nmea_sentence --field data
 ros2 topic echo /rtk/odom
 ros2 topic echo /fix
 cat /tmp/rtk_nmea
@@ -238,8 +263,20 @@ ls /tinynav/output/map_go2_looper/rtk_continuous_odom.npy
 
 判断标准：
 
+- `/rtk/io_status` 里 `last_nmea_age_s < 2`、`last_rtcm_age_s < 2`、`rtcm_dropped_bytes=0`。
+- `/rtk/io_status` 里 `ntrip_gga_source=live`，说明 caster 收到的是实时位置 GGA。
 - `/rtk/status` 里 `accepted=true`。
 - 推车移动时 `/rtk/odom` 以米为单位变化。
 - `/rtk/fusion_status` 里 `offset_ready=true`。
 - 行走一段距离后 `alignment_ready=true`。
 - `/slam/odometry_fused` 连续、平滑，没有瞬间米级跳变。
+
+户外如果怀疑 NMEA 更新不及时，按这个顺序查：
+
+1. 看 `/rtk/io_status`：`last_nmea_age_s` 和 `last_gga_age_s` 是否持续小于 2 秒。
+2. 看计数：`nmea_sentence_count`、`nmea_gga_count` 是否持续增长。如果总数增长但 GGA 不增长，说明板子没有持续输出 GGA。
+3. 看 `/rtk/nmea_sentence --field data`：默认只显示 GGA，适合确认 GGA 是否带经纬度、quality 是否从 0 变成 1/2/4/5。
+4. 看 `cat /tmp/rtk_nmea`：如果需要确认 THS/RMC 等其它句子是否把串口刷得太满，这里能看到全部 NMEA。
+5. 看 `/rtk/io_status`：`rtcm_written_bytes` 是否持续增长，`rtcm_dropped_bytes` 是否为 0，`ntrip_gga_source` 是否为 `live`。
+
+需要复盘现场问题时，录 bag 至少保留 `/rtk/io_status`、`/rtk/status`、`/fix`、`/rtk/odom`。`/rtk/nmea_sentence` 默认只含 GGA，数据量不大；如果要完整原始 NMEA，单独保存 `cat /tmp/rtk_nmea` 输出或用 `raw_sentence_types:=ALL` 临时打开。

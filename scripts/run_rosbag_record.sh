@@ -42,5 +42,6 @@ ros2 bag record \
     /fix \
     /rtk/odom \
     /rtk/status \
+    /rtk/io_status \
     /rtk/fusion_status \
     /tf_static

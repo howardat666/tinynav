@@ -169,19 +169,52 @@ class RtkBridgeNode(Node):
         self.serial_enabled = bool(self.get_parameter("serial_enabled").value)
         self.serial_port = self.get_parameter("serial_port").value
         self.baud = int(self.get_parameter("baud").value)
+        self.rtcm_serial_port = self.get_parameter("rtcm_serial_port").value or self.serial_port
+        self.rtcm_baud = int(self.get_parameter("rtcm_baud").value) or self.baud
         self.ntrip_enabled = bool(self.get_parameter("ntrip_enabled").value)
         self.raw_pty_enabled = bool(self.get_parameter("raw_pty_enabled").value)
         self.raw_pty_path = self.get_parameter("raw_pty_path").value
+        self.raw_sentence_types = self._parse_sentence_type_filter(self.get_parameter("raw_sentence_types").value)
 
         self.origin = self._load_origin_from_params()
         self.latest_fix: NavSatFix | None = None
         self.latest_gga = ""
+        self.latest_position_gga = ""
+        self.latest_gga_quality = 0
+        self.latest_num_satellites = 0
+        self.latest_hdop = float("nan")
+        self.latest_gga_utc = ""
+        self.latest_gga_differential_age = None
+        self.latest_gga_station_id = ""
+        self.latest_sentence = ""
+        self.latest_sentence_type = ""
+        self.last_gga_time = None
+        self.nmea_checksum_fail_count = 0
+        self.nmea_sentence_count = 0
+        self.nmea_gga_count = 0
+        self.nmea_rmc_count = 0
+        self.nmea_heading_count = 0
+        self.raw_sentence_publish_count = 0
+        self.status_seq = 0
         self.latest_heading_yaw = 0.0
         self.latest_heading_stamp = None
         self.latest_velocity = np.zeros(3, dtype=np.float64)
         self.latest_velocity_stamp = None
         self.latest_time_reference = None
+        self.last_nmea_time = None
+        self.ntrip_connected = False
+        self.ntrip_connect_count = 0
+        self.ntrip_disconnect_count = 0
+        self.last_rtcm_time = None
+        self.rtcm_bytes = 0
+        self.rtcm_written_bytes = 0
+        self.rtcm_dropped_bytes = 0
+        self.rtcm_write_fail_count = 0
+        self.latest_ntrip_gga_source = "none"
+        self.latest_enu = None
         self.serial_fd = None
+        self.nmea_fd = None
+        self.rtcm_fd = None
         self.raw_pty_master = None
         self.stop_event = threading.Event()
         self.path = Path()
@@ -194,8 +227,10 @@ class RtkBridgeNode(Node):
         self.odom_pub = self.create_publisher(Odometry, self.get_parameter("odom_topic").value, 10)
         self.path_pub = self.create_publisher(Path, self.get_parameter("path_topic").value, 10)
         self.status_pub = self.create_publisher(String, self.get_parameter("status_topic").value, 10)
+        self.io_status_pub = self.create_publisher(String, self.get_parameter("io_status_topic").value, 10)
         self.raw_pub = self.create_publisher(String, self.get_parameter("raw_sentence_topic").value, 50)
         self.tf_broadcaster = TransformBroadcaster(self)
+        self.status_timer = self.create_timer(1.0, self._publish_status_timer)
 
         if self.raw_pty_enabled:
             self._setup_raw_pty()
@@ -218,6 +253,7 @@ class RtkBridgeNode(Node):
         self.declare_parameter("odom_topic", "/rtk/odom")
         self.declare_parameter("path_topic", "/rtk/path")
         self.declare_parameter("status_topic", "/rtk/status")
+        self.declare_parameter("io_status_topic", "/rtk/io_status")
         self.declare_parameter("raw_sentence_topic", "/rtk/nmea_sentence")
         self.declare_parameter("frame_id", "rtk_world")
         self.declare_parameter("child_frame_id", "rtk_base")
@@ -233,17 +269,29 @@ class RtkBridgeNode(Node):
         self.declare_parameter("serial_enabled", True)
         self.declare_parameter("serial_port", "/dev/ttyCH341USB0")
         self.declare_parameter("baud", 115200)
+        self.declare_parameter("rtcm_serial_port", "")
+        self.declare_parameter("rtcm_baud", 0)
+        self.declare_parameter("split_same_serial_fd", True)
+        self.declare_parameter("serial_read_only", True)
+        self.declare_parameter("serial_init_commands", "")
+        self.declare_parameter("rtcm_serial_init_commands", "")
         self.declare_parameter("raw_pty_enabled", True)
         self.declare_parameter("raw_pty_path", "/tmp/rtk_nmea")
+        self.declare_parameter("raw_sentence_types", "GGA")
         self.declare_parameter("ntrip_enabled", True)
         self.declare_parameter("ntrip_host", os.environ.get("TINYNAV_NTRIP_HOST", "120.253.239.161"))
         self.declare_parameter("ntrip_port", int(os.environ.get("TINYNAV_NTRIP_PORT", "8002")))
         self.declare_parameter("ntrip_mountpoint", os.environ.get("TINYNAV_NTRIP_MOUNTPOINT", "RTCM33_GRCEJ"))
         self.declare_parameter("ntrip_user", os.environ.get("TINYNAV_NTRIP_USER", ""))
         self.declare_parameter("ntrip_password", os.environ.get("TINYNAV_NTRIP_PASSWORD", ""))
+        self.declare_parameter("ntrip_request_version", os.environ.get("TINYNAV_NTRIP_REQUEST_VERSION", "1.0"))
         self.declare_parameter("ntrip_initial_gga", os.environ.get("TINYNAV_NTRIP_INITIAL_GGA", "$GNGGA,085520.00,2246.89808758,N,11330.83046100,E,1,17,1.1,5.5866,M,-5.5511,M,,*6F"))
-        self.declare_parameter("ntrip_gga_period_s", 5.0)
+        self.declare_parameter("ntrip_gga_period_s", 1.0)
         self.declare_parameter("ntrip_reconnect_s", 3.0)
+        self.declare_parameter("ntrip_recv_timeout_s", 1.0)
+        self.declare_parameter("rtcm_write_timeout_s", 0.25)
+        self.declare_parameter("fix_stale_after_s", 2.0)
+        self.declare_parameter("strict_nmea_checksum", False)
 
     def _setup_raw_pty(self):
         master, slave = pty.openpty()
@@ -258,26 +306,80 @@ class RtkBridgeNode(Node):
         self.get_logger().info(f"Raw NMEA mirror: cat {self.raw_pty_path}")
 
     def _open_serial(self):
-        self.serial_fd = os.open(self.serial_port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
-        set_serial_raw(self.serial_fd, self.baud)
+        if self.rtcm_serial_port == self.serial_port and self.rtcm_baud != self.baud:
+            raise ValueError("rtcm_baud cannot differ from baud when both streams use the same serial port")
+        split_same_port = self.rtcm_serial_port == self.serial_port and bool(
+            self.get_parameter("split_same_serial_fd").value
+        )
+        read_only = bool(self.get_parameter("serial_read_only").value)
+        nmea_flags = os.O_RDWR if self.rtcm_serial_port == self.serial_port and not split_same_port else (
+            os.O_RDONLY if read_only else os.O_RDWR
+        )
+        self.nmea_fd = os.open(self.serial_port, nmea_flags | os.O_NOCTTY | os.O_NONBLOCK)
+        set_serial_raw(self.nmea_fd, self.baud)
+        self.serial_fd = self.nmea_fd
         self.get_logger().info(f"Opened RTK serial {self.serial_port} at {self.baud}")
+        self._send_serial_init_commands(self.nmea_fd, "serial_init_commands", self.serial_port)
+        if self.rtcm_serial_port == self.serial_port:
+            if split_same_port:
+                self.rtcm_fd = os.open(self.rtcm_serial_port, os.O_WRONLY | os.O_NOCTTY | os.O_NONBLOCK)
+                set_serial_raw(self.rtcm_fd, self.rtcm_baud)
+                self.get_logger().info(f"Opened RTCM writer on {self.rtcm_serial_port} at {self.rtcm_baud}")
+            else:
+                self.rtcm_fd = self.nmea_fd
+        else:
+            self.rtcm_fd = os.open(self.rtcm_serial_port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+            set_serial_raw(self.rtcm_fd, self.rtcm_baud)
+            self.get_logger().info(f"Opened RTCM serial {self.rtcm_serial_port} at {self.rtcm_baud}")
+            self._send_serial_init_commands(self.rtcm_fd, "rtcm_serial_init_commands", self.rtcm_serial_port)
+
+    def _send_serial_init_commands(self, fd: int, param_name: str, port: str):
+        commands = str(self.get_parameter(param_name).value or "")
+        for command in commands.split(";"):
+            command = command.strip()
+            if not command:
+                continue
+            payload = command.encode("ascii") + b"\r\n"
+            written = self._write_fd(fd, payload, timeout_s=0.5)
+            if written == len(payload):
+                self.get_logger().info(f"Sent init command to {port}: {command}")
+            else:
+                self.get_logger().warning(f"Could not fully send init command to {port}: {command}")
 
     def _serial_loop(self):
         buf = b""
         while not self.stop_event.is_set():
             try:
-                readable, _, _ = select.select([self.serial_fd], [], [], 0.2)
+                readable, _, _ = select.select([self.nmea_fd], [], [], 0.2)
                 if not readable:
                     continue
-                data = os.read(self.serial_fd, 4096)
+                data = os.read(self.nmea_fd, 4096)
                 if not data:
                     continue
                 buf += data
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    line = line.strip(b"\r").decode("ascii", errors="ignore").strip()
-                    if line:
+
+                while True:
+                    cr_pos = buf.find(b"\r")
+                    lf_pos = buf.find(b"\n")
+
+                    if cr_pos == -1 and lf_pos == -1:
+                        break
+
+                    if cr_pos != -1 and (lf_pos == -1 or cr_pos < lf_pos):
+                        split_pos = cr_pos
+                    else:
+                        split_pos = lf_pos
+
+                    line = buf[:split_pos]
+                    buf = buf[split_pos+1:]
+
+                    if buf.startswith(b"\r") or buf.startswith(b"\n"):
+                        buf = buf[1:]
+
+                    line = line.decode("ascii", errors="ignore").strip()
+                    if line and line.startswith("$"):
                         self._handle_nmea_line(line)
+
             except Exception as exc:
                 self.get_logger().error(f"Serial read error: {exc}")
                 time.sleep(1.0)
@@ -285,30 +387,95 @@ class RtkBridgeNode(Node):
     def _ntrip_loop(self):
         while not self.stop_event.is_set():
             sock = None
+            last_sent_gga_source = "none"
             try:
-                sock = self._connect_ntrip()
-                self._read_http_header(sock)
-                last_gga = 0.0
+                sock, last_sent_gga_source = self._connect_ntrip()
+                initial_data = self._read_http_header(sock)
+                sock.settimeout(float(self.get_parameter("ntrip_recv_timeout_s").value))
+                self.ntrip_connected = True
+                self.ntrip_connect_count += 1
+                last_sent_gga_source = self._send_ntrip_gga(sock)
+                last_gga = time.monotonic()
+                if initial_data:
+                    self._handle_rtcm_data(initial_data)
                 while not self.stop_event.is_set():
                     now = time.monotonic()
                     if now - last_gga >= float(self.get_parameter("ntrip_gga_period_s").value):
-                        gga = self.latest_gga or self.get_parameter("ntrip_initial_gga").value
-                        if gga:
-                            sock.sendall((gga.strip() + "\r\n").encode("ascii"))
+                        last_sent_gga_source = self._send_ntrip_gga(sock)
                         last_gga = now
-                    data = sock.recv(4096)
+                    try:
+                        data = sock.recv(4096)
+                    except socket.timeout:
+                        continue
                     if not data:
                         raise ConnectionError("NTRIP socket closed")
-                    if self.serial_fd is not None:
-                        os.write(self.serial_fd, data)
+                    self._handle_rtcm_data(data)
+
             except Exception as exc:
-                self.get_logger().warning(f"NTRIP disconnected: {exc}")
+                self.ntrip_connected = False
+                self.ntrip_disconnect_count += 1
+                self.get_logger().warning(
+                    f"NTRIP disconnected: {exc}; "
+                    f"last_gga_source={last_sent_gga_source}, "
+                    f"rtcm_bytes={self.rtcm_bytes}, written={self.rtcm_written_bytes}"
+                )
                 if sock is not None:
                     try:
                         sock.close()
                     except OSError:
                         pass
                 time.sleep(float(self.get_parameter("ntrip_reconnect_s").value))
+
+    def _handle_rtcm_data(self, data: bytes):
+        self.rtcm_bytes += len(data)
+        written = self._write_serial(data)
+        self.rtcm_written_bytes += written
+        dropped = len(data) - written
+        if dropped > 0:
+            self.rtcm_dropped_bytes += dropped
+            self.rtcm_write_fail_count += 1
+            self.get_logger().warning(f"Serial write timeout, dropped {dropped}/{len(data)} RTCM bytes")
+        if written > 0:
+            self.last_rtcm_time = time.monotonic()
+
+    def _write_serial(self, data: bytes) -> int:
+        if self.rtcm_fd is None:
+            return 0
+        return self._write_fd(self.rtcm_fd, data, float(self.get_parameter("rtcm_write_timeout_s").value))
+
+    def _write_fd(self, fd: int, data: bytes, timeout_s: float) -> int:
+        deadline = time.monotonic() + timeout_s
+        written = 0
+        while written < len(data) and not self.stop_event.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                break
+            _, writable, _ = select.select([], [fd], [], remaining)
+            if not writable:
+                break
+            try:
+                chunk_written = os.write(fd, data[written:])
+            except BlockingIOError:
+                time.sleep(0.001)
+                continue
+            except OSError:
+                break
+            if chunk_written <= 0:
+                break
+            written += chunk_written
+        return written
+
+    def _select_ntrip_gga(self):
+        if self.latest_position_gga:
+            return self.latest_position_gga, "live"
+        return self.get_parameter("ntrip_initial_gga").value, "initial"
+
+    def _send_ntrip_gga(self, sock):
+        gga, gga_source = self._select_ntrip_gga()
+        if gga:
+            sock.sendall((gga.strip() + "\r\n").encode("ascii"))
+        self.latest_ntrip_gga_source = gga_source
+        return gga_source
 
     def _connect_ntrip(self):
         host = self.get_parameter("ntrip_host").value
@@ -322,46 +489,121 @@ class RtkBridgeNode(Node):
                 "ntrip_user, and ntrip_password via ROS params or TINYNAV_NTRIP_* env vars."
             )
         auth = base64.b64encode(f"{user}:{password}".encode("utf-8")).decode("ascii")
-        req = (
-            f"GET /{mount} HTTP/1.1\r\n"
-            f"Host: {host}:{port}\r\n"
-            f"Ntrip-Version: Ntrip/2.0\r\n"
-            f"User-Agent: NTRIP TinyNav/1.0\r\n"
-            f"Authorization: Basic {auth}\r\n"
-            f"Connection: close\r\n\r\n"
-        )
+        version = str(self.get_parameter("ntrip_request_version").value)
+        if version == "2.0":
+            req = (
+                f"GET /{mount} HTTP/1.1\r\n"
+                f"Host: {host}:{port}\r\n"
+                f"Ntrip-Version: Ntrip/2.0\r\n"
+                f"User-Agent: NTRIP TinyNav/1.0\r\n"
+                f"Authorization: Basic {auth}\r\n"
+                f"Connection: keep-alive\r\n\r\n"
+            )
+        else:
+            req = (
+                f"GET /{mount} HTTP/1.0\r\n"
+                f"User-Agent: NTRIP TinyNav/1.0\r\n"
+                f"Authorization: Basic {auth}\r\n\r\n"
+            )
         sock = socket.create_connection((host, port), timeout=10.0)
         sock.settimeout(10.0)
         sock.sendall(req.encode("ascii"))
-        self.get_logger().info(f"Connected NTRIP {host}:{port}/{mount}")
-        return sock
+        gga_source = self._send_ntrip_gga(sock)
+        self.get_logger().info(
+            f"Opened NTRIP TCP {host}:{port}/{mount} request_version={version}, "
+            f"initial_gga_source={gga_source}"
+        )
+        return sock, gga_source
 
     def _read_http_header(self, sock):
         data = b""
-        while b"\r\n\r\n" not in data and len(data) < 4096:
-            data += sock.recv(1)
-        header = data.decode("latin1", errors="ignore")
-        if "200" not in header and "ICY" not in header:
-            raise ConnectionError(header.strip())
+        max_header_bytes = 8192
+        start = time.monotonic()
+        while time.monotonic() - start < 10.0:
+            try:
+                chunk = sock.recv(256)
+                if not chunk:
+                    header = data.decode("latin1", errors="ignore").strip()
+                    raise ConnectionError(f"NTRIP socket closed while reading header: {header!r}")
+                data += chunk
+                status_line, payload_after_status = self._split_status_line(data)
+                if status_line is None:
+                    if len(data) > max_header_bytes:
+                        raise ConnectionError("NTRIP header too large before status line")
+                    continue
+                if "200" not in status_line and "ICY" not in status_line:
+                    raise ConnectionError(f"Bad NTRIP response: {status_line}")
+                if status_line.startswith("ICY"):
+                    self.get_logger().info(f"NTRIP header: {status_line!r}")
+                    return payload_after_status
+                header, payload = self._split_http_header(data)
+                if header is not None:
+                    self.get_logger().info(f"NTRIP header: {header[:100]!r}")
+                    return payload
+                if len(data) > max_header_bytes:
+                    raise ConnectionError(f"NTRIP HTTP header too large: {status_line}")
+            except socket.timeout:
+                continue
+
+        header = data.decode("latin1", errors="ignore").strip()
+        raise TimeoutError(f"Timed out reading NTRIP header: {header[:100]!r}")
+
+    @staticmethod
+    def _split_status_line(data: bytes):
+        lf = data.find(b"\n")
+        if lf < 0:
+            return None, b""
+        line = data[: lf + 1].decode("latin1", errors="ignore").strip()
+        return line, data[lf + 1 :]
+
+    @staticmethod
+    def _split_http_header(data: bytes):
+        for sep in (b"\r\n\r\n", b"\n\n"):
+            pos = data.find(sep)
+            if pos >= 0:
+                header = data[:pos].decode("latin1", errors="ignore")
+                return header, data[pos + len(sep) :]
+        return None, b""
 
     def _handle_nmea_line(self, line: str):
+        self.last_nmea_time = time.monotonic()
+        self.nmea_sentence_count += 1
         if self.raw_pty_master is not None:
             try:
                 os.write(self.raw_pty_master, (line + "\n").encode("ascii", errors="ignore"))
             except OSError:
                 pass
-        self.raw_pub.publish(String(data=line))
-        if not nmea_checksum_ok(line):
+        has_checksum = "*" in line
+        if has_checksum and not nmea_checksum_ok(line):
+            self.nmea_checksum_fail_count += 1
+            self.get_logger().warning(f"NMEA checksum failed: {line}")
             return
-        self.latest_gga = line if line[3:6] == "GGA" else self.latest_gga
+        if not has_checksum and bool(self.get_parameter("strict_nmea_checksum").value):
+            self.nmea_checksum_fail_count += 1
+            return
         parts = line[1:].split("*")[0].split(",")
         msg_type = parts[0][2:]
+        self.latest_sentence = line
+        self.latest_sentence_type = msg_type
+        if self._should_publish_raw_sentence(msg_type):
+            self.raw_pub.publish(String(data=line))
+            self.raw_sentence_publish_count += 1
         if msg_type == "GGA":
+            self.nmea_gga_count += 1
+            self.latest_gga = line
+            self.last_gga_time = time.monotonic()
+            if len(parts) > 5 and parts[2] and parts[3] and parts[4] and parts[5]:
+                self.latest_position_gga = line
             self._parse_gga(parts)
         elif msg_type == "RMC":
+            self.nmea_rmc_count += 1
             self._parse_rmc(parts)
         elif msg_type in ("HDT", "THS"):
+            self.nmea_heading_count += 1
             self._parse_heading(parts)
+
+    def _should_publish_raw_sentence(self, msg_type: str) -> bool:
+        return not self.raw_sentence_types or msg_type in self.raw_sentence_types
 
     def _parse_gga(self, p: list[str]):
         if len(p) < 15:
@@ -371,8 +613,12 @@ class RtkBridgeNode(Node):
         if lat is None or lon is None:
             return
         quality = int(p[6] or "0")
+        num_satellites = int(p[7] or "0")
+        hdop = float(p[8] or "nan")
         alt = float(p[9] or "0.0")
         undulation = float(p[11] or "0.0") if len(p) > 11 and p[11] else 0.0
+        differential_age = float(p[13]) if len(p) > 13 and p[13] else None
+        station_id = p[14] if len(p) > 14 else ""
         stamp = ros_time_from_utc(p[1]) or self.get_clock().now().to_msg()
         fix = NavSatFix()
         fix.header.stamp = stamp
@@ -388,6 +634,12 @@ class RtkBridgeNode(Node):
         fix.position_covariance_type = NavSatFix.COVARIANCE_TYPE_APPROXIMATED
         self.fix_pub.publish(fix)
         self.latest_fix = fix
+        self.latest_gga_quality = quality
+        self.latest_num_satellites = num_satellites
+        self.latest_hdop = hdop
+        self.latest_gga_utc = p[1]
+        self.latest_gga_differential_age = differential_age
+        self.latest_gga_station_id = station_id
         self._publish_odom_from_fix(fix)
 
         time_ref = TimeReference()
@@ -433,7 +685,7 @@ class RtkBridgeNode(Node):
 
     def _publish_odom_from_fix(self, msg: NavSatFix):
         if msg.status.status < self.min_navsat_status:
-            self._publish_status(msg, accepted=False, position=None)
+            self.latest_enu = None
             return
         if self.origin is None:
             self.origin = make_origin(msg.latitude, msg.longitude, msg.altitude)
@@ -442,6 +694,7 @@ class RtkBridgeNode(Node):
                 f"lon={msg.longitude:.9f}, alt={msg.altitude:.3f}"
             )
         position = lla_to_enu(msg.latitude, msg.longitude, msg.altitude, self.origin)
+        self.latest_enu = [float(v) for v in position]
         yaw = self.latest_heading_yaw if self.use_heading else 0.0
         quat = yaw_to_quat(yaw)
         odom = Odometry()
@@ -461,7 +714,6 @@ class RtkBridgeNode(Node):
         self._copy_position_covariance(msg, odom)
         self.odom_pub.publish(odom)
         self._publish_path(odom)
-        self._publish_status(msg, accepted=True, position=position)
         if self.publish_tf:
             self.tf_broadcaster.sendTransform(self._odom_to_tf(odom))
 
@@ -500,22 +752,70 @@ class RtkBridgeNode(Node):
             self.path.poses = self.path.poses[-self.path_max_size:]
         self.path_pub.publish(self.path)
 
-    def _publish_status(self, msg: NavSatFix, accepted: bool, position):
-        payload = {
+    def _publish_status_timer(self):
+        if self.latest_fix is None:
+            self._publish_status(None, accepted=False, position=None)
+        else:
+            accepted = self.latest_fix.status.status >= self.min_navsat_status and not self._fix_is_stale()
+            self._publish_status(self.latest_fix, accepted=accepted, position=self.latest_enu)
+
+    def _fix_is_stale(self) -> bool:
+        if self.last_nmea_time is None:
+            return True
+        return time.monotonic() - self.last_nmea_time > float(self.get_parameter("fix_stale_after_s").value)
+
+    def _publish_status(self, msg: NavSatFix | None, accepted: bool, position):
+        now = time.monotonic()
+        self.status_seq += 1
+        nmea_age = None if self.last_nmea_time is None else now - self.last_nmea_time
+        gga_age = None if self.last_gga_time is None else now - self.last_gga_time
+        rtcm_age = None if self.last_rtcm_time is None else now - self.last_rtcm_time
+        io_status = {
+            "seq": self.status_seq,
+            "ntrip_connected": self.ntrip_connected,
+            "last_nmea_age_s": nmea_age,
+            "last_gga_age_s": gga_age,
+            "last_rtcm_age_s": rtcm_age,
+            "latest_sentence_type": self.latest_sentence_type or None,
+            "nmea_sentence_count": self.nmea_sentence_count,
+            "nmea_gga_count": self.nmea_gga_count,
+            "nmea_rmc_count": self.nmea_rmc_count,
+            "nmea_heading_count": self.nmea_heading_count,
+            "raw_sentence_publish_count": self.raw_sentence_publish_count,
+            "nmea_checksum_fail_count": self.nmea_checksum_fail_count,
+            "rtcm_bytes": self.rtcm_bytes,
+            "rtcm_written_bytes": self.rtcm_written_bytes,
+            "rtcm_dropped_bytes": self.rtcm_dropped_bytes,
+            "rtcm_write_fail_count": self.rtcm_write_fail_count,
+            "ntrip_gga_source": self.latest_ntrip_gga_source,
+            "gga_quality": self.latest_gga_quality,
+            "fix_stale": self._fix_is_stale(),
+        }
+        status = {
+            "seq": self.status_seq,
             "accepted": accepted,
-            "navsat_status": int(msg.status.status),
-            "service": int(msg.status.service),
-            "latitude": msg.latitude,
-            "longitude": msg.longitude,
-            "altitude": msg.altitude,
+            "navsat_status": None if msg is None else int(msg.status.status),
+            "service": None if msg is None else int(msg.status.service),
+            "fix_stale": self._fix_is_stale(),
+            "last_gga_age_s": gga_age,
+            "last_rtcm_age_s": rtcm_age,
+            "gga_quality": self.latest_gga_quality,
+            "gga_utc": self.latest_gga_utc or None,
+            "gga_differential_age_s": self.latest_gga_differential_age,
+            "gga_station_id": self.latest_gga_station_id or None,
+            "num_satellites": self.latest_num_satellites,
+            "hdop": None if not math.isfinite(self.latest_hdop) else self.latest_hdop,
+            "latitude": None if msg is None else msg.latitude,
+            "longitude": None if msg is None else msg.longitude,
+            "altitude": None if msg is None else msg.altitude,
+            "enu": position,
+            "latest_gga": self.latest_gga or None,
             "origin_ready": self.origin is not None,
             "heading_ready": self.latest_heading_stamp is not None,
             "velocity_ready": self.latest_velocity_stamp is not None,
-            "ntrip_enabled": self.ntrip_enabled,
-            "serial_enabled": self.serial_enabled,
-            "enu": None if position is None else [float(v) for v in position],
         }
-        self.status_pub.publish(String(data=json.dumps(payload)))
+        self.status_pub.publish(String(data=json.dumps(status, separators=(",", ":"))))
+        self.io_status_pub.publish(String(data=json.dumps(io_status, separators=(",", ":"))))
 
     def _odom_to_tf(self, odom: Odometry):
         from geometry_msgs.msg import TransformStamped
@@ -541,11 +841,20 @@ class RtkBridgeNode(Node):
     def _wrap_angle(angle: float) -> float:
         return (angle + math.pi) % (2.0 * math.pi) - math.pi
 
+    @staticmethod
+    def _parse_sentence_type_filter(value):
+        text = str(value or "").strip().upper()
+        if not text or text in ("*", "ALL"):
+            return set()
+        return {part.strip() for part in text.split(",") if part.strip()}
+
     def destroy_node(self):
         self.stop_event.set()
-        if self.serial_fd is not None:
+        for fd in {self.nmea_fd, self.rtcm_fd}:
+            if fd is None:
+                continue
             try:
-                os.close(self.serial_fd)
+                os.close(fd)
             except OSError:
                 pass
         if self.raw_pty_master is not None:

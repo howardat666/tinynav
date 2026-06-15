@@ -18,9 +18,9 @@
 - `rtk/rtk_bridge_node.py`
   - 不硬编码 NTRIP 账号和密码，改用 ROS 参数或 `TINYNAV_NTRIP_USER` / `TINYNAV_NTRIP_PASSWORD` 环境变量。
   - caster、端口、mountpoint、initial GGA 可以保留现场默认值，但必须支持 ROS 参数或环境变量覆盖。
-  - 保留 `/fix`、`/heading`、`/vel`、`/time_reference`、`/rtk/odom`、`/rtk/path`、`/rtk/status`。
-  - `/rtk/status` 至少能看出：fix 是否 accepted、heading/velocity 是否 ready、NTRIP/serial 是否启用、ENU 坐标。
-  - 可选补充：最近 NMEA/RTCM 时间、GGA quality、卫星数、HDOP。
+  - 保留 `/fix`、`/heading`、`/vel`、`/time_reference`、`/rtk/odom`、`/rtk/path`、`/rtk/status`、`/rtk/io_status`、`/rtk/nmea_sentence`。
+  - `/rtk/status` 看定位结果：fix 是否 accepted、GGA quality、卫星数、HDOP、经纬度、ENU 坐标。
+  - `/rtk/io_status` 看链路状态：最近 NMEA/RTCM age、RTCM 写入字节、丢包、NTRIP 是否连接、GGA 回传来源。
 
 验收标准：
 
@@ -96,7 +96,7 @@
   - 保存 `rtk_continuous_odom.npy`。
   - `--use_rtk_fused_odom_for_mapping` 打开时，用最近的 `/slam/odometry_fused` 替代 raw keyframe odom。
 - `scripts/run_rosbag_record.sh`
-  - 录制 `/fix`、`/rtk/odom`、`/rtk/status`、`/rtk/fusion_status`。
+  - 录制 `/fix`、`/rtk/odom`、`/rtk/status`、`/rtk/io_status`、`/rtk/fusion_status`。
 
 后续再做：
 
