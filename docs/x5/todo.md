@@ -91,18 +91,44 @@
 
 ---
 
-## 3. 下一步
+## 3. 📷 是否需要插着相机 —— 排期用
 
-### 🟢 立即可做（PC 侧，不被任何硬件阻塞）
+> 相机长时间通电发热，所以按"必须上板"和"纯 PC"分开排期：**相机在的时候优先清掉 📷 那一列，其余留给相机拔掉之后做。**
+
+| 需要相机 📷 | 不需要相机 💻 |
+|---|---|
+| **T-1** 试装 `pydbow3`（0.5 h）| **T-2** 填四个 recall 空白（1–2 天）🔴 最高优先 |
+| **T-3** 验 BPU 并发（0.5 h）🔴 否决项 | **T-4** `hb_mapper` 编 DINOv2 int8（1–3 天，PC + docker）|
+| **T-13** 对比正常机 sensor 库 md5（10 min）| **T-5** backend 抽象（1–2 天）🔴 上板前置 |
+| **T-15** SuperPoint 线程扩展曲线（0.5 h）| **T-7** 轮速里程计节点 + IMU 融合（2–3 天，写代码不需相机）|
+| **T-21** 验 RGB（imx415）是否正常 | **T-8** 轻量 Feetech 驱动（1–2 天，写代码不需相机）|
+| **T-12** 办公室日夜采数（1 天，还要能走动）| **T-9** `map_node --localization-only`（1 天）|
+| 抓一帧 stereo left 判断是否红外 | **T-10** 地图导出瘦身（1–2 天）|
+| 把设备上的文件捞回 PC | **T-11** 双时段地图合并（1 天，借 PR #150）|
+| | **T-16** 多方案对比（T-2 之后）|
+| | **T-19** 写 `setup_looper.sh`（写脚本不需相机，验证时才需要）|
+| | **T-20** 问 Looper 能否降 ion 预留（发消息，零硬件）|
+
+**💻 那一列足够填满好几个晚上，而且都是这个项目工作量最大的部分**（管路开发 + recall 量化）。相机可以拔掉。
+
+⚠️ 两个例外要注意：
+- **T-7 / T-8 最终要接底盘验证** —— 代码可以先写完、单元测试可以跑，但闭环测试要等 LeKiwi + 相机都在
+- **T-12 需要一台能正常出图的相机** —— 64GB 那台修好之前只能用标准版机器录
+
+---
+
+## 4. 下一步
+
+### 🟢 可立即开工（📷 = 需要插着相机，💻 = 纯 PC）
 
 <a name="t-1"></a>
-#### T-1 · 试装 `pydbow3` 定第一版路线 —— 0.5 h ⚡ 最先做
+#### 📷 T-1 · 试装 `pydbow3` 定第一版路线 —— 0.5 h ⚡ 最先做
 在**标准版** Looper（不是坏的那台 64GB）上试装 `pydbow3`。
 - 装得上 → 直接跑 [T-6a](#t-6) 方案 1
 - 装不上 → 把 PR #194 的 `tinynav/core/bow_retrieval.py`（148 行，纯 cv2+numpy）接进来走 [T-6b](#t-6) 方案 5a
 
 <a name="t-2"></a>
-#### T-2 · 填掉四个 recall 数据空白 —— 1–2 天 🔴 **所有方案的生死线**
+#### 💻 T-2 · 填掉四个 recall 数据空白 —— 1–2 天 🔴 **所有方案的生死线**
 给 `tool/benchmark/map_retrieval_self_consistency.py` 加**描述子后端开关**（现在写死读 `vlad_descriptors.db`），然后一次跑齐：
 
 | 待测组合 | 对标基线 | 决定哪条路线 |
@@ -115,50 +141,50 @@
 数据集：`hf download --repo-type dataset UniflexAI/rosbag_tinynav_vlad_eval`
 
 <a name="t-5"></a>
-#### T-5 · backend 抽象 —— 1–2 天 🔴 **所有上板工作的前置**
+#### 💻 T-5 · backend 抽象 —— 1–2 天 🔴 **所有上板工作的前置**
 `tinynav/core/models_trt.py:1` 硬 `import tensorrt`（第 9 行还有 `from cuda import cudart`），在 X5 上 import 即崩。
 - 复用 PR #136 已有的 soft-import
 - 拆出 `tinynav/core/backends/{trt,ort,hbdnn}.py`
 - 顺手把三层拆成 `retrieval/` `features/` `matchers/`（见 `README.md § 5`）
 
-#### T-7 · 轮速里程计节点（方案 A + B）—— 2–3 天
+#### 💻 T-7 · 轮速里程计节点（方案 A + B）—— 2–3 天（闭环测试才需硬件）
 - 新写 `wheel_odom_node`：读轮速 → 发 `/slam/odometry`
 - 加 IMU 陀螺融合（方案 B）：复用 `imu_propagator_node.py` 的模式，把低频源换成重定位位姿
 - `tool/looper_bridge_node.py` 加 **IMU publisher**（现在不发）
 - `imu_propagator_node.py:69` 的 `/camera/camera/imu` 要 remap
 
-#### T-8 · 轻量 Feetech(scservo) 串口驱动 —— 1–2 天
+#### 💻 T-8 · 轻量 Feetech(scservo) 串口驱动 —— 1–2 天（闭环测试才需硬件）
 `tinynav/platforms/lekiwi_control.py:5` 依赖 `lerobot` → 依赖 `torch` → **X5 装不下**。而且它只 `send_action()`，**从不调 `get_observation()` 读轮速**。
 写 ~200 行纯串口驱动替代，同时提供轮速读取。
 
-#### T-9 · `map_node` 加 `--localization-only` 模式 —— 1 天
+#### 💻 T-9 · `map_node` 加 `--localization-only` 模式 —— 1 天
 现在 `keyframe_callback`（`map_node.py:332`）每个关键帧无条件跑 `keyframe_mapping()`（写盘存 depth/image + 重算 DINO/SP + 全量 Ceres），额外 **391.8 ms/帧**且随地图增长。
 
-#### T-10 · 地图导出瘦身 —— 1–2 天
+#### 💻 T-10 · 地图导出瘦身 —— 1–2 天
 写 `tool/export_reloc_map.py`：丢掉 `depths.db` / `images.db`，只导出关键点 3D 坐标 + 描述子 + 位姿图 + 栅格。38 GB → ORB 路线 ~720 MB / SP 路线 ~500 MB。
 > 依据：`keypoint_with_depth_to_3d`（`map_node.py:491`）只按关键点坐标采样 `depth[v,u]`，可预先算成 3D 点。
 
-#### T-11 · 双时段地图支持 —— 1 天
+#### 💻 T-11 · 双时段地图支持 —— 1 天
 借 **PR #150**（offline map merge via cross-map loop closure）合并白天/夜晚两张图。日夜方案的核心。
 
 <a name="t-4"></a>
-#### T-4 · `hb_mapper` 编 DINOv2 int8 —— 1–3 天（方案 6 前置）
+#### 💻 T-4 · `hb_mapper` 编 DINOv2 int8 —— 1–3 天（方案 6 前置）
 ① fp16 onnx → fp32 ② 冻结动态维为 `1×3×224×224`（BPU 要静态 shape）③ 采 ~100 张真实 Looper 图做校准集（预处理必须与推理完全一致）④ 编译 ⑤ 用 `hb_model_infer` 出描述子喂给 T-2 验 recall
 
 ---
 
-### 🔴 被 64GB 机器 MIPI 故障阻塞
+### 📷 需要相机在位
 
 <a name="t-3"></a>
-#### T-3 · 验 BPU 能否被第二个进程使用 —— 0.5 h 🔴 **方案 6 的一票否决项**
+#### 📷 T-3 · 验 BPU 能否被第二个进程使用 —— 0.5 h 🔴 **方案 6 的一票否决项**
 板上 20 行 ctypes 调 `/usr/lib/libdnn.so` 反复推理任意 `.bin`，同时 `hrut_bpuprofile` 看固件深度推理的 FC 时间是否恶化。
 > 💡 **可以用标准版 Looper 做**，不必等 64GB 修好。
 
-#### T-12 · 办公室日夜采数 —— 1 天 🔴 **日夜方案生死**
+#### 📷 T-12 · 办公室日夜采数 —— 1 天 🔴 **日夜方案生死**
 同一条路线录三趟 bag：**白天 / 晚上开灯 / 晚上关灯**。然后 ① 肉眼看图判断是否红外、靠窗区域差多少 ② 拿这三段跑 T-2 → 得到**你办公室的真实数字**。
 ⚠️ 录之前**必须先给相机对时**（64GB 那台 RTC 坏了）。
 
-#### T-13 · 修 64GB 机器 —— ⚠️ **不是排线问题，别开壳**
+#### 📷 T-13 · 修 64GB 机器 —— ⚠️ **不是排线问题，别开壳**
 
 已深挖定位：**sensor 被写成 1 lane，而 CSI host 配成 2 lane**，host 永远等不到 D1 进入 LP-11。
 决定性证据：用 `multi_isp_vflow -s 1`（1 lane 配置）**两路立体相机都能跑满 ~62 fps，MIPI 错误计数器全 0**。
@@ -174,13 +200,13 @@
 - [ ] 🟢 备选绕法：既然 1 lane @1200 Mbps 实测能跑 1088×1280 ~60 fps，**对 20 fps 双目绰绰有余** —— 可以问 Looper 能否直接把 `stereo_sensor_name` 换成 1-lane 配置
 
 <a name="t-20"></a>
-#### T-20 · ⭐ 争取降低 ion 预留 —— 🔴 **价值最高的单项**
+#### 💻 T-20 · ⭐ 争取降低 ion 预留 —— 🔴 **价值最高的单项**
 实测这颗 X5 **物理 DRAM 3.9 GiB，其中 ~2.5 GiB 被 ion 静态预留**，所以 `MemTotal 1307 MB` **是分配决策而非硬件上限**。
 内存是全项目最硬的约束（DINOv2 曾 OOM 并杀到固件的 `imu_pub`），而这是唯一能从根上放宽它的手段 —— 比关 VIO（只省 2 核）和降 depth 帧率（只释放 BPU）价值都高。
 - [ ] 问 Looper：当前 2.5 GiB 的依据、实际水位、能否降到 1.5–2 GiB、有无运行时查询接口
 - [ ] ⚠️ **不要自己硬改** —— ion 池是相机流水线（VPF/ISP/深度推理/BPU 张量）在用的，砍太多会让固件启动失败
 
-#### T-21 · 验证 RGB（imx415）是否正常 —— 仍未测
+#### 📷 T-21 · 验证 RGB（imx415）是否正常 —— 仍未测
 `insight_full` 死在第一路立体相机上，RGB 根本没走到（`/sys/class/vps/mipi_phy/status/host` 只有 host2 有痕迹）。板上 sample 工具的 sensor 列表里没有 imx415，无法单独拉起 rx0。
 - [ ] 方法 A：先把立体相机改成 1-lane 配置让固件能起来，再看 RGB
 - [ ] 方法 B：跑 `insight_full_uvc` —— ⚠️ **它会重配 USB gadget，会断掉 NCM SSH 链路，必须先准备串口**
@@ -212,7 +238,7 @@
 
 ---
 
-## 4. 推荐的开工顺序
+## 5. 推荐的开工顺序
 
 ```
 今天  ─┬─ T-1  试装 pydbow3（0.5h，标准版机器）      ← 定第一版路线
