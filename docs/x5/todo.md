@@ -63,8 +63,19 @@
 - [x] DINOv2 内存四档量化对比（ORT fp16 / ORT int8 / hbDNN int8 / small）→ 结论：**换运行时 ≫ 换精度**
 - [x] ORB 路线全链路：提取 46.5 ms + BF-Hamming 26.0 ms + RANSAC 87.1 ms + PnP 2.6 ms，**47 MB**
 - [x] ⭐ **cv2 BF-L2 匹配 SuperPoint 描述子只要 38.6 ms**（knn+ratio 20.6 ms）→ 比 LightGlue 快 **74–140 倍**
+- [x] **SuperPoint 线程扩展曲线**：1t 3902 → 2t 2031 → 3t 1342 → **4t 1110（3.52×，饱和）** → 6t 1071 → 8t 1126。**4 线程后是平台期**
+- [x] **ORB 完全不扩展**：1/2/4/8 线程都是 38 ms、43 MB（该 OpenCV 构建里 `detectAndCompute` 实质单线程）
+- [x] ⚠️ 纠正 SuperPoint ONNX 输入规格：**输入是 `uint8` 不是 fp16**，且有第二个必需输入 `keypoint_threshold`
+- [x] 由线程曲线得出：**关 VIO 对单模型延迟几乎没用**（SP 1110→1071 ms），价值在并发度
 
 ### 2.3 BPU 分析
+
+- [x] 🟢 **BPU 能被第二个进程并发使用**（实测，方案 6 的一票否决项解除）：固件占 87–96% 时 `hbDNNInitializeFromFiles` rc=0，100 次推理零失败；连**固件自己的 `DStereo.bin`** 都能在第二进程再加载一遍
+- [x] 延迟是**双峰不是抖动**：p50 70.6 ms（等一个固件 FC）vs min 5.4 ms（抢到空隙）；纯 BPU 计算 palm_det 2.3 ms / yolo11n@640 5.6 ms / stereonet 139 ms
+- [x] 对固件**零可测影响**：FC 速率 12.8→13.0 FC/s（±2% 噪声）、`insight_full` CPU/RSS/线程数全不动、dmesg 0 错误、未重启
+- [x] 🔴 `priority=PREEMP` **无效**（FC 下发后不可抢占）
+- [x] 🟢 **BPU 路线内存便宜一个量级**：20 MB 基座 + 模型 ×2（stereonet 13.3 MB 模型只占 46.7 MB，对照 ORT SuperPoint 130–148 MB）
+- [x] 工具链版本要求：板上 HBRT `3.15.54.0`，固件模型用 builder `1.24.3`/HBRT `3.15.55.0` 编的 → **编 DINOv2 要对齐这一代 OpenExplorer**
 
 - [x] 三个模型的算子构成统计 → **DINOv2 最干净（23 种算子、无 Einsum）· SuperPoint 可切图 · LightGlue 最难（Einsum×36 + IsInf/IsNaN×60）**
 - [x] 🔴 证实 **depth 帧率不可调**（无参数，sensor mode 最低 20 fps）→ "降到 5 fps 释放 5.5 TOPS" 做不到
@@ -97,14 +108,14 @@
 
 | 需要相机 📷 | 不需要相机 💻 |
 |---|---|
-| **T-1** 试装 `pydbow3`（0.5 h）| **T-2** 填四个 recall 空白（1–2 天）🔴 最高优先 |
-| **T-3** 验 BPU 并发（0.5 h）🔴 否决项 | **T-4** `hb_mapper` 编 DINOv2 int8（1–3 天，PC + docker）|
-| **T-13** 对比正常机 sensor 库 md5（10 min）| **T-5** backend 抽象（1–2 天）🔴 上板前置 |
-| **T-15** SuperPoint 线程扩展曲线（0.5 h）| **T-7** 轮速里程计节点 + IMU 融合（2–3 天，写代码不需相机）|
+| **T-1** 试装 `pydbow3`（0.5 h）🔴 **还没做，下次插相机时优先** | **T-2** 填四个 recall 空白（1–2 天）🔴 最高优先 |
+| ~~T-3 验 BPU 并发~~ ✅ **已完成：能并发** | **T-4** `hb_mapper` 编 DINOv2 int8（1–3 天，PC + docker）|
+| ~~T-13 对比 sensor 库 md5~~ ✅ **已完成：确认不同** | **T-5** backend 抽象（1–2 天）🔴 上板前置 |
+| ~~T-15 SP/ORB 线程曲线~~ ✅ **已完成** | **T-7** 轮速里程计节点 + IMU 融合（2–3 天，写代码不需相机）|
 | **T-21** 验 RGB（imx415）是否正常 | **T-8** 轻量 Feetech 驱动（1–2 天，写代码不需相机）|
 | **T-12** 办公室日夜采数（1 天，还要能走动）| **T-9** `map_node --localization-only`（1 天）|
-| 抓一帧 stereo left 判断是否红外 | **T-10** 地图导出瘦身（1–2 天）|
-| 把设备上的文件捞回 PC | **T-11** 双时段地图合并（1 天，借 PR #150）|
+| ~~抓帧判断是否红外~~ ✅ **已完成：可见光，无主动照明** | **T-10** 地图导出瘦身（1–2 天）|
+| ~~把设备文件捞回 PC~~ ✅ **已完成（42 文件 / 35 MB，md5 双向校验）** | **T-11** 双时段地图合并（1 天，借 PR #150）|
 | | **T-16** 多方案对比（T-2 之后）|
 | | **T-19** 写 `setup_looper.sh`（写脚本不需相机，验证时才需要）|
 | | **T-20** 问 Looper 能否降 ion 预留（发消息，零硬件）|
