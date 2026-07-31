@@ -77,7 +77,7 @@
 
 1. **LeKiwi 是三轮全向轮（omni）**，侧滑比差速底盘严重得多。纯轮速的弱点不是直线距离而是 **yaw 累积**（原地转向、加减速时打滑）。5s 内 3° yaw 误差 → 走 1.5 m 后横向偏 **7.8 cm**，而 `planning_node` 栅格分辨率是 **0.1 m**。
 2. 陀螺积分同期误差 **<0.5°**（横向 1.3 cm），好一个数量级，且 **IMU 本来就有**（`insight_full` 的 `imu_pub` 线程），CPU 成本近零。
-3. **脚手架已存在**：`tinynav/core/imu_propagator_node.py` 干的正是「低频位姿 + 100 Hz IMU 积分 → 高频 `/slam/odometry`」，只需把低频源换成重定位位姿、平移换成轮速积分。
+3. **脚手架已存在且话题现成**：`tinynav/core/imu_propagator_node.py` 干的正是「低频位姿 + 100 Hz IMU 积分 → 高频 `/slam/odometry`」，而它订阅的 `/camera/camera/imu` **就是 Looper 自己发的话题**（实测 bag 里 ~400 Hz）。只需把低频源换成重定位位姿、平移换成轮速积分，**不用 remap、不用改 `looper_bridge`**。
 
 ---
 
@@ -112,16 +112,28 @@
 > **这才是 64GB 机器真正的价值** —— 不是装更大的地图，而是装同一场景的多个时段版本。
 > 🎁 [PR #150](https://github.com/UniflexAI/tinynav/pull/150)（junlinp，offline map merge via cross-map loop closure）正好是双时段地图合并需要的工具，已 fetch 到本地 `pr150` 分支。
 
+### 🔴 已实测：立体相机是**可见光单色**，机身**没有主动照明**
+
+原来指望"`SC132GS` 是单色 → 可能是近红外 → 日夜差异不大"这个大杠杆，**已被实测推翻**（详见 [`x5.md § 10.2`](x5.md)）：
+
+- **抓到真实帧对照**：画面里的**绿色 LED 出口标志**（~525 nm，NIR 输出基本为零）在 mono 立体图里清晰可见、位置与 RGB 一致 → 镜头前没有 IR 滤片，**成像靠环境可见光**
+- **主动照明全盘零命中**：无 `/sys/class/leds`；`strings` 搜固件和整个 `/etc/init.d/looper/` 的 `infrared|projector|illuminat|emitter|led|laser` 全部 0 命中；`gpio_init.sh` 只有 reset/power-on 序列
+- 唯一的 PWM 是 **20 Hz 帧同步触发**（`period=50000 occupied=CAMSYS`，i2c 确认两颗 sensor 都在外触发从模式）—— **是立体硬同步，不是补光**
+
+**所以日夜问题跑不掉。出路只有两条：双时段地图（灯开着的场景足够）+ 必要时外加照明。**
+
 🔴 **待确认（决定整个日夜方案）：办公室晚上灯是开着还是关着？**
 
-| 实际场景 | 视觉影响 | 能否重定位 |
-|---|---|---|
-| 晚上**灯开着** | 与白天差异**很小**（室内本就人工光为主）| 🟢 基本无损 |
-| 晚上灯关、有走廊/应急灯漏光 | 极低照度、噪声大、运动模糊 | 🟡 取决于是否有主动红外 |
-| 晚上**全黑** | 无纹理 | 🔴 **纯视觉不可能**，需主动照明 |
-| 靠窗区域 | 白天有阳光 → **日夜差异最大处** | 🟡 双时段建图可覆盖 |
+| 实际场景 | 能否重定位 |
+|---|---|
+| 晚上**灯开着** | 🟢 与白天差异不大 + 双时段地图 → 基本无损 |
+| 晚上灯关、有走廊/应急灯漏光 | 🟡 极低照度，取决于 sensor 感光下限和运动模糊 |
+| 晚上**全黑** | 🔴 **纯视觉直接失效，机身帮不上忙**，必须外加照明 |
+| 靠窗区域 | 🟡 白天有阳光 → 日夜差异最大处，双时段建图可覆盖 |
 
-若为关灯，值得查一个大杠杆：**Looper 立体相机是否近红外 + 带主动投射？** 传感器 `SC132GS`（Smartsens 全局快门**单色**）—— 单色 + 全局快门通常配红外。若重定位用的正是这对红外图（tinynav 用 stereo left），且有主动照明，则日夜外观差异会小得多，问题直接消解。半小时可验：白天/晚上各抓一帧 stereo left 原图对比。
+🔬 **1 分钟就能做的关键验证**：**拿电视遥控器对着立体镜头按键，看 `infra1` 图里有没有亮点。**
+- 有亮点 → 无 IR-cut，**850 nm 红外补光方案成立**（不刺眼、不影响办公）
+- 没亮点 → 装了 IR-cut，只能上可见光补光
 
 ---
 
@@ -148,8 +160,7 @@ CLI 形如 `--retrieval {dinov2,vlad,bow,dbow3} --features {superpoint,orb} --ma
 |---|---|---|
 | 🔴 | `tinynav/core/models_trt.py:1` 硬 `import tensorrt`（第 9 行还有 `from cuda import cudart`）| **backend 抽象必须先做**。PR #136 已有 soft-import 可复用 |
 | 🔴 | `tinynav/platforms/lekiwi_control.py:5` `from lerobot...` —— **lerobot 依赖 torch，1307 MB 的 X5 装不下**；且该节点只 `send_action()`，**从不调 `get_observation()` 读轮速** | ① 轮速里程计节点新写 ② 写轻量 Feetech(scservo) 串口驱动替代 lerobot |
-| 🔴 | `tool/looper_bridge_node.py` **不发 IMU 话题**（只发 odometry / depth / camera_info / keyframe 四类）| 方案 B 要先加 IMU publisher |
-| 🟡 | `imu_propagator_node.py:69` 订阅 `/camera/camera/imu`（RealSense 命名）| remap。⚠️ 但这个节点本身是**可复用的脚手架** |
+| 🟢 | ~~`looper_bridge_node.py` 不发 IMU~~ · ~~`imu_propagator_node.py:69` 订阅 RealSense 命名要 remap~~ | ❌ **两条都作废** —— **`/camera/camera/imu` 就是 Looper 自己的话题名**（Looper 的 topic 命名刻意仿照 RealSense），由 `insight_full` 直接发布，bag 里实测 ~400 Hz。所以 `imu_propagator_node.py` **原样就对**，方案 B 的 IMU 数据现成可用，不用改 `looper_bridge` |
 | 🟡 | `map_node.py:332` `keyframe_callback` 每个关键帧无条件跑 `keyframe_mapping()`（写盘 + 重算 DINO/SP + 全量 Ceres），额外 391.8 ms/帧 | 加 `--localization-only` 模式 |
 
 ### 5.2 可直接借用的上游 PR
