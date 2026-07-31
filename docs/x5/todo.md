@@ -45,8 +45,13 @@
 - [x] 四个硬件维度的余量：CPU **4.5 核**（VIO 开）/ **6.6 核**（VIO 关）· 内存 **~911 MB** · BPU 87–95% · 存储
 - [x] CPU 算力基准（自造 onnx）：**fp16 Conv 比 fp32 快 2.5 倍** → 推翻"fp16 是瓶颈"的早期假设
 - [x] VIO 负载拆分：静止 **0.92 核** vs 运动 **2.11 核**（ZUPT 导致 2.3 倍差）+ 线程级明细
-- [x] 🔴 **64GB 机器 MIPI D-PHY 故障定位**（`lane state error 0x1000d`）—— I2C 正常、时钟正常、高速数据通道失败；冷启动+手动重启均 100% 复现 → 物理层问题
-- [x] 发现 64GB 机器 **RTC 是坏的**（`hwclock -r` = 1970），系统时间每次启动恢复到同一时刻
+- [x] 🔴 **64GB 机器 MIPI 故障根因定位** —— **不是排线，是 lane 数不匹配**：sensor 寄存器被写成 1 lane（`0x3018=0x12`、`0x3019=0x0e` 禁用 D1/D2/D3）而 host 配成 2 lane。**决定性实测：1 lane 下两路立体相机都跑满 ~62 fps、错误计数器全 0**。嫌疑是旧 OTA 残留的 `libsc132gs.so.1.0.0`（所有模式都只写同一张 1-lane 表，`0x301f` 恒为 `0x45`）
+- [x] 排除排线/接插件/SoC CSI/DPHY/供电/过温（两条物理独立链路逐位相同失败 + lane0 在 1200 Mbps 跑满帧 + 所有错误计数器为 0 + 无 regulator/thermal 日志 + 全频满速）
+- [x] 摸清相机拓扑：rx0=imx415 RGB 4lane（未测）· rx2=立体#1（i2c-4 @0x32）· rx3=立体#2（i2c-0 @0x32 + EEPROM）
+- [x] 找到证据说明**这台机器改装前出过图**（`/app/calibration/` 下的双目和 RGB 标定文件与镜像默认值不同，日期 Jul 17 2026）
+- [x] 发现 64GB 机器 **RTC 是坏的**（`hwclock -r` = 1970），系统时间每次启动恢复到同一时刻 → crash log 同名互相覆盖、OTA 版本判断可能失效
+- [x] ⭐ **发现物理 DRAM 是 3.9 GiB，~2.5 GiB 被 ion 预留** → `MemTotal 1307 MB` 是分配决策而非硬件上限 → 见 [T-20](#t-20)
+- [x] 整理相机故障诊断入口（`/sys/class/vps/mipi_host*/status/*`、`/sys/kernel/debug/sif*/fps`、`multi_isp_vflow -s N`）
 
 ### 2.2 算法实测（X5 板上，ONNXRuntime 1.18 CPU）
 
@@ -153,10 +158,33 @@
 同一条路线录三趟 bag：**白天 / 晚上开灯 / 晚上关灯**。然后 ① 肉眼看图判断是否红外、靠窗区域差多少 ② 拿这三段跑 T-2 → 得到**你办公室的真实数字**。
 ⚠️ 录之前**必须先给相机对时**（64GB 那台 RTC 坏了）。
 
-#### T-13 · 修 64GB 机器
-- [ ] 断电开壳**重新插拔立体相机 MIPI 排线**（最可能的原因，改装机）
-- [ ] 换带独立供电的 USB hub（次可能：MIPI PHY 对电压敏感）
-- [ ] 问俊霖改装过程 + 板上有没有"改装后曾经出过图"的证据
+#### T-13 · 修 64GB 机器 —— ⚠️ **不是排线问题，别开壳**
+
+已深挖定位：**sensor 被写成 1 lane，而 CSI host 配成 2 lane**，host 永远等不到 D1 进入 LP-11。
+决定性证据：用 `multi_isp_vflow -s 1`（1 lane 配置）**两路立体相机都能跑满 ~62 fps，MIPI 错误计数器全 0**。
+排线/供电/SoC 已全部排除（两条物理独立链路逐位相同的失败 + lane0 在 1200 Mbps 跑满帧 + 所有错误计数器为 0）。详见 [`x5.md § 2.2`](x5.md)。
+
+- [ ] 🔴 **找 Looper 要正确的 `libsc132gs.so.1.0.0`** —— 板上那个（46768 B，md5 `f171ab12…`）与 2026-04 旧 OTA 包的 blob 完全一致，而 OTA 2.1.2 已把它从 payload 删掉；但 `/userdata/postinst` 只 `cp -a` **从不删文件**，所以旧库永远留着。且 `libcamdev_manager.so` **硬编码 `/usr/hobot/lib/sensor`**，无法用 `LD_LIBRARY_PATH` 绕过
+- [ ] 🔴 **拿一台正常的 insight9 对比三个文件**（一锤定音，10 分钟）：
+      `md5sum /usr/hobot/lib/sensor/libsc132gs.so.1.0.0`（预期 ≠ `f171ab12…`）、
+      `/userdata/install/share/insight_full/config/user_params.json`、
+      `/etc/init.d/looper/sensor/insight9/imx415/stereo_camera.json`
+- [ ] 🟡 **修 RTC 纽扣电池** —— 它同时是"证据被毁"（crash log 同名互相覆盖）和"OTA 每次开机重装旧包"两个问题的源头
+- [ ] 🟡 查清 `/userdata/ota_packet/setting/update_v2_1_6cmsibv830.2.bundle`（名字像 2.1.6）与已装 2.1.2 的关系，以及为什么每次开机都在重装
+- [ ] 🟢 备选绕法：既然 1 lane @1200 Mbps 实测能跑 1088×1280 ~60 fps，**对 20 fps 双目绰绰有余** —— 可以问 Looper 能否直接把 `stereo_sensor_name` 换成 1-lane 配置
+
+<a name="t-20"></a>
+#### T-20 · ⭐ 争取降低 ion 预留 —— 🔴 **价值最高的单项**
+实测这颗 X5 **物理 DRAM 3.9 GiB，其中 ~2.5 GiB 被 ion 静态预留**，所以 `MemTotal 1307 MB` **是分配决策而非硬件上限**。
+内存是全项目最硬的约束（DINOv2 曾 OOM 并杀到固件的 `imu_pub`），而这是唯一能从根上放宽它的手段 —— 比关 VIO（只省 2 核）和降 depth 帧率（只释放 BPU）价值都高。
+- [ ] 问 Looper：当前 2.5 GiB 的依据、实际水位、能否降到 1.5–2 GiB、有无运行时查询接口
+- [ ] ⚠️ **不要自己硬改** —— ion 池是相机流水线（VPF/ISP/深度推理/BPU 张量）在用的，砍太多会让固件启动失败
+
+#### T-21 · 验证 RGB（imx415）是否正常 —— 仍未测
+`insight_full` 死在第一路立体相机上，RGB 根本没走到（`/sys/class/vps/mipi_phy/status/host` 只有 host2 有痕迹）。板上 sample 工具的 sensor 列表里没有 imx415，无法单独拉起 rx0。
+- [ ] 方法 A：先把立体相机改成 1-lane 配置让固件能起来，再看 RGB
+- [ ] 方法 B：跑 `insight_full_uvc` —— ⚠️ **它会重配 USB gadget，会断掉 NCM SSH 链路，必须先准备串口**
+- [ ] 可推断（非实测）：RGB 用的 `libimx415.so` 是未被覆盖的原厂 BSP 版本（May 21 2026），且在独立的 DPHY group 0 上，不受 sc132gs 库问题影响
 
 ---
 
@@ -189,7 +217,8 @@
 ```
 今天  ─┬─ T-1  试装 pydbow3（0.5h，标准版机器）      ← 定第一版路线
        ├─ T-3  验 BPU 并发（0.5h，标准版机器）       ← 定长期路线
-       └─ T-13 拔插 64GB 机器排线                   ← 解除板上阻塞
+       ├─ T-13 拿正常 insight9 对比 sensor 库 md5     ← 一锤定音，解除板上阻塞
+       └─ T-20 问 Looper 能否降 ion 预留             ← 价值最高，解最硬约束
              ↓
 本周  ─┬─ T-2  填四个 recall 空白（1–2 天，纯 PC）   ← 所有方案的生死线
        ├─ T-5  backend 抽象（1–2 天，纯 PC）        ← 所有上板工作的前置
