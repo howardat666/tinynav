@@ -108,8 +108,8 @@
 
 | 需要相机 📷 | 不需要相机 💻 |
 |---|---|
-| **T-1** 试装 `pydbow3`（0.5 h）🔴 **还没做，下次插相机时优先** | **T-2** 填四个 recall 空白（1–2 天）🔴 最高优先 |
-| ~~T-3 验 BPU 并发~~ ✅ **已完成：能并发** | **T-4** `hb_mapper` 编 DINOv2 int8（1–3 天，PC + docker）|
+| ~~T-1 试装 `pydbow3`~~ ✅ **已完成（在 PC 上解决，见下）** | ~~T-2 填 recall 空白~~ 🟢 **经典那两项已补完，见 § 10.2** |
+| ~~T-3 验 BPU 并发~~ ✅ **已完成：能并发** | **T-4** `hb_mapper` 编 DINOv2 int8（1–3 天，PC + docker）🔴 **卡在 GPU 驱动** |
 | ~~T-13 对比 sensor 库 md5~~ ✅ **已完成：确认不同** | **T-5** backend 抽象（1–2 天）🔴 上板前置 |
 | ~~T-15 SP/ORB 线程曲线~~ ✅ **已完成** | **T-7** 轮速里程计节点 + IMU 融合（2–3 天，写代码不需相机）|
 | **T-21** 验 RGB（imx415）是否正常 | **T-8** 轻量 Feetech 驱动（1–2 天，写代码不需相机）|
@@ -133,23 +133,35 @@
 ### 🟢 可立即开工（📷 = 需要插着相机，💻 = 纯 PC）
 
 <a name="t-1"></a>
-#### 📷 T-1 · 试装 `pydbow3` 定第一版路线 —— 0.5 h ⚡ 最先做
-在**标准版** Looper（不是坏的那台 64GB）上试装 `pydbow3`。
-- 装得上 → 直接跑 [T-6a](#t-6) 方案 1
-- 装不上 → 把 PR #194 的 `tinynav/core/bow_retrieval.py`（148 行，纯 cv2+numpy）接进来走 [T-6b](#t-6) 方案 5a
+#### ✅ T-1 · `pydbow3` —— **已完成（2026-08-03）**
+原计划是"在板上试装"，实际发现问题不在 aarch64 而在代码本身：上游 `foxis/pyDBoW3` **编不过 OpenCV 4.x**（自带的 `NumpyAllocator` 因基类新增纯虚函数而变成抽象类），x86 上也一样失败。
+
+**解法：自己写了 ~70 行 pybind11 薄壳**（`pydbow3_shim.cpp`），只处理 `(N,32) uint8` 稠密描述子，接口与 `models_trt.py::DBoW3Engine` 期望的 API 源码兼容。已在 x86 docker 里跑通全流程。详见 [`x5.md § 5.6`](x5.md)。
+
+→ **对上板的意义**：这个 shim 不依赖任何 OpenCV 版本耦合的遗留代码，**aarch64 照着同一个 Dockerfile 编一遍即可**。原来"装不上就退方案 5a"的分支不再需要。
+→ **但换出了一个新约束**：预训练 ORBvoc（1M 词）常驻 **475 MB**，X5 上和固件抢内存 —— 这催生了下面的小词典实验。
 
 <a name="t-2"></a>
-#### 💻 T-2 · 填掉四个 recall 数据空白 —— 1–2 天 🔴 **所有方案的生死线**
-给 `tool/benchmark/map_retrieval_self_consistency.py` 加**描述子后端开关**（现在写死读 `vlad_descriptors.db`），然后一次跑齐：
+#### 🟢 T-2 · recall 数据空白 —— **经典路线两项已补完（2026-08-03）**
+已给 `tool/benchmark/map_retrieval_self_consistency.py` 加了 `--descriptor` 后端开关（`embedding` / `dbow3` / `dbow3-trained` / `bow-cv2` / `bf-l2`），**并修掉了一个方法学问题**：原 harness 的 SE(2) 真值是用被评测描述子自己的 Top-1 拟合的（循环论证），加了 `--transform-json` 让所有后端共用同一个变换。
 
-| 待测组合 | 对标基线 | 决定哪条路线 |
-|---|---|---|
-| DBoW3 + ORBvoc | fp16 DINOv2 的 day 78.80% / 88.87% | **方案 1（当前基线）** |
-| SuperPoint BoW | 同上 | 方案 5a |
-| SP 描述子 + BF-L2 匹配 | SP + LightGlue | 方案 5a / 6 共同 |
-| DINOv2 int8（需 T-4 先出模型） | fp16 同款 | 方案 6 |
+已跑完（`bag_gt` 为底图，全 CPU 不用 GPU，详见 [`x5.md § 10.2`](x5.md)）：
 
-数据集：`hf download --repo-type dataset UniflexAI/rosbag_tinynav_vlad_eval`
+| 待测组合 | 结果 |
+|---|---|
+| DBoW3 + ORBvoc | ✅ Day R@1 **88.4%**（打平 DINOv2 VLAD 的 88.87%）· Night R@1 17.6% |
+| BoW（cv2.kmeans 自训练） | ✅ 8192 词 Day R@1 **89.5%** / Night R@10 **42.3%**，**反超 1M 词 ORBvoc** |
+| SuperPoint BoW | ❌ 待做（需 SP 推理 → GPU 或装 onnxruntime）|
+| SP 描述子 + BF-L2 匹配 | ❌ 待做（同上）|
+| DINOv2 int8（需 T-4） | ❌ 待做 |
+| DINOv2 fp16 在同一套地图上复测 | ❌ 待做（口径对齐用）|
+
+🔴 **剩下四项共同卡在 PC 的 GPU 上**：内核升到 `6.8.0-136-generic`，NVIDIA 内核模块只装了 `-124` 的版本。**一条命令修好，不用重启**：
+```bash
+sudo apt install -y linux-modules-nvidia-595-open-6.8.0-136-generic && sudo modprobe nvidia && nvidia-smi
+```
+
+数据集已下好：`/home/dm/looper/datasets/vlad_eval`（8.1 GB，三个 bag，消息数与 metadata 核对一致）。三张地图在 `/home/dm/looper/x5_work/maps/`，评测结果在 `../results/`。
 
 <a name="t-5"></a>
 #### 💻 T-5 · backend 抽象 —— 1–2 天 🔴 **所有上板工作的前置**
