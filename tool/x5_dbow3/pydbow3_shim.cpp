@@ -162,6 +162,42 @@ PYBIND11_MODULE(pydbow3, m) {
             }
             return out;
         }, py::arg("descriptors"), py::arg("max_results") = 10)
+        // Database::save() writes the vocabulary into the same cv::FileStorage
+        // (Database.cpp calls m_voc->save(fs) first), so the file is
+        // self-contained: load() below needs no prior setVocabulary(), and the
+        // separate Vocabulary.load() can be skipped entirely.
+        //
+        // The extension picks the cv::FileStorage backend: ".yml"/".yaml" and
+        // ".xml"/".json" are all text, and appending ".gz" gzips them.
+        .def("save", [](const DBoW3::Database &self, const std::string &path) {
+            // DBoW3 throws a bare std::string (not a std::exception) when
+            // FileStorage cannot open the path; pybind11 has no translator for
+            // that, so it would abort the interpreter instead of raising.
+            try {
+                self.save(path);
+            } catch (const std::string &err) {
+                throw std::runtime_error(err);
+            }
+        }, py::arg("path"))
+        .def("load", [](DBoW3::Database &self, const std::string &path) {
+            try {
+                self.load(path);
+            } catch (const std::string &err) {
+                throw std::runtime_error(err);
+            }
+            // A file that parses but is not a database leaves the embedded
+            // vocabulary empty rather than failing, which would then make every
+            // query silently return nothing.
+            const DBoW3::Vocabulary *voc = self.getVocabulary();
+            if (voc == nullptr || voc->empty()) {
+                throw std::runtime_error(
+                    "database has no vocabulary after loading " + path);
+            }
+            return true;
+        }, py::arg("path"))
         .def("size", [](const DBoW3::Database &self) { return self.size(); })
+        .def("usingDirectIndex", [](const DBoW3::Database &self) {
+            return self.usingDirectIndex();
+        })
         .def("clear", [](DBoW3::Database &self) { self.clear(); });
 }

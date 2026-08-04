@@ -89,6 +89,56 @@ voc.save("voc_office.dbow3")
 Then, at load time, drop the Python-side vocabulary once the database has taken
 its copy — that alone saves ~154 MB with the stock ORBvoc:
 
+## Do not persist the Database (measured)
+
+`Database.save()` / `Database.load()` are bound (the saved file embeds the
+vocabulary, so `load()` needs no prior `setVocabulary()`), but **they are useless
+as a startup optimisation and must not be put on the board's boot path.**
+
+Measured on this PC (x86_64) over `maps/map_gt` — 1123 keyframes, 1.03 M ORB
+descriptors, 0.29 s to read them all out of the feature shelf. "rebuild" is the
+status quo: binary `voc.load()` plus 1123 × `db.add()`.
+
+| vocabulary | words | rebuild | save | file | load | load / rebuild |
+| --- | --- | --- | --- | --- | --- | --- |
+| `voc_office_k10L4` | 10 000 | 1.54 s | 0.79 s | 52.6 MB | **6.4 s** | 4× |
+| `voc_office_k10L5` | 99 023 | 1.54 s | 0.96 s | 84.6 MB | **595.5 s** | **387×** |
+| `voc_office_k10L5` (`.yml.gz`) | 99 023 | 1.66 s | 7.27 s | 20.5 MB | **851.1 s** | **512×** |
+| `ORBvoc` | 971 814 | 5.29 s | 5.01 s | 352.5 MB | not attempted, ~16 h | ~10 000× |
+
+Every round trip is exact — identical top-10 ids and `max|ΔScore| = 0` — so this
+is a performance verdict, not a correctness one. Gzipping shrinks the file 4×
+and makes loading *slower*: the cost is parsing, not I/O.
+
+The cause is not "YAML is slow", it is a complexity bug in DBoW3. Both loops in
+the load path index a FileStorage **sequence** by integer, and
+`cv::FileNode::operator[](int)` is a linear walk, so both are **O(n²)**:
+`Vocabulary::load(fs)` does `fn[i]["nodeId"]` per node, and `Database::load`
+does `fn[wid]` per word. A 9.9× larger vocabulary cost 93× the load time
+(9.9² = 98) while the file only grew 1.6×.
+
+Load time is therefore set by the *vocabulary*, not by the map. With `k10L5`
+fixed, cutting the keyframe count changes nothing:
+
+| entries | rebuild | file | load |
+| --- | --- | --- | --- |
+| 100 | 0.25 s | 35.0 MB | 691.6 s |
+| 300 | 0.48 s | 44.3 MB | 786.9 s |
+| 1123 | 1.48 s | 84.6 MB | 595.5 s |
+
+Note that a standalone `.dbow3` file is DBoW3's own **binary** format, which
+`Vocabulary::load(const std::string&)` sniffs and reads in 0.06 s.
+`Database::save` throws that away and re-encodes the same vocabulary as YAML, so
+most of the 595 s is spent re-parsing something we already had a fast reader for.
+Any real fix has to bypass `Database::save`/`load` and serialise `m_ifile`
+directly.
+
+For reference, rebuilding costs ~16 s of a 34 s `MapNode.__init__` on the X5,
+which is ~9× slower than this PC. The PC load is already 387× the PC rebuild,
+and a PC number is a *lower bound* on the board: extrapolating gives ~90 min to
+load what the board rebuilds in 16 s. `.yml` at 84.6 MB also has to be parsed
+into an OpenCV node tree on a board with 908 MB available and no swap.
+
 ```python
 voc = pydbow3.Vocabulary(); voc.load("voc_office.dbow3")
 db = pydbow3.Database(); db.setVocabulary(voc)

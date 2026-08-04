@@ -13,6 +13,7 @@ compiler and no OpenCV):
 """
 import os
 import sys
+import tempfile
 import time
 
 import numpy as np
@@ -44,6 +45,46 @@ def roundtrip(feats, label):
           f"x{len(feats)} -> voc.size={voc.size()} db.size={db.size()} "
           f"results={len(r)} top1=(Id={r[0].Id}, Score={r[0].Score:.4f}) "
           f"[{time.time() - t0:.1f}s]")
+
+
+def save_load_roundtrip(feats, label, suffix=".yml"):
+    """Database.save()/load() must round-trip queries bit-for-bit.
+
+    Also asserts the saved file is self-contained: the fresh Database gets no
+    setVocabulary() call, because DBoW3 embeds the vocabulary in the same
+    FileStorage.
+    """
+    voc = pydbow3.Vocabulary(10, 3)
+    voc.create(feats)
+    db = pydbow3.Database()
+    db.setVocabulary(voc)
+    for f in feats:
+        db.add(f)
+    before = [db.query(f, 5) for f in feats]
+
+    path = os.path.join(tempfile.gettempdir(), f"pydbow3_test_db{suffix}")
+    t0 = time.time()
+    db.save(path)
+    t_save = time.time() - t0
+    size = os.path.getsize(path)
+
+    fresh = pydbow3.Database()  # deliberately no setVocabulary()
+    t0 = time.time()
+    assert fresh.load(path) is True, f"{label}: load() did not return True"
+    t_load = time.time() - t0
+
+    assert fresh.size() == db.size(), \
+        f"{label}: size {fresh.size()} != {db.size()}"
+    after = [fresh.query(f, 5) for f in feats]
+    for i, (b, a) in enumerate(zip(before, after)):
+        assert [r.Id for r in b] == [r.Id for r in a], \
+            f"{label}: query {i} ids differ: {[r.Id for r in b]} vs {[r.Id for r in a]}"
+        for rb, ra in zip(b, a):
+            assert abs(rb.Score - ra.Score) < 1e-9, \
+                f"{label}: query {i} score {rb.Score} != {ra.Score}"
+    os.remove(path)
+    print(f"{label}: db.size={db.size()} save={t_save:.2f}s load={t_load:.2f}s "
+          f"file={size / 1e6:.2f} MB -> {len(before)} queries identical")
 
 
 print("python:", sys.version.split()[0])
@@ -78,5 +119,36 @@ except Exception as exc:  # noqa: BLE001
     print("float64 rejected as expected ->", type(exc).__name__)
 else:
     print("WARNING: float64 was silently accepted (forcecast still in place?)")
+
+# Database.save()/load() round trip. Small (32 images x 200 descriptors) because
+# the YAML that cv::FileStorage writes is bulky and slow -- that is exactly the
+# property being measured in docs/x5, not a property of this test.
+save_load_roundtrip([rng.integers(0, 256, (200, 32), dtype=np.uint8)
+                     for _ in range(32)], "uint8 save/load")
+save_load_roundtrip([rng.integers(0, 256, (200, 32), dtype=np.uint8)
+                     for _ in range(32)], "uint8 save/load gz", ".yml.gz")
+
+# Loading something that is not a database must raise rather than yield a
+# silently empty index.
+_bogus = os.path.join(tempfile.gettempdir(), "pydbow3_not_a_db.yml")
+with open(_bogus, "w") as fh:
+    fh.write("%YAML:1.0\n---\nsomething: 1\n")
+try:
+    pydbow3.Database().load(_bogus)
+except Exception as exc:  # noqa: BLE001
+    print("non-database file rejected as expected ->", type(exc).__name__)
+else:
+    print("WARNING: a non-database YAML file loaded without error")
+finally:
+    os.remove(_bogus)
+
+# A missing path must raise (DBoW3 throws a bare std::string there, which
+# pybind11 cannot translate unless the shim catches it).
+try:
+    pydbow3.Database().load("/nonexistent/definitely_not_here.yml")
+except Exception as exc:  # noqa: BLE001
+    print("missing file rejected as expected ->", type(exc).__name__)
+else:
+    print("WARNING: loading a missing file did not raise")
 
 print("OK")
