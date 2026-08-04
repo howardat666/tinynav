@@ -318,14 +318,34 @@ class ORBMatcher:
         if d0_u8.size == 0 or d1_u8.size == 0:
             return out
 
-        k = 2 if d1_u8.shape[0] >= 2 else 1
-        raw_matches = self.flann.knnMatch(d0_u8, d1_u8, k=k)
+        # Lowe's ratio test needs a second-nearest neighbour to compare against.
+        # When the train set holds a single descriptor there is none, and
+        # accepting the sole neighbour unconditionally is not a degenerate corner
+        # case -- it is actively harmful: every query descriptor then "matches"
+        # that one train descriptor, so all correspondences collapse onto a single
+        # keypoint. Downstream that yields hundreds of coincident 2D observations,
+        # a PnP problem whose translation is unobservable, a pose at ~1e15 m with
+        # exactly zero reprojection error, and an inlier ratio of 1.0 -- i.e. the
+        # worst possible estimate carries the highest possible confidence. A frame
+        # with one keypoint cannot localize anything, so report no matches.
+        if d1_u8.shape[0] < 2:
+            logger.warning(
+                "ORBMatcher: train set has %d descriptor(s); the ratio test cannot "
+                "be evaluated, so no matches are reported",
+                d1_u8.shape[0],
+            )
+            return out
+
+        raw_matches = self.flann.knnMatch(d0_u8, d1_u8, k=2)
         good_matches = []
         for pair in raw_matches:
-            if len(pair) == 0:
-                continue
-            if len(pair) == 1:
-                good_matches.append(pair[0])
+            if len(pair) < 2:
+                # LSH is approximate and can return a single neighbour even when
+                # the train set holds many. Accepting it would mean accepting a
+                # match that passed no quality test at all, and measurement says
+                # that costs more than it gains: keeping these matches drops
+                # night precision from 71.1% to 61.0% and day correct
+                # relocalizations from 1123 to 1120. Undecidable, so discard.
                 continue
             m, n = pair[:2]
             if m.distance < self.flann_ratio * n.distance:

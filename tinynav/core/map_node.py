@@ -864,6 +864,22 @@ class MapNode(Node):
                 point_3d_in_world_list = np.concatenate(point_3d_in_world_arrays, axis=0)
                 point_2d_in_keyframe_list = np.concatenate(point_2d_in_keyframe_arrays, axis=0)
 
+                # A correspondence count says nothing about whether the geometry
+                # constrains a pose. If the 2D observations are all (nearly) the
+                # same pixel, every 3D point projects to that pixel from a camera
+                # at effectively infinite distance, so PnP fits *perfectly* with
+                # zero reprojection error and a 1.0 inlier ratio while the
+                # translation is completely unobservable. Counting inliers cannot
+                # detect that; measuring the spread of the observations can.
+                spread_ok, spread_detail = self._observations_constrain_pose(point_2d_in_keyframe_list)
+                if not spread_ok:
+                    self.get_logger().info(f"Relocalization candidate timing ms: {'; '.join(candidate_timing_summaries)}")
+                    return self._relocalization_failed(
+                        f"degenerate 2D observations: {spread_detail}, "
+                        f"landmarks={len(point_3d_in_world_list)}, "
+                        f"candidates=[{'; '.join(candidate_summaries)}]"
+                    )
+
                 t_pnp = time.perf_counter()
                 success, rvec, tvec, inliers = cv2.solvePnPRansac(point_3d_in_world_list, point_2d_in_keyframe_list, self.map_K, None)
                 timings["pnp"] = timings.get("pnp", 0.0) + (time.perf_counter() - t_pnp) * 1000.0
@@ -872,6 +888,17 @@ class MapNode(Node):
                     T = np.eye(4)
                     T[:3, :3] = R
                     T[:3, 3] = tvec.reshape(3)
+                    # Last line of defence: the camera has to end up somewhere the
+                    # map actually covers. This catches any remaining ill-posed
+                    # solve regardless of how it arose.
+                    pose_ok, pose_detail = self._pose_is_within_map(T)
+                    if not pose_ok:
+                        self.get_logger().info(f"Relocalization candidate timing ms: {'; '.join(candidate_timing_summaries)}")
+                        return self._relocalization_failed(
+                            f"relocalized pose outside the map: {pose_detail}, "
+                            f"inliers={len(inliers)}/{len(point_2d_in_keyframe_list)}, "
+                            f"candidates=[{'; '.join(candidate_summaries)}]"
+                        )
                     print(f"relocalization pose : {T}")
                     self.get_logger().info(f"Relocalization candidate timing ms: {'; '.join(candidate_timing_summaries)}")
                     return True, T, len(inliers) / len(point_2d_in_keyframe_list)
@@ -893,6 +920,68 @@ class MapNode(Node):
                 f"no loop candidates above threshold: candidates={len(candidates)}, max_similarity={max_similarity:.3f}"
             )
         return self._relocalization_failed("unknown relocalization failure")
+
+    # A pose is only determined if the bearings to the landmarks actually differ.
+    # These two numbers are deliberately loose -- they are there to reject the
+    # pathological cases (everything on one pixel, or a handful of pixels), not to
+    # second-guess a genuine solve. A healthy relocalization spreads its
+    # observations over ~100 px of a 544x640 image.
+    min_distinct_observations = 20
+    min_observation_spread_px = 8.0
+
+    def _observations_constrain_pose(self, points_2d: np.ndarray) -> tuple[bool, str]:
+        """Reject 2D correspondence sets too concentrated to determine a pose."""
+        if points_2d.shape[0] == 0:
+            return False, "no observations"
+        # Round to a tenth of a pixel before counting: the failure mode is exact
+        # duplication (many reference keypoints matched to one query keypoint),
+        # and rounding keeps float noise from hiding it.
+        distinct = np.unique(np.round(points_2d[:, :2], 1), axis=0).shape[0]
+        # RMS distance from the centroid, i.e. how wide a patch the observations
+        # cover. Zero means they are all the same point.
+        spread = float(np.sqrt(points_2d[:, :2].var(axis=0).sum()))
+        detail = f"distinct={distinct}, spread={spread:.2f}px"
+        if distinct < self.min_distinct_observations:
+            return False, f"{detail} (need distinct >= {self.min_distinct_observations})"
+        if spread < self.min_observation_spread_px:
+            return False, f"{detail} (need spread >= {self.min_observation_spread_px}px)"
+        return True, detail
+
+    # How far outside the mapped area a relocalized camera may still land. The
+    # map is metric and bounded, so this only has to be generous enough never to
+    # reject a plausible pose; it exists to catch the absurd ones.
+    max_distance_outside_map_m = 50.0
+
+    def _map_bounds(self) -> tuple[np.ndarray, float] | None:
+        """Centroid and radius of the mapped keyframe positions, computed once."""
+        cached = getattr(self, "_map_bounds_cache", None)
+        if cached is not None:
+            return cached
+        if not self.map_poses:
+            return None
+        positions = np.array([pose[:3, 3] for pose in self.map_poses.values()])
+        centre = positions.mean(axis=0)
+        radius = float(np.linalg.norm(positions - centre, axis=1).max())
+        self._map_bounds_cache = (centre, radius)
+        return self._map_bounds_cache
+
+    def _pose_is_within_map(self, pose_world_to_camera: np.ndarray) -> tuple[bool, str]:
+        """Check the solved camera centre sits somewhere the map covers."""
+        bounds = self._map_bounds()
+        if bounds is None:
+            return True, "map bounds unavailable"
+        centre, radius = bounds
+        # solvePnPRansac returns world->camera; the camera position in world is
+        # -R^T t.
+        rotation = pose_world_to_camera[:3, :3]
+        translation = pose_world_to_camera[:3, 3]
+        camera_in_world = -rotation.T @ translation
+        if not np.all(np.isfinite(camera_in_world)):
+            return False, "camera position is not finite"
+        distance = float(np.linalg.norm(camera_in_world - centre))
+        limit = radius + self.max_distance_outside_map_m
+        detail = f"|camera - map_centre|={distance:.2f}m, map_radius={radius:.2f}m, limit={limit:.2f}m"
+        return distance <= limit, detail
 
     def keypoint_with_depth_to_3d(self, keypoints:np.ndarray, depth:np.ndarray, pose_from_camera_to_world:np.ndarray, K:np.ndarray):
         point_in_camera = []
