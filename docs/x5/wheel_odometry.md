@@ -297,8 +297,8 @@ the geometry need to be overridable from a launcher without editing code.
 | `baudrate` | `1000000` | Feetech factory default |
 | `wheel_motor_ids` | `[7, 8, 9]` | left, back, right. Order matters. |
 | `wheel_signs` | `[1.0, 1.0, 1.0]` | per-wheel +1/-1, absorbs reversed wiring |
-| `wheel_radius` | `0.05` | **CALIBRATE.** Scales translation. |
-| `base_radius` | `0.125` | **CALIBRATE.** Scales yaw. |
+| `wheel_radius` | `0.05` | **CALIBRATE.** Scales translation. This robot: `0.050385`. |
+| `base_radius` | `0.125` | **CALIBRATE.** Scales yaw. This robot: `0.127083`. |
 | `wheel_mount_angles_deg` | `[240, 0, 120]` | before the offset |
 | `wheel_mount_offset_deg` | `-90.0` | |
 | `ticks_per_rev` | `4096` | STS3215; SCS series is 1024 |
@@ -439,6 +439,58 @@ the robot is on the ground than by being told nothing.
 
 ## Calibration
 
+### Measured on this robot (LeKiwi + Looper, 2026-08-04)
+
+```bash
+-p wheel_radius:=0.050385 -p base_radius:=0.127083
+```
+
+| | value | vs upstream default | how |
+| --- | --- | --- | --- |
+| `wheel_radius` | **0.050385** | +0.77% | one 25 s driven straight run, 3.030 m by tape |
+| `base_radius` | **0.127083** | +1.66% | two driven spins, 4.000 turns each, agreeing to 0.12% |
+
+Both defaults turned out to be close, so the practical lesson from this
+calibration is not "the defaults are wrong" -- it is **how easy it is to produce
+a confidently wrong calibration**, and what each failure looked like:
+
+* **Hand-pushing slipped ~11%.** The docs used to recommend pushing by hand for
+  the straight test, on the theory that no torque means no slip. On an omni base
+  that is backwards: pushing at one point yaws the chassis and skids the rollers.
+  Two hand-pushed runs under-rotated by 11.4% and 11.0%, and the straight test
+  reported `wheel_radius = 0.0558` -- 12.8% *above* the geometric radius, which
+  is impossible, since a loaded roller's effective radius can only be smaller.
+  Driving all three wheels gave 0.17 deg of yaw and 0.06% left/right asymmetry
+  where the push gave 23.7 deg and 10.8%.
+* **Eyeballing a fraction of a turn is worth only +/-5%.** Driving for a fixed
+  time and then estimating "about 4 1/8 turns" produced 0.1275 and 0.1210 from
+  two runs -- a 5.3% disagreement. The encoders proved the error was in the
+  count, not the wheels: the tick totals said one run had rotated 6.2% further
+  than the other while the reported counts differed by 0.9%.
+* **The fix was to make the operator judge an event, not a quantity.** Drive with
+  `--drive` and *no* `--duration`, and press ENTER at the moment the floor and
+  chassis marks realign on the 4th turn. The ground truth is then exactly 4 turns
+  by construction, and the only error is reaction time: 0.3 s at 0.3 rad/s is
+  5 deg, i.e. 0.35%. That is a 15x improvement over estimating the fraction, and
+  the two directions then agreed to 0.12%.
+* **A ruler on the chassis lost to the spin test, and should have.** `base_radius`
+  measured wheel-centre-to-base-centre came out 134 mm, 5.4% above the calibrated
+  0.1271 -- enough for 19.6 deg of error per full turn. `base_radius` is not
+  really a distance: it is the coefficient mapping wheel rotation to base yaw,
+  and whatever mix of wheel spacing, roller contact point and wheel cant produces
+  that coefficient, the spin test measures the coefficient the odometry actually
+  uses. Prefer it over the tape. (The tape's weak point here is that the base
+  centre is an imaginary point; if you do want an independent geometric check,
+  measure *between two wheels* and use `base_radius = d / sqrt(3)`, because both
+  ends of that measurement are physical.)
+
+Cross-axis error that odometry cannot see: over 3 m of commanded-straight driving
+the robot ended up 50-80 mm to the right, twice, same sign -- about 1.6%. The
+odometry reported `dy = +0.0008 m`, i.e. nothing. The mechanism is visible in the
+tick counts: the back wheel would have had to roll 647 ticks to allow a 50 mm
+sideways translation, and it turned 5. It skidded. This is the "no slip
+observability" property of an exactly-determined three-wheel base, measured.
+
 Run in this order. Steps 2 and 3 both need step 1 to be correct first.
 
 ### 1. Signs and wheel order
@@ -464,29 +516,49 @@ yaw) separately.
 ### 2. `wheel_radius`, from a straight run
 
 ```bash
-python3 tool/wheel_odom_calibrate.py straight --port /dev/ttyACM0 --distance 2.0
+python3 tool/wheel_odom_calibrate.py straight --port /dev/ttyS3 \
+    --drive --speed 0.12 --duration 25 --measure-after
 ```
 
-Push the robot a tape-measured 2 m, press ENTER. Body displacement is exactly
-proportional to `wheel_radius`, so the correction is a plain ratio.
+Drive for a fixed time, *then* tape-measure what happened, entering both the
+forward distance and the sideways miss. Body displacement is exactly proportional
+to `wheel_radius`, so the correction is a plain ratio -- of the two *lengths*,
+which is why the sideways miss enters only through the hypotenuse and barely
+moves the answer (50 mm across 3 m is 0.014%). Its value is the direction check:
+the magnitude ratio is one equation that rescaling `wheel_radius` can always
+satisfy, so it is structurally blind to *relative* error between the three
+wheels, and the angle between the two displacement vectors is not.
 
-Push by hand rather than using `--drive`: no torque means no slip, so you measure
-geometry instead of geometry plus slip.
+Use `--drive`, not a hand push, and do not try to stop the base on a mark.
 
 ### 3. `base_radius`, from a spin
 
 ```bash
-python3 tool/wheel_odom_calibrate.py spin --port /dev/ttyACM0 --turns 5 \
-    --wheel-radius <value from step 2>
+python3 tool/wheel_odom_calibrate.py spin --port /dev/ttyS3 \
+    --drive --yaw-rate 0.3 --turns 4 --wheel-radius <value from step 2>
 ```
 
-Rotate in place a whole number of turns. Yaw is proportional to
-`wheel_radius / base_radius`, so with `wheel_radius` already fixed this is again
-a plain ratio. Mark the floor and the chassis so you can hit the turn count.
+Note the deliberate absence of `--duration`: the wheels start turning and the
+script waits on ENTER. Mark the floor and the chassis, and press ENTER at the
+instant the marks realign on the 4th turn. The ground truth is then exactly the
+`--turns` you passed, and the operator never has to estimate a fraction of a
+turn -- which is worth a factor of ~15 in accuracy, see above. Yaw is
+proportional to `wheel_radius / base_radius`, so with `wheel_radius` already
+fixed this is again a plain ratio.
 
-Use as many turns as you can stand (5-10): the estimate improves linearly with
-total rotation, and one turn does not separate the answer from the start/stop
-transient.
+Run it in both directions (`--yaw-rate 0.3` then `-0.3`). Two reasons: the two
+results are an independent consistency check, and it unwinds the tether. Four
+turns wraps a USB-C cable four times around the chassis, and a wound cable's
+restoring torque resists the run that wound it and assists the run that unwinds
+it -- which biases the two estimates in opposite directions. Better still, hold
+the cable above the axis of rotation and let it hang.
+
+Note that the `base_radius` you pass in cancels out of its own calibration
+exactly (the yaw row of `M^-1` carries `1/base_radius`, and the correction
+multiplies by `base_radius` again), so its value only affects the printed
+"deviation from default" and the commanded yaw rate. The `wheel_radius` you pass
+in does *not* cancel -- the result is directly proportional to it. Hence the
+order.
 
 ### Also
 
@@ -499,8 +571,37 @@ transient.
   different effective wheel radii on omniwheels.
 - Repeat each run 3 times. If `wheel_radius` moves more than ~1% between runs,
   something mechanical is loose.
+- Every run appends its encoder half to `wheel_odom_runs.jsonl` (see `--log`) the
+  moment the motion ends, before the measurement prompt. The tick deltas are the
+  one part that cannot be recovered -- a drive cannot be un-driven -- so a run
+  abandoned at the prompt used to throw away the whole thing. A tape measurement
+  can always be re-applied to a logged line afterwards.
+- Watch the `Goal_Velocity tracking` line, which reports commanded versus actual
+  wheel rotation. It separates wheel *slip* (the wheel turned, the robot did not
+  move, so the robot travels less than the encoders say) from a *setpoint* error
+  (the wheel did not turn by the commanded amount). The second never shows up in
+  the calibrated radii, which come from encoder counts rather than setpoints, but
+  it decides whether two runs are comparable -- which matters the moment you reuse
+  a ground truth measured during an earlier run.
 
 ## Practical limits
+
+**Open-loop velocity commands under-deliver, and worse at low speed.** Measured
+`Goal_Velocity` tracking on this base:
+
+| commanded | actual / commanded |
+| --- | --- |
+| 1369 ticks/s (0.12 m/s straight) | −0.8% |
+| 867 ticks/s (0.5 rad/s spin) | −1.3% |
+| 485 ticks/s (0.3 rad/s spin) | **−6.5%** |
+
+The shortfall grows as the setpoint shrinks, which is the signature of friction
+and a velocity-loop deadband rather than of voltage saturation -- saturation
+would bite at the *top* end. End to end, commanding 0.3 rad/s delivered
+0.2755 rad/s, −8.2%: 6.5% of that is the servo, and the remaining 1.6% was the
+uncalibrated `base_radius` in the command mapping. Fixing the parameter removes
+only the 1.6%. So do not command below roughly 0.2 rad/s or 0.05 m/s and expect
+the base to honour it, and do not build a controller that assumes it does.
 
 **Top speed.** 1 m/s forward needs 11291 ticks/s per wheel. The STS3215 tops out
 around 45 rpm at 12 V, i.e. ~3070 ticks/s, so **maximum forward speed is roughly

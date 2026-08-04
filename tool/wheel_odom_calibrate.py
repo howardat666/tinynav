@@ -31,18 +31,20 @@ Three checks, in the order you should run them
 
 Usage
 -----
-Manual mode (recommended first; nothing is energised, you push the robot)::
+Step 1 is a hand push: nothing is energised and it only needs to establish a
+sign, so slip does not matter::
 
-    python3 tool/wheel_odom_calibrate.py signs   --port /dev/ttyACM0
-    python3 tool/wheel_odom_calibrate.py straight --port /dev/ttyACM0 --distance 2.0
-    python3 tool/wheel_odom_calibrate.py spin     --port /dev/ttyACM0 --turns 5
+    python3 tool/wheel_odom_calibrate.py signs --port /dev/ttyS3
 
-Powered mode (the script drives the wheels itself; keep a hand on the power)::
+Steps 2 and 3 drive the wheels -- keep a hand on the power.  Step 3 is
+deliberately given no ``--duration``, so it turns until you press ENTER::
 
-    python3 tool/wheel_odom_calibrate.py straight --port /dev/ttyACM0 --distance 2.0 \
-        --drive --speed 0.15
-    python3 tool/wheel_odom_calibrate.py spin --port /dev/ttyACM0 --turns 5 \
-        --drive --yaw-rate 0.6
+    python3 tool/wheel_odom_calibrate.py straight --port /dev/ttyS3 \
+        --drive --speed 0.12 --duration 25 --measure-after
+    python3 tool/wheel_odom_calibrate.py spin --port /dev/ttyS3 \
+        --drive --yaw-rate 0.3 --turns 4 --wheel-radius <from step 2>
+    python3 tool/wheel_odom_calibrate.py spin --port /dev/ttyS3 \
+        --drive --yaw-rate -0.3 --turns 4 --wheel-radius <from step 2>
 
 Dry run with no hardware at all (exercises this script's own arithmetic; it
 should recover ``--fake-wheel-radius`` / ``--fake-base-radius``)::
@@ -56,13 +58,34 @@ Practical notes
 ---------------
 * Do ``straight`` on the same floor you will navigate on.  Carpet and vinyl give
   measurably different effective wheel radii on omniwheels.
-* Do ``spin`` for as many turns as you can stand (5-10).  The estimate improves
-  linearly with total rotation, and one turn is not enough to separate the answer
-  from the start/stop transient.
-* Pushing by hand is *better* than driving for the ``straight`` test: no torque
-  means no slip, so you measure geometry rather than geometry plus slip.
+* Run ``spin`` with ``--drive`` and **no** ``--duration``, so it turns until you
+  press ENTER, and press it at the instant your floor and chassis marks realign
+  on a whole turn.  Then ``--turns`` is exact by construction and the only error
+  is your reaction time -- 0.3 s at 0.3 rad/s is 5 degrees, i.e. 0.35%.  Driving
+  for a fixed time and afterwards estimating "about 4 1/8 turns" is worth only
+  about +/-5%: two such runs on this robot disagreed by 5.3%, and the tick totals
+  proved the error was in the count, not the wheels.  Judging an *event* beats
+  estimating a *quantity*.
+* Run ``spin`` in both directions.  The two results check each other, and it
+  unwinds the tether: four turns wraps a USB cable four times round the chassis,
+  and its restoring torque resists the run that wound it while assisting the run
+  that unwinds it, biasing the two estimates in opposite directions.
+* **Do not push by hand.**  This file used to recommend it, reasoning that no
+  torque means no slip.  On an omni base that is backwards: pushing at one point
+  yaws the chassis and skids the rollers sideways.  Measured on this robot, a
+  hand push gave 23.7 degrees of yaw and 10.8% left/right asymmetry where driving
+  all three wheels gave 0.17 degrees and 0.06%, and two hand-pushed runs
+  under-rotated by 11.4% and 11.0% -- enough to report a ``wheel_radius`` 12.8%
+  *above* the geometric radius, which is impossible, since a loaded roller's
+  effective radius can only be smaller.
 * Repeat each run 3 times and check the spread.  If ``wheel_radius`` moves by
   more than ~1% between runs, something mechanical is loose.
+* Sanity-check the result against a tape, but do not let the tape win a
+  disagreement.  ``base_radius`` is not really a distance -- it is the
+  coefficient mapping wheel rotation to base yaw -- and measuring to the base
+  *centre*, an imaginary point, came out 5.4% off on this robot.  If you want an
+  independent geometric check, measure between two wheels, where both ends are
+  physical, and use ``base_radius = d / sqrt(3)``.
 """
 
 from __future__ import annotations
