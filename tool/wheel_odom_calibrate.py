@@ -72,7 +72,11 @@ import numpy as np
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from tinynav.platforms.feetech_bus import FakeFeetechBus, FeetechBus  # noqa: E402
+from tinynav.platforms.feetech_bus import (  # noqa: E402
+    FakeFeetechBus,
+    FeetechBus,
+    FeetechBusError,
+)
 from tinynav.platforms.omni3_kinematics import (  # noqa: E402
     DEFAULT_BASE_RADIUS,
     DEFAULT_TICKS_PER_REV,
@@ -199,9 +203,21 @@ def start_motion(args, bus, kin, motor_ids) -> None:
     if not args.drive or args.fake:
         return
     for motor_id in motor_ids:
+        # Operating_Mode is at address 33, inside the EEPROM region, so it only
+        # takes effect while torque is off AND Lock is cleared. A locked write is
+        # acknowledged with error byte 0 and silently discarded, which would
+        # leave the wheel in position mode where Goal_Velocity does nothing.
+        bus.write("Torque_Enable", motor_id, 0)
+        bus.write("Lock", motor_id, 0)
         bus.write("Operating_Mode", motor_id, 1)
-        bus.write("Torque_Enable", motor_id, 1)
         bus.write("Lock", motor_id, 1)
+        bus.write("Torque_Enable", motor_id, 1)
+        mode = bus.read("Operating_Mode", motor_id)
+        if mode != 1:
+            raise FeetechBusError(
+                f"wheel {motor_id} reports Operating_Mode={mode} after being set to 1; "
+                "the EEPROM unlock did not take effect, so the wheels would not turn"
+            )
     if args.command == "spin":
         raw = kin.body_to_wheel_raw(0.0, 0.0, args.yaw_rate)
     else:
@@ -214,6 +230,23 @@ def stop_motion(args, bus, motor_ids) -> None:
     if not args.drive or args.fake:
         return
     bus.sync_write("Goal_Velocity", dict.fromkeys(motor_ids, 0))
+
+
+def driven_accumulate(args, bus, kin, motor_ids, clock):
+    """start_motion -> accumulate -> stop_motion, with the stop guaranteed.
+
+    With ``--drive`` the wheels are energised for the whole run, so the stop must
+    survive anything raised in between: Ctrl-C at the ENTER prompt, a bus error
+    mid-read, an unexpected exception. Without the finally, the base drives away
+    while the traceback prints.
+    """
+    start_motion(args, bus, kin, motor_ids)
+    try:
+        return accumulate(
+            bus, motor_ids, args.retries, make_stop_predicate(args, clock), clock, args.ticks_per_rev
+        )
+    finally:
+        stop_motion(args, bus, motor_ids)
 
 
 def report(label: str, nominal: float, measured: float) -> None:
@@ -248,9 +281,29 @@ def cmd_signs(args, bus, kin, clock) -> int:
         bus, ids, args.retries, make_stop_predicate(args, clock), clock, args.ticks_per_rev
     )
     print(f"\n  measured over {elapsed:.2f}s:")
-    for name, motor_id, d, expect in zip(WHEEL_NAMES, ids, deltas, nominal):
-        ok = "OK" if (d == 0 or np.sign(d) == np.sign(expect)) else "MISMATCH -> flip wheel_signs"
+    # A wheel whose expected rate is ~0 for this motion carries no sign
+    # information: the back wheel's rolling direction is perpendicular to +x, so
+    # a pure forward push turns it only by whatever slip occurs. Comparing
+    # np.sign(d) against np.sign(0.0) == 0 flagged that noise as a mismatch and
+    # sent you looking for a wiring fault that was not there.
+    scale = float(np.max(np.abs(nominal)))
+    uninformative = np.abs(nominal) < 0.05 * scale if scale > 0 else np.ones(3, dtype=bool)
+    for name, motor_id, d, expect, skip in zip(WHEEL_NAMES, ids, deltas, nominal, uninformative):
+        if skip:
+            ok = "(no constraint: nominally 0 for this motion, so any reading here is slip)"
+        elif d == 0 or np.sign(d) == np.sign(expect):
+            ok = "OK"
+        else:
+            ok = "MISMATCH -> flip this wheel's sign"
         print(f"    {name:<5} (id {motor_id}): {d:+7d} ticks   {ok}")
+
+    # The two informative wheels should read equal magnitudes for a straight
+    # push; the difference is the yaw that leaked in, and it is the single most
+    # useful number for judging whether the run is worth keeping.
+    informative = [abs(d) for d, skip in zip(deltas, uninformative) if not skip]
+    if len(informative) == 2 and max(informative) > 0:
+        asym = 100.0 * abs(informative[0] - informative[1]) / max(informative)
+        print(f"\n  left/right magnitude asymmetry: {asym:.1f}%  (a clean straight push is under ~3%)")
 
     body = kin.wheel_tick_delta_to_body_delta(deltas)
     print(f"\n  implied body displacement: dx={body[0]:+.4f} m  dy={body[1]:+.4f} m  dyaw={np.degrees(body[2]):+.2f} deg")
@@ -272,11 +325,7 @@ def cmd_straight(args, bus, kin, clock) -> int:
     print(f"STRAIGHT TEST -> wheel_radius   (ground truth distance {args.distance:.3f} m)")
     if not args.drive:
         print("  Push the robot straight forward exactly that distance, then press ENTER.")
-    start_motion(args, bus, kin, ids)
-    deltas, elapsed = accumulate(
-        bus, ids, args.retries, make_stop_predicate(args, clock), clock, args.ticks_per_rev
-    )
-    stop_motion(args, bus, ids)
+    deltas, elapsed = driven_accumulate(args, bus, kin, ids, clock)
 
     body = kin.wheel_tick_delta_to_body_delta(deltas)
     measured = float(np.hypot(body[0], body[1]))
@@ -303,11 +352,7 @@ def cmd_spin(args, bus, kin, clock) -> int:
     if not args.drive:
         print("  Rotate the robot in place by exactly that many turns, then press ENTER.")
         print("  Mark the floor and the chassis so you can hit the whole number of turns.")
-    start_motion(args, bus, kin, ids)
-    deltas, elapsed = accumulate(
-        bus, ids, args.retries, make_stop_predicate(args, clock), clock, args.ticks_per_rev
-    )
-    stop_motion(args, bus, ids)
+    deltas, elapsed = driven_accumulate(args, bus, kin, ids, clock)
 
     body = kin.wheel_tick_delta_to_body_delta(deltas)
     measured_rad = abs(float(body[2]))
