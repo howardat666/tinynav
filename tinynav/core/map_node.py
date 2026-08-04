@@ -538,6 +538,18 @@ class MapNode(Node):
         self.occupancy_map = np.load(f"{tinynav_map_path}/occupancy_grid.npy")
         self.occupancy_map_meta = np.load(f"{tinynav_map_path}/occupancy_meta.npy")
         self.sdf_map = np.load(f"{tinynav_map_path}/sdf_map.npy")
+        # Starts here, *after* the two LoopClosures, and must not be moved ahead of
+        # them. It looks like free real estate: the warmup needs nothing from the
+        # arrays above but their dtypes and one scalar, so starting it earlier
+        # would seem to hide its ~2.7 s of JIT inside the rebuild's ~18 s. Measured
+        # on the X5, k10L5 vocabulary, 1161-keyframe map, it does the opposite:
+        #
+        #   warmup started after the rebuild  : __init__ 21205 / 20068 ms
+        #   warmup started before the rebuild : __init__ 44481 / 32345 ms
+        #
+        # The DBoW3 rebuild does not release the GIL, so numba's compiler and the
+        # rebuild thrash against each other rather than overlapping -- in one run
+        # the JIT itself stretched from 2.7 s to 21.7 s. Serial beats contending.
         self._start_nav_path_search_warmup()
 
         print(f"sdf_map.shape: {self.sdf_map.shape}")

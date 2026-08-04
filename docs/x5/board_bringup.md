@@ -283,6 +283,32 @@ ffmpeg + CMake 搬上板。而 `tool/video_db.py` 在模块顶层 import 它，
 **X5 比 PC 慢约 9 倍**，和 PC 上按核数缩放外推的 0.2–1.1 s 吻合。
 **5 秒预算有约 13 倍余量 —— 时间明确不是瓶颈。**
 
+### 冷启动优化：板上实测（2026-08-04）
+
+`map_day`（1161 关键帧）+ `voc_office_k10L5`，numba 与页缓存均已预热，同一份
+`profile_startup.py`，只换 `core/` 三个文件：
+
+| | 优化前 | 优化后 | |
+|---|---|---|---|
+| `MapNode.__init__` | 34795 / 34981 ms | **21205 / 20068 / 19647 ms** | **−41.8%** |
+| ├ `LoopClosure(1161)`（DBoW3 重建） | 30131 / 30418 ms | 17849–19258 ms | −38.6% |
+| ├ `LoopClosure(0)` | 474 / 475 ms | 76–94 ms | −83% |
+| └ `_warmup_nav_path_search`（numba JIT） | 2708 / 2785 ms | 移出构造函数 | −100%（关键路径上） |
+| RSS | 363 MiB | **304 MiB** | −16% |
+| 峰值 RSS | 363 MiB | 310 MiB | |
+
+重复性：优化前散布 0.5%，优化后 3.8%。
+
+剩下的 **~18 s 就是 DBoW3 数据库重建，而且这是设计下限** —— `Database::save/load`
+已经实现并验证正确（top-10 完全一致，`max|ΔScore| = 0`），但 k10L5 的加载比重建慢
+**387 倍**（595.5 s vs 1.54 s），根因是 `cv::FileNode::operator[](int)` 的线性遍历
+被套在逐节点循环里，是 O(n²) 复杂度缺陷。所以这 18 s 收不回来。
+
+`_warmup_nav_path_search` 那 2.7 s 只是移出了构造函数（后台线程），并没有被藏进重建里
+—— **也不能藏**，见 `map_node.py` 里那段注释：把线程提到重建之前实测让 `__init__`
+恶化到 44481 / 32345 ms，因为 DBoW3 重建不释放 GIL，numba 编译器和它互相抢，
+其中一趟 JIT 自身从 2.7 s 被拖到 21.7 s。**串行比争用快。**
+
 分段耗时（gt→day，ms，mean/p50）：
 
 | 阶段 | mean | p50 | 说明 |
@@ -320,8 +346,8 @@ ffmpeg + CMake 搬上板。而 `tool/video_db.py` 在模块顶层 import 它，
 |---|---|---|
 | 🔴 | **PnP 之后没有任何几何校验**（只检查 `landmarks>40` 且 `inliers≥20`）。板上独立复现：gt→day 有 1/28 个查询返回 `success=True` 但 XY 误差 **1.9e14 m**、旋转 **112°**，还带着 weight>0.9 进 Ceres 污染 map→odom | 会污染位姿图，白天也有 1.8–2.2 % 发生率。**这是上车前必须修的** |
 | 🔴 | **夜间成功率只有 14.2 %**，且根因在**特征层不在检索层**：夜间每帧只有 326 个 ORB 点（白天 908–926），甚至有整帧 0 个。换词典只能到 16.7 % | 换词典/调检索是死路。要走补光 / 换特征 / 夜间图只夜间用。**「晚上没灯」这个前提下，纯可见光无主动照明的方案不成立** |
-| 🟡 | 启动 34 s：`LoopClosure.__init__`(bow) 用 `get_depth_embedding_features_images` 取描述子，白读 **1564 MB depth**（只要描述子的 132 MB），改用 `db.features[ts]` 一行搞定 | 冷启动时间 |
-| 🟡 | `__init__` 建两个 `LoopClosure` 各载一份完整词典，而 `nav_loop_closure` 服务的 `keyframe_mapping` 在 `map_node.py:622` 已被禁用 | 大词典下白费 596 MB |
+| ✅ | ~~启动 34 s：`LoopClosure.__init__`(bow) 用 `get_depth_embedding_features_images` 取描述子，白读 **1564 MB depth**~~ 已修（`35628bf`），改用 `TinyNavDB.get_features()`。板上实测 34.9 → **20.3 s**，见上 | 冷启动时间 |
+| ✅ | ~~`__init__` 建两个 `LoopClosure` 各载一份完整词典~~ 已修（`35628bf`）。实际驻留的是**四份**不是两份（2 份 Python + 2 份 `Database` 深拷贝）；共享后 ORBvoc 1189 → 628 MiB、k10L5 123 → 63 MiB，板上 RSS 363 → 304 MiB | 大词典下白费 596 MB |
 | 🟡 | ORB 二值描述子被存成 float32/255，`features.dat` 145 MB（本可 36 MB），每次匹配还要转回 uint8 | 磁盘 + `db_load` 耗时 |
 | ⚪ | `depth3d` 是纯 Python for 循环，59 ms | 有优化空间但当前不是瓶颈 |
 | ⚪ | LeKiwi 轮速里程计代码已写完自测通过，但**没在真硬件上标定过**；还有和 `lekiwi_control.py` 的串口独占冲突、`base_link → camera` 静态变换缺失 | 见 [`wheel_odometry.md`](wheel_odometry.md) |
