@@ -62,10 +62,20 @@ in turn follows the Feetech STS/SMS e-manual.
 
 from __future__ import annotations
 
+import errno
+import logging
+import termios
 import time
 from dataclasses import dataclass, field
 
 import serial
+
+logger = logging.getLogger(__name__)
+
+# How many times to retry tcdrain() when a signal interrupts it. Signals arrive
+# in bursts at process teardown, not continuously, so a small count is enough;
+# see FeetechBus._drain for why exhausting them is not fatal.
+_DRAIN_EINTR_RETRIES = 8
 
 # --------------------------------------------------------------------------- #
 # Protocol constants
@@ -338,6 +348,36 @@ class FeetechBus:
 
     # -- raw framing -------------------------------------------------------- #
 
+    def _drain(self, ser) -> None:
+        """``ser.flush()``, but tolerant of being interrupted by a signal.
+
+        pyserial's ``flush()`` is ``termios.tcdrain()``, which blocks until the
+        UART has actually shifted the bytes out.  The ``termios`` module is not
+        covered by PEP 475, so a signal delivered while it blocks raises
+        ``termios.error(EINTR)`` instead of the call being retried -- unlike
+        almost every other blocking call in the standard library.
+
+        Observed on the X5: SIGTERM arriving mid-transaction propagated out of a
+        ROS timer callback as an unhandled traceback.  The dangerous part is not
+        the ugly exit, it is that ``WheelOdometryNode.destroy_node()`` zeroes
+        ``Goal_Velocity`` on the way out -- so a Ctrl-C landing inside tcdrain
+        could skip the stop command and leave the base driving.
+
+        Draining is only a barrier for tidiness: ``write()`` has already handed
+        the bytes to the kernel and the UART will transmit them regardless.  So
+        if the retries are exhausted, carry on rather than raise; the worst case
+        is a stale byte at the head of the next read, which the checksum catches.
+        """
+        for _ in range(_DRAIN_EINTR_RETRIES):
+            try:
+                ser.flush()
+                return
+            except (termios.error, OSError) as exc:
+                if (exc.args[0] if exc.args else None) != errno.EINTR:
+                    raise
+        logger.debug("tcdrain interrupted %d times in a row; proceeding without the barrier",
+                     _DRAIN_EINTR_RETRIES)
+
     def _send(self, motor_id: int, instruction: int, params: list[int]) -> None:
         ser = self._require_serial()
         length = len(params) + 2
@@ -345,7 +385,7 @@ class FeetechBus:
         packet = bytes([0xFF, 0xFF, *body, checksum(body)])
         ser.reset_input_buffer()
         ser.write(packet)
-        ser.flush()
+        self._drain(ser)
 
     def _read_exactly(self, n: int) -> bytes:
         """Read exactly ``n`` bytes or raise :class:`FeetechTimeoutError`."""

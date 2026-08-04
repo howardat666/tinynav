@@ -9,6 +9,7 @@ Covers, in order of how much they would hurt if wrong:
   * encoder wrap-around differencing across the 0/4095 seam
   * SE(2) integration on a straight line and a closed circle
   * Feetech packet framing, checksums and sign-magnitude decoding
+  * tcdrain surviving EINTR, so Ctrl-C cannot skip the wheel-stop command
   * the scipy-free quaternion helpers the control node relies on
   * velocity limits derived from geometry, replacing a hardcoded guess
   * the full ROS nodes driven by a fake bus (skipped if rclpy is unavailable)
@@ -414,6 +415,79 @@ def test_node_straight_and_circle():
     assert abs(track_y[-1, 0]) < 1e-3
 
 
+def test_drain_survives_eintr():
+    """A signal interrupting tcdrain must not abort the transaction.
+
+    pyserial's flush() is termios.tcdrain(), and the termios module is not
+    covered by PEP 475, so a signal delivered while it blocks raises
+    termios.error(EINTR) rather than being retried. Observed on the X5: SIGTERM
+    arriving mid-transaction escaped a ROS timer callback as an unhandled
+    traceback. The unsafe part is that WheelOdometryNode.destroy_node() zeroes
+    Goal_Velocity on the way out, so a Ctrl-C landing inside tcdrain could skip
+    the stop command and leave the base driving.
+    """
+    import errno
+    import termios
+
+    bus = FeetechBus(port="/dev/null")
+
+    class FakeSerial:
+        def __init__(self, fail_times):
+            self.fail_times = fail_times
+            self.calls = 0
+
+        def flush(self):
+            self.calls += 1
+            if self.calls <= self.fail_times:
+                raise termios.error(errno.EINTR, "Interrupted system call")
+
+    # Interrupted a few times, then succeeds: must return quietly.
+    ser = FakeSerial(fail_times=3)
+    bus._drain(ser)
+    assert ser.calls == 4, ser.calls
+    print(f"  interrupted 3x then succeeded after {ser.calls} calls: OK")
+
+    # Interrupted forever: must give up quietly rather than raise, because the
+    # bytes are already in the kernel and the barrier is only for tidiness.
+    ser = FakeSerial(fail_times=10_000)
+    bus._drain(ser)
+    assert ser.calls >= 2, "must retry more than once before giving up"
+    print(f"  interrupted indefinitely: gave up after {ser.calls} calls, no exception")
+
+    # A different errno is a real fault and must propagate.
+    class BadSerial:
+        def flush(self):
+            raise termios.error(errno.EIO, "I/O error")
+
+    try:
+        bus._drain(BadSerial())
+    except termios.error as exc:
+        assert exc.args[0] == errno.EIO
+        print("  EIO propagated rather than being swallowed: OK")
+    else:
+        raise AssertionError("a non-EINTR termios error must propagate")
+
+    # And the whole point: a stop command must still reach the wire when every
+    # drain is interrupted. Drive it through the real _send path.
+    sent = []
+
+    class CountingSerial(FakeSerial):
+        is_open = True  # _require_serial checks this before using the port
+
+        def reset_input_buffer(self):
+            pass
+
+        def write(self, data):
+            sent.append(bytes(data))
+            return len(data)
+
+    bus._serial = CountingSerial(fail_times=10_000)
+    bus.sync_write("Goal_Velocity", {7: 0, 8: 0, 9: 0})
+    assert sent, "sync_write produced no bytes despite drain being interrupted"
+    assert sent[0][:2] == b"\xff\xff", sent[0][:4].hex()
+    print(f"  sync_write still emitted {len(sent[0])} bytes with drain always interrupted: OK")
+
+
 def test_eeprom_lock_semantics():
     """A locked EEPROM write is dropped, not refused -- and the fake bus says so.
 
@@ -715,6 +789,7 @@ TESTS = [
     test_sign_magnitude,
     test_feetech_framing,
     test_fake_bus_wraps,
+    test_drain_survives_eintr,
     test_eeprom_lock_semantics,
     test_node_configures_velocity_mode,
     test_node_straight_and_circle,

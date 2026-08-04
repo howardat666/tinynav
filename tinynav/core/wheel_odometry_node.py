@@ -58,6 +58,7 @@ import numpy as np
 import rclpy
 from geometry_msgs.msg import TransformStamped, Twist
 from nav_msgs.msg import Odometry
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from std_srvs.srv import Empty
 from tf2_ros import TransformBroadcaster
@@ -309,6 +310,17 @@ class WheelOdometryNode(Node):
     # -- main loop ---------------------------------------------------------- #
 
     def _tick(self) -> None:
+        # rclpy's SIGINT/SIGTERM handler invalidates the context, but a timer
+        # callback that has already been dispatched keeps running -- so
+        # publishing below would raise RCLError("publisher's context is invalid")
+        # out of the executor. That turns every ordinary shutdown into a
+        # traceback, which hides real faults at exactly the moment a stop is in
+        # progress; a shutdown that looks like a crash is one nobody trusts. The
+        # wheels are still stopped by destroy_node(), which writes to the serial
+        # port and needs no ROS context.
+        if not rclpy.ok():
+            return
+
         register = "Present_Position" if self.velocity_source == "position" else "Present_Velocity"
         try:
             result = self.bus.sync_read(register, self.motor_ids, num_retry=self.num_read_retries)
@@ -508,6 +520,11 @@ class WheelOdometryNode(Node):
     # -- output ------------------------------------------------------------- #
 
     def _publish(self, stamp, twist: np.ndarray, twist_cov: np.ndarray) -> None:
+        # Re-checked here as well as in _tick: the signal can land between the
+        # two, and this is the call that actually raises.
+        if not rclpy.ok():
+            return
+
         qx, qy, qz, qw = yaw_to_quaternion(self.theta)
 
         msg = Odometry()
@@ -595,9 +612,13 @@ def main(args=None):
     node = WheelOdometryNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
+        # SIGINT and SIGTERM are how this node is normally stopped, not faults.
         pass
     finally:
+        # Runs on every path, including an unexpected exception, because this is
+        # what zeroes Goal_Velocity. It writes to the serial port and needs no
+        # ROS context, so it still works after rclpy has shut down.
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
