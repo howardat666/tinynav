@@ -92,12 +92,26 @@ ssh_ 'hwclock -w' >/dev/null 2>&1 && echo "==> wrote RTC" || echo "==> RTC write
 # A monitor thread inside insight_full re-reads the file once a second, so this
 # takes effect without a restart.  Setting it only makes sense *after* the sync
 # above, which is why the two live in one script.
+#
+# The flag must be made to *transition* 0 -> 1, not merely end up at 1.
+# `computeRealtimeOffset()` runs once per transition and the result is cached in
+# `threads_.time_offset_ns`; the monitor thread only recomputes when it sees the
+# flag go from unset to set. Since the flag file survives a reboot but the clock
+# does not, a board that boots with the flag already at 1 computes its offset
+# from the *wrong* clock and then keeps using it forever -- observed in practice
+# as camera stamps 29600733 s (343 days) behind the PC even after the clock was
+# corrected. So clear it, wait for the monitor thread to observe the clear, then
+# set it again.
 FLAG=/etc/init.d/looper/setting/is_time_sync
 if [ "${SET_TIME_SYNC_FLAG:-1}" = "1" ]; then
     ssh_ "mkdir -p /userdata/fixbak
           [ -f ${FLAG} ] && [ ! -f /userdata/fixbak/is_time_sync.orig ] && cp -a ${FLAG} /userdata/fixbak/is_time_sync.orig
-          echo 1 > ${FLAG}"
-    echo "==> set ${FLAG}=1 (insight_full will publish wall-clock stamps within ~1 s)"
+          echo 0 > ${FLAG}"
+    # The monitor thread polls once a second; give it comfortably more than that.
+    ssh_ 'sleep 3'
+    ssh_ "echo 1 > ${FLAG}"
+    ssh_ 'sleep 3'
+    echo "==> cycled ${FLAG} 0->1 so insight_full recomputes its clock offset"
 fi
 
 echo
