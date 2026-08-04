@@ -378,15 +378,42 @@ class DBoW3Engine:
       - Raw descriptor arrays shaped (N, 32), dtype uint8/float32
     """
 
-    def __init__(self, vocabulary_path: str):
+    def __init__(self, vocabulary_path: str | None = None, voc: Any = None):
+        """
+        Args:
+            vocabulary_path: vocabulary to load. Ignored when `voc` is given.
+            voc: an already-loaded Vocabulary to reuse, as returned by
+                load_vocabulary(). Several engines may be built from one
+                Vocabulary object: DBoW3's Database::setVocabulary() deep-copies
+                the vocabulary it is handed (`m_voc = new Vocabulary(voc)`), so
+                the databases never alias each other's word tree. Reusing it only
+                avoids re-reading and re-inflating the file, which for the stock
+                ORBvoc is ~48 MB of disk and ~300 MiB resident per copy (measured
+                on x86_64).
+        """
         self._bow = self._import_module()
-        self.voc = self._bow.Vocabulary()
-        load_ret = self.voc.load(vocabulary_path)
+        if voc is None:
+            if vocabulary_path is None:
+                raise ValueError("DBoW3Engine needs either vocabulary_path or voc")
+            voc = self.load_vocabulary(vocabulary_path)
+        self.db = self._bow.Database()
+        self.db.setVocabulary(voc)
+        # Database::setVocabulary() took its own copy, so holding a second
+        # reference here would keep a redundant word tree resident for the life
+        # of the engine (~300 MiB with ORBvoc). Callers that want to keep the
+        # vocabulary around for reuse hold their own reference.
+        self.voc = None
+
+    @classmethod
+    def load_vocabulary(cls, vocabulary_path: str):
+        """Load a vocabulary once so it can be shared by several engines."""
+        bow = cls._import_module()
+        voc = bow.Vocabulary()
+        load_ret = voc.load(vocabulary_path)
         # PyDBoW3 often returns None on success (instead of True).
         if load_ret is False:
             raise RuntimeError(f"Failed to load DBoW3 vocabulary: {vocabulary_path}")
-        self.db = self._bow.Database()
-        self.db.setVocabulary(self.voc)
+        return voc
 
     @staticmethod
     def _import_module():

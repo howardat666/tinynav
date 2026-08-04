@@ -20,6 +20,7 @@ import argparse
 
 from tinynav.tinynav_cpp_bind import pose_graph_solve
 from tinynav.core.models_trt import (
+    DBoW3Engine,
     Dinov2TRT,
     LightGlueTRT,
     ORBFeatureTRTCompatible,
@@ -28,6 +29,7 @@ from tinynav.core.models_trt import (
 )
 import logging
 import asyncio
+import threading
 import time
 from tf2_ros import TransformBroadcaster
 from tinynav.core.build_map_node import TinyNavDB
@@ -433,6 +435,7 @@ class MapNode(Node):
         loop_closure_use_bow: bool = False,
         dbow3_vocabulary_path: str | None = None,
         verbose_timer: bool = True,
+        warmup_nav_path_search: bool = True,
     ):
         """Initialization
 
@@ -440,8 +443,16 @@ class MapNode(Node):
             tinynav_db_path (str): Directory to store output data.
             tinynav_map_path (str): Directory to load the pre-built map.
             verbose_timer (bool): Whether to use verbose timer output.
+            warmup_nav_path_search (bool): Precompile the numba path-search
+                kernels on a background thread. Set False on relocalization-only
+                deployments, which never call them; the first path search then
+                compiles them inline.
         """
         super().__init__('map_node')
+        self._warmup_nav_path_search_enabled = bool(warmup_nav_path_search)
+        self._nav_warmed = False
+        self._nav_warmup_lock = threading.Lock()
+        self._nav_warmup_thread = None
         self.logger = logging.getLogger(__name__)
         self.timer_logger = self.logger.info if verbose_timer else self.logger.debug
         self.extractor = extractor
@@ -489,6 +500,15 @@ class MapNode(Node):
         self.relocalization_threshold = 0.85
         self.relocalization_loop_top_k = 3
 
+        # There are two bow LoopClosures below (nav + map). Read the vocabulary
+        # from disk once and hand the same object to both: each Database still
+        # deep-copies it, but this drops the two redundant Python-side copies.
+        # Measured steady-state cost of the two engines' vocabularies, x86_64:
+        # ORBvoc 1189 -> 628 MiB, self-trained k10L5 123 -> 63 MiB.
+        shared_dbow3_vocabulary = None
+        if self.loop_closure_mode == "bow" and self.dbow3_vocabulary_path is not None:
+            shared_dbow3_vocabulary = DBoW3Engine.load_vocabulary(self.dbow3_vocabulary_path)
+
         os.makedirs(f"{tinynav_db_path}/nav_temp", exist_ok=True)
         self.nav_temp_db = TinyNavDB(f"{tinynav_db_path}/nav_temp", is_scratch=True)
         self.nav_loop_closure = LoopClosure(
@@ -498,6 +518,7 @@ class MapNode(Node):
             dbow3_vocabulary_path=self.dbow3_vocabulary_path,
             embedding_similarity_threshold=self.loop_similarity_threshold,
             embedding_top_k=self.loop_top_k,
+            dbow3_vocabulary=shared_dbow3_vocabulary,
         )
         self.map_poses = np.load(f"{tinynav_map_path}/poses.npy", allow_pickle=True).item()
         self.map_K = np.load(f"{tinynav_map_path}/intrinsics.npy")
@@ -509,11 +530,15 @@ class MapNode(Node):
             dbow3_vocabulary_path=self.dbow3_vocabulary_path,
             embedding_similarity_threshold=self.relocalization_threshold,
             embedding_top_k=self.relocalization_loop_top_k,
+            dbow3_vocabulary=shared_dbow3_vocabulary,
         )
+        # Both databases hold their own copy now; release ours.
+        del shared_dbow3_vocabulary
+
         self.occupancy_map = np.load(f"{tinynav_map_path}/occupancy_grid.npy")
         self.occupancy_map_meta = np.load(f"{tinynav_map_path}/occupancy_meta.npy")
         self.sdf_map = np.load(f"{tinynav_map_path}/sdf_map.npy")
-        self._warmup_nav_path_search()
+        self._start_nav_path_search_warmup()
 
         print(f"sdf_map.shape: {self.sdf_map.shape}")
         print(f"occupancy_map.shape: {self.occupancy_map.shape}")
@@ -540,18 +565,73 @@ class MapNode(Node):
 
         self._save_completed = False
 
-    def _warmup_nav_path_search(self):
-        small_sdf = np.ones((3, 3, 3), dtype=self.sdf_map.dtype)
-        small_sdf[1, 1, 1] = 0.0
-        small_occupancy = np.zeros((3, 3, 3), dtype=self.occupancy_map.dtype)
-        search_close_to_sdf_map_numba(np.array([0, 0, 0], dtype=np.int32), small_sdf, small_occupancy, 0.2)
-        search_within_sdf_map_numba(
-            np.array([0, 0, 0], dtype=np.int32),
-            np.array([2, 2, 2], dtype=np.int32),
-            small_sdf,
-            small_occupancy,
-            float(self.occupancy_map_meta[3]),
+    def _start_nav_path_search_warmup(self):
+        """Kick off the path-search JIT warmup without blocking the constructor.
+
+        Compiling the ten @njit path-search kernels costs ~33 s on the X5 with a
+        cold numba cache, and none of them are on the relocalization path -- a
+        deployment that only relocalizes used to pay all of it before the node
+        could receive its first keyframe.
+
+        The warmup is therefore moved onto a background thread instead of being
+        made lazy outright: `generate_nav_path_in_map` runs inside the keyframe
+        callback, so compiling there on first use would just move the same stall
+        into the control loop. Navigation additionally cannot start until a
+        relocalization has succeeded *and* the planner has sent POIs, which in
+        practice leaves the thread far more than 33 s to finish. Should a path
+        search still get there first, `_ensure_nav_path_search_warm` blocks on
+        the thread, which is no worse than today's behaviour.
+        """
+        if not self._warmup_nav_path_search_enabled:
+            return
+
+        def _run():
+            t0 = time.perf_counter()
+            try:
+                self._warmup_nav_path_search()
+            except Exception as e:  # noqa: BLE001 - a warmup thread must never die silently
+                # The only symptom would otherwise be an unexplained stall in the
+                # first path search, which then recompiles inline.
+                self.get_logger().error(f"nav path search warmup failed: {e}")
+                return
+            self.get_logger().info(
+                f"nav path search kernels ready in {(time.perf_counter() - t0) * 1000.0:.0f} ms"
+            )
+
+        self._nav_warmup_thread = threading.Thread(
+            target=_run, name="nav_path_search_warmup", daemon=True
         )
+        self._nav_warmup_thread.start()
+
+    def _warmup_nav_path_search(self):
+        with self._nav_warmup_lock:
+            if self._nav_warmed:
+                return
+            small_sdf = np.ones((3, 3, 3), dtype=self.sdf_map.dtype)
+            small_sdf[1, 1, 1] = 0.0
+            small_occupancy = np.zeros((3, 3, 3), dtype=self.occupancy_map.dtype)
+            search_close_to_sdf_map_numba(np.array([0, 0, 0], dtype=np.int32), small_sdf, small_occupancy, 0.2)
+            search_within_sdf_map_numba(
+                np.array([0, 0, 0], dtype=np.int32),
+                np.array([2, 2, 2], dtype=np.int32),
+                small_sdf,
+                small_occupancy,
+                float(self.occupancy_map_meta[3]),
+            )
+            self._nav_warmed = True
+
+    def _ensure_nav_path_search_warm(self):
+        """Block until the path-search kernels are compiled. Idempotent."""
+        if self._nav_warmed:
+            return
+        thread = self._nav_warmup_thread
+        if thread is not None and thread.is_alive():
+            thread.join()
+        if not self._nav_warmed:
+            # Warmup was disabled, or the background thread raised. Compile here;
+            # the njit calls below would do it anyway, just without the log line.
+            self.get_logger().info("Compiling nav path search kernels inline")
+            self._warmup_nav_path_search()
 
     def pois_callback(self, msg: String):
         self.get_logger().info("Received POIs from planner: " + msg.data)
@@ -1308,6 +1388,12 @@ class MapNode(Node):
             print("here")
             log_generate_timing("out_of_bounds")
             return None 
+
+        # Normally a no-op: the warmup thread started in __init__ has long since
+        # finished by the time a POI arrives. Present so that a path search which
+        # does get here first waits for the JIT rather than racing it.
+        self._ensure_nav_path_search_warm()
+        t_stage = mark_stage("nav_warmup_wait", t_stage)
 
         sdf_start_path = search_close_to_sdf_map_numba(start_idx, self.sdf_map, self.occupancy_map, 0.2)
         t_stage = mark_stage("search_start_close", t_stage)

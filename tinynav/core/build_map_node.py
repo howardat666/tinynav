@@ -161,7 +161,15 @@ class LoopClosure:
         dbow3_vocabulary_path: str | None = None,
         embedding_similarity_threshold: float = 0.90,
         embedding_top_k: int = 20,
+        dbow3_vocabulary=None,
     ):
+        """
+        Args:
+            dbow3_vocabulary: an already-loaded pydbow3 Vocabulary to reuse
+                instead of re-reading dbow3_vocabulary_path from disk. Pass this
+                when several LoopClosure instances share one vocabulary; see
+                DBoW3Engine.load_vocabulary().
+        """
         self.db = db
         self.timestamps = list(timestamps)
         self.mode = mode
@@ -183,17 +191,21 @@ class LoopClosure:
                 )
         else:
             self.embeddings = np.zeros((0, 1), dtype=np.float32)
-            if dbow3_vocabulary_path is None:
+            if dbow3_vocabulary_path is None and dbow3_vocabulary is None:
                 raise ValueError("dbow3_vocabulary_path is required when mode='bow'")
             from tinynav.core.models_trt import DBoW3Engine
-            self.dbow3_engine = DBoW3Engine(dbow3_vocabulary_path)
+            self.dbow3_engine = DBoW3Engine(dbow3_vocabulary_path, voc=dbow3_vocabulary)
             total = len(self.timestamps)
             for idx, ts in enumerate(self.timestamps):
-                logger.info(
-                    f"[LoopClosure] loading map keyframe {idx + 1}/{total}, timestamp={int(ts)}"
-                )
+                # One line per keyframe is ~1100 lines of log for a real map, which
+                # is slow enough to show up in the startup profile. Keep the first,
+                # the last and every 100th.
+                if idx == 0 or idx + 1 == total or (idx + 1) % 100 == 0:
+                    logger.info(
+                        f"[LoopClosure] loading map keyframe {idx + 1}/{total}, timestamp={int(ts)}"
+                    )
                 try:
-                    _, _, cand_features, _, _ = self.db.get_depth_embedding_features_images(ts)
+                    cand_features = self.db.get_features(ts)
                 except Exception as e:
                     logger.error(
                         f"[LoopClosure] failed loading timestamp={int(ts)}: {e}"
@@ -215,7 +227,7 @@ class LoopClosure:
             else:
                 self.embeddings = np.concatenate([self.embeddings, emb], axis=0)
         else:
-            _, _, cand_features, _, _ = self.db.get_depth_embedding_features_images(ts)
+            cand_features = self.db.get_features(ts)
             self.dbow3_engine.add(cand_features)
 
     @staticmethod
@@ -496,6 +508,16 @@ class TinyNavDB():
             return self.infra1_video_db.read(key_int)
 
         return self.depths[key], self.get_embedding(key), self.features[key], rgb_loader, infra1_loader
+
+    def get_features(self, key:int):
+        """Read only the keypoints/descriptors of a keyframe.
+
+        Callers that need nothing else must not go through
+        get_depth_embedding_features_images(): that eagerly unshelves the depth
+        map too, which is an order of magnitude more bytes than the features
+        (1564 MB vs 145 MB across a 1123-keyframe map) and is then discarded.
+        """
+        return self.features[int(key)]
 
     def get_embedding(self, key:int):
         key_int = int(key)
