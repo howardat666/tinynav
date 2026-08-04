@@ -20,6 +20,17 @@
 | [7. 待确认事项](#7-待确认事项) | 问谁 · 卡住什么 · LooperHub 索取优先级 |
 | [8. 设备与环境](#8-设备与环境) | Looper 台账 · 常用命令 |
 
+**本目录其他文档**
+
+| 文档 | 内容 |
+|---|---|
+| [`x5.md`](x5.md) | 硬件占用 · 算法延迟/内存 · BPU 分析 · 九方案参数对比 |
+| [`board_bringup.md`](board_bringup.md) | **把重定位真跑在 X5 上**：环境配置 · 时钟与 QoS 陷阱 · 依赖 · 板上实测结果 |
+| [`depth_frame_skip.md`](depth_frame_skip.md) | 把 depth 从 12.8 Hz 降到 5 Hz 换热余量 |
+| [`fix_64gb_mipi.md`](fix_64gb_mipi.md) | 64GB 相机 MIPI 故障的定位与修复 |
+| [`wheel_odometry.md`](wheel_odometry.md) | LeKiwi 三轮全向底盘的轮速里程计 |
+| [`todo.md`](todo.md) | 待办清单 |
+
 **当前状态一句话**：Phase 0 已完成 0a / 0b / 0e / 0f。⭐ **最重要的结论：决定 recall 的是描述子而非检索算法** —— 白天经典路线（ORB + 自训练 DBoW3）R@1 **90.1%**，超过 main 现行 DINOv2 配置且快 4 倍省 2 倍内存，**第一版直接上方案 1**；但夜间 ORB 只有 21.6%，而同样检索算法换成 SuperPoint 描述子就有 **44.0%**（DINOv2 调好 48.8%）。由此浮出一个**没人测过的最优候选 —— DBoW3 + SuperPoint**（兼得 #210 的 recall 与本项目的检索速度）。🟢 BPU 已实测可被第二个进程并发使用；64GB 机器的 MIPI 故障定位为**旧 OTA 残留的 sensor 库只有 1-lane 寄存器表**（**不是排线坏**）。剩 0c（int8 编译）/ 0d（办公室日夜采数）。PC 的 GPU 已于 2026-08-03 修复（内核 -136 缺配套 nvidia 模块包）。
 
 > ⭐ **顺带查出一个可能最重要的杠杆**：这颗 X5 的物理 DRAM 是 **3.9 GiB，其中 ~2.5 GiB 被 ion 静态预留**，`MemTotal 1307 MB` 是分配决策而非硬件上限。内存是全项目最硬的约束，这是唯一能从根上放宽它的手段 → 见 [`x5.md § 2.3`](x5.md)。
