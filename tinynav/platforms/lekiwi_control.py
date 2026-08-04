@@ -37,13 +37,32 @@ camera's **[1]** (down) axis. That is why the indices below are not the [0] and
 this node that drove the wheels through lerobot, and they are preserved here
 unchanged.
 
-One thing genuinely is unverified: because camera-y points *down* while base-yaw
-is measured about *up*, the yaw rate plausibly needs negating. Nobody has driven
-this on real hardware yet, so rather than silently guessing, the sign is exposed
-as the ``yaw_sign`` parameter, defaulting to +1.0 to preserve existing
-behaviour. Determining it is a one-minute test: put the chassis on blocks,
-command a path that turns left, and check which way it spins. If it turns the
-wrong way, set ``-p yaw_sign:=-1.0``.
+THE YAW SIGN, AND WHY IT LOOKS WRONG BUT IS RIGHT
+-------------------------------------------------
+``yaw_sign = +1.0`` is correct.  This used to be flagged as unverified, on the
+reasoning that camera-y points *down* while REP-103 yaw is measured about *up*,
+so the yaw rate surely needed negating.  That reasoning counts only one of the
+two reversals actually present:
+
+1. the camera's y axis points **down**, while REP-103 yaw is about **up**;
+2. the angular term is ``quaternion_relative_rotvec(quat2, quat1)``, i.e.
+   ``q2^-1 * q1`` -- the **reverse** increment, not ``q1^-1 * q2``.
+
+Flip the axis and flip the increment and you are back where you started.  Verified
+by feeding a genuine left-curving arc through this node: a path curving left at
+0.5 rad/s yields ``angular.z = +0.5000``, which under REP-103 (positive yaw =
+counter-clockwise = left) is the correct direction.  See
+``tests/test_wheel_odometry.py::test_lekiwi_control_path_to_twist``, which now
+pins both directions so that "correcting" either reversal alone fails the suite
+rather than sending the base the wrong way round every corner.
+
+The parameter is kept, because it costs nothing and the *downstream* half of the
+chain is a separate question: this node only decides the sign of ``angular.z``,
+and whether a positive ``angular.z`` actually rotates the chassis
+counter-clockwise depends on ``wheel_signs`` and on how the wheels are bolted on.
+If the base turns the wrong way with a correct ``angular.z``, that is a
+``wheel_signs`` problem in ``wheel_odometry_node``, and ``yaw_sign:=-1.0`` would
+only paper over it.
 """
 
 from __future__ import annotations

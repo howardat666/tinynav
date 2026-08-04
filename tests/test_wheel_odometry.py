@@ -761,6 +761,60 @@ def test_lekiwi_control_path_to_twist():
         assert abs(cmd.linear.x + node.max_linear_x) < 1e-6, cmd.linear.x
         print(f"  -5.0 m/s demanded -> clamped to {cmd.linear.x:.4f} m/s")
 
+        # yaw_sign: a path that curves LEFT must produce a POSITIVE angular.z.
+        #
+        # This is the one sign in the chain that is not obvious, and it needs a
+        # test because there are *two* reversals in play and they cancel, so the
+        # code looks wrong at a glance and invites being "corrected":
+        #
+        #   1. the camera's y axis points DOWN, while REP-103 yaw is about UP;
+        #   2. the node computes quaternion_relative_rotvec(quat2, quat1), i.e.
+        #      q2^-1 * q1 -- the *reverse* increment.
+        #
+        # Flip the axis and flip the increment and you are back where you started,
+        # hence yaw_sign=+1.0. Removing either reversal on its own would drive the
+        # base the wrong way round every corner.
+        def make_arc(v, omega, n=10):
+            """A path curving at ``omega`` while advancing at ``v``.
+
+            Built as a real arc rather than a synthetic pure rotation so that the
+            forward axis and the yaw axis are exercised together: a pure rotation
+            leaves the linear term at zero and would hide a wrong forward index.
+            """
+            radius = v / omega
+            path = Path()
+            path.header.stamp = node.get_clock().now().to_msg()
+            for i in range(n):
+                psi = omega * i * dt  # positive = turning left
+                ps = PoseStamped()
+                # Left is camera -x and forward is camera +z, so a left turn
+                # curves toward -x about a centre at x = -radius.
+                ps.pose.position.x = -radius + radius * np.cos(psi)
+                ps.pose.position.z = radius * np.sin(psi)
+                # Rotation about the camera's UP axis, which is (0, -1, 0).
+                ps.pose.orientation.y = -np.sin(0.5 * psi)
+                ps.pose.orientation.w = np.cos(0.5 * psi)
+                path.poses.append(ps)
+            return path
+
+        node.path_callback(make_arc(0.20, 0.50))
+        cmd = node._sample_velocity()
+        assert cmd.angular.z > 0.0, (
+            f"a left-curving path gave angular.z={cmd.angular.z:+.4f}; under REP-103 "
+            "(positive yaw = counter-clockwise = left) that sign is inverted, so the "
+            "base would turn the wrong way at every corner"
+        )
+        assert abs(cmd.angular.z - 0.50) < 1e-6, cmd.angular.z
+        assert cmd.linear.x > 0.0 and abs(cmd.linear.x - 0.20) < 1e-3, cmd.linear.x
+        print(f"  left arc 0.20 m/s @ 0.50 rad/s -> linear.x={cmd.linear.x:+.4f}, "
+              f"angular.z={cmd.angular.z:+.4f} (positive = left: correct)")
+
+        # The mirror image too, so this cannot pass on a magnitude alone.
+        node.path_callback(make_arc(0.20, -0.50))
+        cmd = node._sample_velocity()
+        assert cmd.angular.z < 0.0 and abs(cmd.angular.z + 0.50) < 1e-6, cmd.angular.z
+        print(f"  right arc -> angular.z={cmd.angular.z:+.4f}")
+
         # A stale path yields no sample, so the bus owner's watchdog can act.
         stale = make_path(0.1 * dt, stamp_now=False)
         stale.header.stamp.sec = 1  # far in the past
