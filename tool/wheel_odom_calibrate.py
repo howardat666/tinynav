@@ -249,6 +249,30 @@ def driven_accumulate(args, bus, kin, motor_ids, clock):
         stop_motion(args, bus, motor_ids)
 
 
+def ground_truth(args, label: str, unit: str, preset: float) -> float:
+    """The externally measured truth, asked for after the motion if requested.
+
+    With --drive you cannot reliably stop on a mark: by the time you react the
+    base has moved on. Driving for a fixed time and *then* measuring what
+    actually happened removes that error entirely, and it is the only part of
+    this calibration that is not derived from the encoders -- so it is worth
+    getting right rather than approximating.
+    """
+    if not args.measure_after:
+        return preset
+    while True:
+        raw = input(f"\n  measure the actual {label} now and enter it in {unit}: ").strip()
+        try:
+            value = float(raw)
+        except ValueError:
+            print("  not a number, try again")
+            continue
+        if value <= 0:
+            print("  must be positive")
+            continue
+        return value
+
+
 def report(label: str, nominal: float, measured: float) -> None:
     dev = 100.0 * (measured - nominal) / nominal
     print(f"\n  {label}")
@@ -327,6 +351,7 @@ def cmd_straight(args, bus, kin, clock) -> int:
         print("  Push the robot straight forward exactly that distance, then press ENTER.")
     deltas, elapsed = driven_accumulate(args, bus, kin, ids, clock)
 
+    distance = ground_truth(args, "straight-line distance travelled", "metres", args.distance)
     body = kin.wheel_tick_delta_to_body_delta(deltas)
     measured = float(np.hypot(body[0], body[1]))
     print(f"\n  elapsed {elapsed:.2f}s, tick deltas {deltas}")
@@ -338,7 +363,7 @@ def cmd_straight(args, bus, kin, clock) -> int:
 
     # Body displacement is exactly proportional to wheel_radius, so the
     # correction is a plain ratio.
-    corrected = kin.wheel_radius * args.distance / measured
+    corrected = kin.wheel_radius * distance / measured
     report("wheel_radius", DEFAULT_WHEEL_RADIUS, corrected)
     print(f"\n  apply with:  -p wheel_radius:={corrected:.6f}")
     return 0
@@ -347,13 +372,18 @@ def cmd_straight(args, bus, kin, clock) -> int:
 def cmd_spin(args, bus, kin, clock) -> int:
     ids = args.motor_ids
     truth_rad = 2.0 * np.pi * args.turns
-    print(f"SPIN TEST -> base_radius   (ground truth {args.turns:g} turns = {np.degrees(truth_rad):.1f} deg)")
+    if args.measure_after:
+        print("SPIN TEST -> base_radius   (turns to be entered after the motion)")
+    else:
+        print(f"SPIN TEST -> base_radius   (ground truth {args.turns:g} turns = {np.degrees(truth_rad):.1f} deg)")
     print(f"  using wheel_radius = {kin.wheel_radius:.6f} m (run the straight test first!)")
     if not args.drive:
         print("  Rotate the robot in place by exactly that many turns, then press ENTER.")
         print("  Mark the floor and the chassis so you can hit the whole number of turns.")
     deltas, elapsed = driven_accumulate(args, bus, kin, ids, clock)
 
+    turns = ground_truth(args, "number of turns completed", "turns (fractions ok)", args.turns)
+    truth_rad = 2.0 * np.pi * turns
     body = kin.wheel_tick_delta_to_body_delta(deltas)
     measured_rad = abs(float(body[2]))
     print(f"\n  elapsed {elapsed:.2f}s, tick deltas {deltas}")
@@ -421,6 +451,13 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--drive", action="store_true", help="let this script command the wheels")
     ap.add_argument("--speed", type=float, default=0.15, help="--drive forward speed, m/s")
     ap.add_argument("--yaw-rate", type=float, default=0.6, help="--drive spin rate, rad/s")
+    ap.add_argument(
+        "--measure-after",
+        action="store_true",
+        help="ask for the ground truth after the motion instead of before. Use this with "
+             "--drive: rather than trying to stop the base on a mark, drive for a fixed "
+             "--duration, then tape-measure what actually happened.",
+    )
     ap.add_argument("--fake", action="store_true", help="no hardware; synthesise motion")
     ap.add_argument("--fake-wheel-radius", type=float, default=0.0483)
     ap.add_argument("--fake-base-radius", type=float, default=0.1312)
