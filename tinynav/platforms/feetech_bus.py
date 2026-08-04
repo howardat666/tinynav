@@ -108,6 +108,12 @@ STS_CONTROL_TABLE: dict[str, tuple[int, int]] = {
     "Present_Current": (69, 2),
 }
 
+# First SRAM address.  Everything below this lives in EEPROM and can only be
+# written while the motor's ``Lock`` register is 0 -- a locked write is
+# acknowledged and then silently discarded, with no error byte set.  40 is
+# ``Torque_Enable``, the first SRAM register on the STS/SMS series.
+FIRST_SRAM_ADDRESS = 40
+
 # data_name: index of the sign bit (sign-magnitude encoded registers).
 STS_SIGN_MAGNITUDE_BITS: dict[str, int] = {
     "Present_Load": 10,
@@ -598,6 +604,16 @@ class FakeFeetechBus:
         self.is_connected = False
         self.written: list[tuple[str, dict[int, int]]] = []
 
+        # Register state, so that ``read`` can see what ``write`` did.  The
+        # defaults are deliberately the pessimistic ones: a servo that has been
+        # used before comes up with its EEPROM ``Lock`` set and, unless someone
+        # changed it, ``Operating_Mode`` at 0 (position).  Starting the fake in
+        # the convenient state instead would hide the exact bug this models.
+        self.registers: dict[int, dict[str, int]] = {
+            motor_id: {"Lock": 1, "Operating_Mode": 0, "Torque_Enable": 0} for motor_id in self.motor_ids
+        }
+        self.rejected_eeprom_writes: list[tuple[str, int, int]] = []
+
     def connect(self) -> None:
         self.is_connected = True
         self._t0 = self._clock()
@@ -645,9 +661,34 @@ class FakeFeetechBus:
 
     def sync_write(self, data_name: str, id_to_value: dict[int, int]) -> None:
         self.written.append((data_name, dict(id_to_value)))
+        for motor_id, value in id_to_value.items():
+            self.registers.setdefault(motor_id, {})[data_name] = int(value)
 
     def write(self, data_name: str, motor_id: int, value: int, num_retry: int = 2) -> None:
+        # Every attempt is logged, including the ones the servo ignores, so a
+        # test can distinguish "was not attempted" from "was attempted and
+        # dropped".
         self.written.append((data_name, {motor_id: int(value)}))
+        regs = self.registers.setdefault(motor_id, {})
+
+        addr, _length = STS_CONTROL_TABLE.get(data_name, (None, None))
+        is_eeprom = addr is not None and addr < FIRST_SRAM_ADDRESS
+        if is_eeprom and regs.get("Lock", 1) != 0:
+            # Real STS3215 behaviour: a write to the EEPROM region while Lock is
+            # set is acknowledged with error byte 0 and then discarded.  No
+            # exception here, because raising would make the fake *easier* to
+            # pass than the hardware.
+            self.rejected_eeprom_writes.append((data_name, motor_id, int(value)))
+            return
+
+        regs[data_name] = int(value)
+
+    def read(self, data_name: str, motor_id: int, num_retry: int = 2) -> int:
+        if motor_id not in self.motor_ids:
+            raise FeetechBusError(f"no motor with id {motor_id} on this fake bus")
+        if data_name in ("Present_Position", "Present_Velocity"):
+            return self.sync_read(data_name, [motor_id], num_retry=num_retry).values[motor_id]
+        return self.registers.get(motor_id, {}).get(data_name, 0)
 
     def ping(self, motor_id: int, num_retry: int = 0) -> bool:
         return motor_id in self.motor_ids

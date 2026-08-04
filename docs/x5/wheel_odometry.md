@@ -16,21 +16,94 @@ will ever correct.
 | `tinynav/platforms/feetech_bus.py` | Minimal Feetech/SCS serial protocol driver. `pyserial` only. Sync read/write, retries, sampling timestamps. Includes `FakeFeetechBus` for hardware-free bring-up. |
 | `tinynav/platforms/omni3_kinematics.py` | 3-wheel omni kinematics, encoder wrap-around differencing, exact SE(2) integration. `numpy` only. |
 | `tinynav/core/wheel_odometry_node.py` | The ROS 2 node: read wheels, integrate, publish `nav_msgs/Odometry` + TF. |
+| `tinynav/platforms/lekiwi_control.py` | Path -> `Twist`. No hardware I/O at all; see "Who owns the bus" below. |
+| `tool/x5_board/servo_scan.py` | **Read-only** bus discovery: which port, which baud, which IDs. First thing to run after wiring. |
 | `tool/wheel_odom_calibrate.py` | Sign check, `wheel_radius` and `base_radius` calibration. |
 | `tests/test_wheel_odometry.py` | Self-checks. `python3 tests/test_wheel_odometry.py`. |
 
+### Who owns the bus
+
+The Feetech bus is half duplex, so a serial port has exactly one owner. The split
+is:
+
+```
+planning_node -> /planning/trajectory_path
+              -> lekiwi_control            (path -> Twist, touches no hardware)
+              -> /lekiwi_control/cmd_vel
+              -> wheel_odometry_node       (-p enable_wheel_command:=true)
+              -> Goal_Velocity on the wire
+```
+
+`wheel_odometry_node` is the owner because it already reads the wheels every
+cycle. Do not run a second process against the same port -- not
+`lekiwi_control`, not a LeRobot `lekiwi_host`. Their transactions will interleave
+and corrupt each other.
+
+`lekiwi_control` deliberately goes *silent* rather than publishing a stream of
+zeros when it has no usable trajectory sample, so that the owner's `cmd_timeout_s`
+watchdog fires. A stalled planner that keeps publishing zeros would keep the
+watchdog fed, which is the opposite of what you want.
+
+### EEPROM writes are silently dropped when locked
+
+`Operating_Mode` (address 33) is in the STS3215's EEPROM region. A write to it
+while the servo's `Lock` register is set is **acknowledged with error byte 0 and
+then discarded** -- there is no error to detect. So the configuration sequence is
+
+    Torque_Enable = 0  ->  Lock = 0  ->  Operating_Mode = 1  ->  Lock = 1  ->  Torque_Enable = 1
+
+followed by reading `Operating_Mode` back and refusing to drive unless it reads
+1. Getting this wrong is self-inflicting and hard to diagnose: a version that
+wrote the mode *before* clearing `Lock` worked once on a factory-fresh servo, set
+`Lock=1` on its way out, and thereafter left every wheel in position mode where
+`Goal_Velocity` writes all "succeed" and nothing turns. `FakeFeetechBus`
+reproduces the lock semantics so the test suite catches a regression.
+
+### How fast can it actually go
+
+`Omni3Kinematics.max_body_velocity(max_raw)` derives the limits from the geometry
+rather than hardcoding them. With stock geometry and the upstream 3000 ticks/s
+ceiling:
+
+| Axis | Limit |
+| --- | --- |
+| forward (`vx`) | 0.266 m/s |
+| sideways (`vy`) | 0.230 m/s |
+| yaw (`omega`) | 1.841 rad/s |
+
+Forward beats sideways by 1.155x because two wheels share the load in pure +x but
+only one is fully loaded in pure +y. These are single-axis maxima; combined
+commands saturate and get scaled down proportionally.
+
+For scale: `lekiwi_control.py` previously clamped forward speed to 2.0 m/s, about
+**7.5x** the real limit, i.e. it never bound at all.
+
 ### Why not just use LeRobot?
 
-`tinynav/platforms/lekiwi_control.py` does `from lerobot.robots.lekiwi...`, and
-`lerobot` depends on `torch`. The X5 has ~1.3 GB of writable rootfs, so that is
+`tinynav/platforms/lekiwi_control.py` used to do `from lerobot.robots.lekiwi...`,
+and `lerobot` depends on `torch`. The X5 has ~1.3 GB of writable rootfs, so that is
 not installable. The kinematics were therefore lifted from
 `lerobot/robots/lekiwi/lekiwi.py` (`_body_to_wheel_raw` / `_wheel_raw_to_body`,
 Apache-2.0) and the register map from `lerobot/motors/feetech/tables.py`, and
 re-expressed with no dependency beyond `numpy` and `pyserial`.
 
+`lerobot[lekiwi]` remains declared in `pyproject.toml`, but only as an *optional*
+extra that nothing in-tree imports any more, so the base install never pulls
+`torch`. Install it if you want LeRobot's own teleop or calibration tools; the
+navigation stack does not need it.
+
 For the same reason this code does **not** import `tinynav/core/math_utils.py`:
 that module pulls in numba, cv2 and fufpy, which is a lot of rootfs to spend on
 building one quaternion. `yaw_to_quaternion` is four lines instead.
+
+`scipy` is avoided on the same grounds -- ~85 MB installed, against ~850 MB of
+free RAM with no swap. `lekiwi_control.py` used `scipy.spatial.transform.Rotation`
+for two operations; those are now `quaternion_rotate_inverse` and
+`quaternion_relative_rotvec` in `omni3_kinematics.py`. They were diffed against
+scipy 1.15.3 over 20k random quaternions, including near-identity and
+near-180-degree cases, agreeing to 1.4e-14 — i.e. the substitution changed no
+number. The suite's own checks are against closed-form rotations, so they still
+run where scipy is missing or ABI-mismatched.
 
 What upstream does not have, and this adds: pose integration, a ROS interface,
 sampling timestamps, covariance, encoder-position differencing, and calibration.
@@ -220,7 +293,7 @@ the geometry need to be overridable from a launcher without editing code.
 
 | Parameter | Default | Notes |
 | --- | --- | --- |
-| `port` | `/dev/ttyACM0` | Feetech bus serial device |
+| `port` | `/dev/ttyACM0` | Feetech bus serial device. `/dev/ttyACM0` is the Waveshare adapter's USB-C seen by a laptop or Pi. Wired straight off the X5's UART it is `/dev/ttyS3` or `/dev/ttyS5` — run `tool/x5_board/servo_scan.py` to find out which, since the X5 **cannot act as a USB host** and has no ttyACM at all. |
 | `baudrate` | `1000000` | Feetech factory default |
 | `wheel_motor_ids` | `[7, 8, 9]` | left, back, right. Order matters. |
 | `wheel_signs` | `[1.0, 1.0, 1.0]` | per-wheel +1/-1, absorbs reversed wiring |

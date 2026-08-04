@@ -156,6 +156,35 @@ class Omni3Kinematics:
             ticks = ticks * (max_raw / peak)
         return np.round(ticks).astype(int)
 
+    def max_body_velocity(self, max_raw: int = 3000) -> dict[str, float]:
+        """What the base can actually do, given a per-wheel ``max_raw`` ticks/s.
+
+        Reported per axis because a kiwi drive is not isotropic: with the
+        standard [150, -90, 30] degree contact layout, two wheels share the load
+        in pure +x motion but one wheel takes it all in pure +y, so forward is
+        about 15% faster than sideways.
+
+        These are *single-axis* maxima.  Combined motion is slower -- asking for
+        max vx and max omega at once saturates, and ``body_to_wheel_raw`` scales
+        the whole command down.  Use them to clamp a planner's output, not as a
+        promise about diagonal motion.
+
+        This exists because the numbers are easy to guess wrong by an order of
+        magnitude: an earlier ``lekiwi_control.py`` clamped forward speed to
+        2.0 m/s, roughly 7.5x what the hardware can do, which is the same as not
+        clamping at all.
+        """
+        # max_raw ticks/s -> wheel rad/s -> contact-point speed in m/s
+        wheel_linear = (max_raw / self.ticks_per_rad) * self.wheel_radius
+        cos_gain = float(np.max(np.abs(self.m[:, 0])))
+        sin_gain = float(np.max(np.abs(self.m[:, 1])))
+        return {
+            "wheel_linear": wheel_linear,
+            "vx": wheel_linear / cos_gain if cos_gain > 0 else float("inf"),
+            "vy": wheel_linear / sin_gain if sin_gain > 0 else float("inf"),
+            "omega": wheel_linear / self.base_radius,
+        }
+
 
 def wrap_tick_delta(curr: int, prev: int, ticks_per_rev: int = DEFAULT_TICKS_PER_REV) -> int:
     """Shortest signed tick difference across the ``0 <-> ticks_per_rev-1`` seam.
@@ -230,3 +259,82 @@ def yaw_to_quaternion(yaw: float) -> tuple[float, float, float, float]:
     numba, cv2 and fufpy).
     """
     return (0.0, 0.0, float(np.sin(0.5 * yaw)), float(np.cos(0.5 * yaw)))
+
+
+# -- minimal quaternion helpers --------------------------------------------- #
+# All use the ROS / scipy ordering ``(x, y, z, w)``.  They exist so that the
+# LeKiwi control path does not need ``scipy.spatial.transform``: scipy is ~85 MB
+# installed, and the board has ~850 MB of RAM free with no swap.  It is also the
+# same reason this module avoids ``math_utils``.
+
+
+def quaternion_matrix(q) -> np.ndarray:
+    """Rotation matrix of a quaternion ``(x, y, z, w)``, normalised first."""
+    x, y, z, w = (float(v) for v in q)
+    n = np.sqrt(x * x + y * y + z * z + w * w)
+    if n == 0.0:
+        raise ValueError("zero-length quaternion has no rotation")
+    x, y, z, w = x / n, y / n, z / n, w / n
+    return np.array(
+        [
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        ]
+    )
+
+
+def quaternion_rotate_inverse(q, v) -> np.ndarray:
+    """Rotate ``v`` by the inverse of ``q``; equals ``R.from_quat(q).inv().apply(v)``."""
+    return quaternion_matrix(q).T @ np.asarray(v, dtype=float)
+
+
+def quaternion_multiply(q1, q2) -> tuple[float, float, float, float]:
+    """Hamilton product ``q1 * q2``, both ``(x, y, z, w)``."""
+    x1, y1, z1, w1 = (float(v) for v in q1)
+    x2, y2, z2, w2 = (float(v) for v in q2)
+    return (
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+    )
+
+
+def quaternion_inverse(q) -> tuple[float, float, float, float]:
+    """Inverse of a unit quaternion, i.e. its conjugate, normalised."""
+    x, y, z, w = (float(v) for v in q)
+    n2 = x * x + y * y + z * z + w * w
+    if n2 == 0.0:
+        raise ValueError("zero-length quaternion has no inverse")
+    return (-x / n2, -y / n2, -z / n2, w / n2)
+
+
+def quaternion_to_rotvec(q) -> np.ndarray:
+    """Rotation vector (axis * angle, radians) of ``q``; equals ``as_rotvec()``.
+
+    The sign is canonicalised the way scipy does it -- a quaternion with a
+    negative scalar part is negated first, so the result always describes the
+    shorter of the two rotations and the angle stays in ``[0, pi]``.  Without
+    that, ``q`` and ``-q`` (the same rotation) would give opposite answers.
+    """
+    x, y, z, w = (float(v) for v in q)
+    n = np.sqrt(x * x + y * y + z * z + w * w)
+    if n == 0.0:
+        raise ValueError("zero-length quaternion has no rotation vector")
+    x, y, z, w = x / n, y / n, z / n, w / n
+    if w < 0.0:
+        x, y, z, w = -x, -y, -z, -w
+
+    vec_norm = np.sqrt(x * x + y * y + z * z)
+    if vec_norm < 1e-8:
+        # angle = 2*atan2(vec_norm, w) -> 2*vec_norm as vec_norm -> 0, and the
+        # axis is vec/vec_norm, so the product tends to 2*vec with no division.
+        return 2.0 * np.array([x, y, z])
+    angle = 2.0 * np.arctan2(vec_norm, w)
+    return (angle / vec_norm) * np.array([x, y, z])
+
+
+def quaternion_relative_rotvec(q_a, q_b) -> np.ndarray:
+    """Rotation vector of ``q_a^-1 * q_b``."""
+    return quaternion_to_rotvec(quaternion_multiply(quaternion_inverse(q_a), q_b))

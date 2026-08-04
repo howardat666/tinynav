@@ -176,9 +176,19 @@ sudo apt install -y linux-modules-nvidia-595-open-6.8.0-136-generic && sudo modp
 - `tool/looper_bridge_node.py` 加 **IMU publisher**（现在不发）
 - `imu_propagator_node.py:69` 的 `/camera/camera/imu` 要 remap
 
-#### 💻 T-8 · 轻量 Feetech(scservo) 串口驱动 —— 1–2 天（闭环测试才需硬件）
-`tinynav/platforms/lekiwi_control.py:5` 依赖 `lerobot` → 依赖 `torch` → **X5 装不下**。而且它只 `send_action()`，**从不调 `get_observation()` 读轮速**。
-写 ~200 行纯串口驱动替代，同时提供轮速读取。
+#### ✅ T-8 · 轻量 Feetech(scservo) 串口驱动 —— **已完成（软件侧）**
+原状：`tinynav/platforms/lekiwi_control.py:5` 依赖 `lerobot` → 依赖 `torch` → **X5 装不下**；而且它只 `send_action()`，**从不调 `get_observation()` 读轮速**。
+
+已做：
+- `tinynav/platforms/feetech_bus.py` + `omni3_kinematics.py` + `core/wheel_odometry_node.py`（提交 `e811d3f`）替代 lerobot，只依赖 `pyserial` + `numpy`。
+- **`lekiwi_control.py` 重写**：不再 import lerobot，也不再碰硬件，退化成纯「路径 → `Twist`」节点。总线由 `wheel_odometry_node -p enable_wheel_command:=true` 单一持有（半双工总线只能有一个主人）。
+- 顺带去掉 `scipy` 依赖（约 85 MB，板上只有 ~850 MB 可用）：四元数运算改用 `omni3_kinematics` 里的纯 numpy 版，与 scipy 1.15.3 在 2 万个随机四元数（含近单位、近 180°）上最大差 1.4e-14。
+- `np.clip(..., -2.0, 2.0)` 的假限幅换成按几何推导的真实上限 `Omni3Kinematics.max_body_velocity()`：**前进 0.266 m/s、横移 0.230 m/s、自转 1.84 rad/s**。原限幅是真实值的 **7.5 倍**，等于没限。
+- 新增 `tool/x5_board/servo_scan.py`：**只读**总线扫描（ttyS3/ttyS5 × 波特率 × ID 1–20），接线完成后第一个跑的工具，已用 PTY 假舵机端到端验证。
+
+**🐛 顺带修掉一个会静默失败的 bug**：`_configure_wheels_for_velocity_mode()` 原本在 EEPROM 未解锁时就写 `Operating_Mode`（addr 33 属 EEPROM 区），且结尾把 `Lock` 置 1。舵机对锁定状态下的 EEPROM 写**回 ACK 且 error=0 然后丢弃** —— 所以第一次之后每次启动都静默失败：轮子留在位置模式，`Goal_Velocity` 全部"写入成功"，车不动且没有任何报错。已改为 `Torque_Enable=0 → Lock=0 → 写 → Lock=1 → Torque_Enable=1` 并**回读校验**，读不到 `mode=1` 就拒绝驱动。`FakeFeetechBus` 现在也模拟这个锁语义，所以测试能真正抓到（`tests/test_wheel_odometry.py`，12/12 通过）。
+
+**仍需硬件才能确定**：轮子转向符号 `wheel_signs`、`wheel_radius`/`base_radius` 标定、以及 `yaw_sign` 的正负（相机 y 轴朝下 vs 底盘 yaw 朝上，见 `lekiwi_control.py` docstring；垫高空转一次即可定）。
 
 #### 💻 T-9 · `map_node` 加 `--localization-only` 模式 —— 1 天
 现在 `keyframe_callback`（`map_node.py:332`）每个关键帧无条件跑 `keyframe_mapping()`（写盘存 depth/image + 重算 DINO/SP + 全量 Ceres），额外 **391.8 ms/帧**且随地图增长。

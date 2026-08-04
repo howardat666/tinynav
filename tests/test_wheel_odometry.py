@@ -1,4 +1,4 @@
-"""Self-checks for the LeKiwi wheel odometry stack.
+"""Self-checks for the LeKiwi wheel odometry and base-control stack.
 
 Run directly (repo style, no pytest needed):
 
@@ -9,7 +9,9 @@ Covers, in order of how much they would hurt if wrong:
   * encoder wrap-around differencing across the 0/4095 seam
   * SE(2) integration on a straight line and a closed circle
   * Feetech packet framing, checksums and sign-magnitude decoding
-  * the full ROS node driven by a fake bus (skipped if rclpy is unavailable)
+  * the scipy-free quaternion helpers the control node relies on
+  * velocity limits derived from geometry, replacing a hardcoded guess
+  * the full ROS nodes driven by a fake bus (skipped if rclpy is unavailable)
 """
 
 import os
@@ -33,6 +35,11 @@ from tinynav.platforms.feetech_bus import (  # noqa: E402
 from tinynav.platforms.omni3_kinematics import (  # noqa: E402
     Omni3Kinematics,
     integrate_se2,
+    quaternion_inverse,
+    quaternion_matrix,
+    quaternion_relative_rotvec,
+    quaternion_rotate_inverse,
+    quaternion_to_rotvec,
     wrap_angle,
     wrap_tick_delta,
     yaw_to_quaternion,
@@ -407,13 +414,309 @@ def test_node_straight_and_circle():
     assert abs(track_y[-1, 0]) < 1e-3
 
 
+def test_eeprom_lock_semantics():
+    """A locked EEPROM write is dropped, not refused -- and the fake bus says so.
+
+    ``Operating_Mode`` (address 33) is in the EEPROM region.  Real STS3215
+    firmware acknowledges a write to it while ``Lock`` is set, with error byte 0,
+    and then discards it.  There is no way to detect that except by reading the
+    register back, so this test pins the behaviour the fake bus must reproduce;
+    without it, a caller that forgets to unlock passes on the fake and fails
+    silently on the robot.
+    """
+    ids = [7, 8, 9]
+    bus = FakeFeetechBus(ids)
+    bus.connect()
+
+    # A used servo comes up locked and in position mode.
+    assert bus.read("Lock", 7) == 1
+    assert bus.read("Operating_Mode", 7) == 0
+
+    # The naive order: write the mode, then lock.  Accepted, and ignored.
+    bus.write("Operating_Mode", 7, 1)
+    assert bus.read("Operating_Mode", 7) == 0, "locked EEPROM write must not take effect"
+    assert ("Operating_Mode", 7, 1) in bus.rejected_eeprom_writes
+    print("  locked write of Operating_Mode was silently dropped, as on real hardware")
+
+    # The correct order.
+    bus.write("Torque_Enable", 7, 0)
+    bus.write("Lock", 7, 0)
+    bus.write("Operating_Mode", 7, 1)
+    bus.write("Lock", 7, 1)
+    bus.write("Torque_Enable", 7, 1)
+    assert bus.read("Operating_Mode", 7) == 1, "unlocked EEPROM write must take effect"
+    assert bus.read("Lock", 7) == 1, "EEPROM must be left locked again"
+    assert bus.read("Torque_Enable", 7) == 1
+    print("  unlock -> write -> relock sequence left Operating_Mode=1, Lock=1, torque on")
+
+    # SRAM registers are never gated by Lock.
+    bus.write("Goal_Velocity", 8, -250)
+    assert bus.read("Goal_Velocity", 8) == -250
+    print("  SRAM writes are unaffected by Lock")
+
+
+def test_node_configures_velocity_mode():
+    """The odometry node's wheel-command setup must leave all three wheels in mode 1.
+
+    This is the regression guard for a silent-failure bug: an earlier version
+    wrote ``Operating_Mode`` before clearing ``Lock`` and then set ``Lock=1`` at
+    the end, so it worked at most once on a factory-fresh servo and thereafter
+    left every wheel in position mode -- where Goal_Velocity writes are accepted
+    and no wheel turns.
+    """
+    try:
+        import rclpy
+    except ImportError:
+        print("  rclpy unavailable, skipped")
+        return
+
+    from tinynav.core.wheel_odometry_node import WheelOdometryNode
+
+    rclpy.init(
+        args=[
+            "--ros-args",
+            "-p", "fake_bus:=true",
+            "-p", "enable_wheel_command:=true",
+            "-p", "odom_topic:=/test/wheel_odometry",
+            "-p", "publish_tf:=false",
+        ]
+    )
+    try:
+        node = WheelOdometryNode()
+        node.timer.cancel()
+        node.bus = FakeFeetechBus(node.motor_ids)
+        node.bus.connect()
+
+        node._configure_wheels_for_velocity_mode()
+        for motor_id in node.motor_ids:
+            assert node.bus.read("Operating_Mode", motor_id) == 1, f"wheel {motor_id} not in velocity mode"
+            assert node.bus.read("Lock", motor_id) == 1, f"wheel {motor_id} left with EEPROM unlocked"
+            assert node.bus.read("Torque_Enable", motor_id) == 1, f"wheel {motor_id} left with torque off"
+        print(f"  all of {node.motor_ids} reached Operating_Mode=1 with EEPROM re-locked")
+
+        # And it must *raise* rather than drive if the mode did not stick: a
+        # wheel whose mode we cannot confirm must never be commanded.
+        stuck = FakeFeetechBus(node.motor_ids)
+        stuck.connect()
+        original_write = stuck.write
+
+        def write_ignoring_unlock(data_name, motor_id, value, num_retry=2):
+            if data_name == "Lock" and value == 0:
+                return  # simulate a servo whose lock will not clear
+            original_write(data_name, motor_id, value, num_retry)
+
+        stuck.write = write_ignoring_unlock
+        node.bus = stuck
+        try:
+            node._configure_wheels_for_velocity_mode()
+        except FeetechBusError as exc:
+            print(f"  refused to drive when the mode did not stick: {str(exc)[:70]}...")
+        else:
+            raise AssertionError("configuration must raise when Operating_Mode does not read back as 1")
+
+        node.destroy_node()
+    finally:
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+def test_quaternion_helpers():
+    """The scipy-free quaternion helpers used by lekiwi_control.
+
+    Checked against closed-form rotations rather than against scipy, so this
+    still runs where scipy is missing or ABI-mismatched -- which is the whole
+    point of not depending on it. (They were also diffed against scipy 1.15.3
+    over 20k random quaternions, agreeing to 1.4e-14 including near-identity and
+    near-180-degree cases; that comparison needs a working scipy, so it is not
+    part of this suite.)
+    """
+    # A 90 degree rotation about +z maps +x to +y; its inverse maps +y to +x.
+    q_z90 = (0.0, 0.0, np.sin(np.pi / 4), np.cos(np.pi / 4))
+    got = quaternion_rotate_inverse(q_z90, [0.0, 1.0, 0.0])
+    assert np.allclose(got, [1.0, 0.0, 0.0], atol=1e-12), got
+    print(f"  inv(Rz(90)) applied to +y -> {np.round(got, 12)}")
+
+    # Rotation vector round-trip on each principal axis, both signs.
+    for axis_idx, axis_name in enumerate("xyz"):
+        for angle in (0.3, -0.3, 2.0, -2.0, np.pi - 1e-6):
+            axis = np.zeros(3)
+            axis[axis_idx] = 1.0
+            half = 0.5 * angle
+            q = (*(axis * np.sin(half)), np.cos(half))
+            rotvec = quaternion_to_rotvec(q)
+            assert np.allclose(rotvec, axis * angle, atol=1e-9), (axis_name, angle, rotvec)
+    print("  as_rotvec round-trip on +/-x, +/-y, +/-z up to +/-pi: OK")
+
+    # q and -q are the same rotation and must give the same rotation vector.
+    rng = np.random.default_rng(7)
+    for _ in range(200):
+        q = rng.normal(size=4)
+        q /= np.linalg.norm(q)
+        assert np.allclose(quaternion_to_rotvec(q), quaternion_to_rotvec(-q), atol=1e-12)
+    print("  q and -q give the same rotation vector (sign canonicalised): OK")
+
+    # Identity, and the near-identity branch that avoids dividing by ~0.
+    assert np.allclose(quaternion_to_rotvec((0.0, 0.0, 0.0, 1.0)), np.zeros(3))
+    tiny = quaternion_to_rotvec((1e-12, 0.0, 0.0, 1.0))
+    assert np.allclose(tiny, [2e-12, 0.0, 0.0], atol=1e-18), tiny
+    print(f"  near-identity quaternion -> {tiny} (no division by zero)")
+
+    # Relative rotation: composing a rotation with itself twice must give 2x.
+    q_z45 = (0.0, 0.0, np.sin(np.pi / 8), np.cos(np.pi / 8))
+    rel = quaternion_relative_rotvec(quaternion_inverse(q_z45), q_z45)
+    assert np.allclose(rel, [0.0, 0.0, np.pi / 2], atol=1e-12), rel
+    print(f"  relative rotvec of Rz(-45) -> Rz(45) = {np.round(rel, 12)} (i.e. 90 deg about +z)")
+
+    # A zero quaternion is not a rotation and must be rejected, not normalised
+    # to garbage.
+    for bad_call in (
+        lambda: quaternion_matrix((0.0, 0.0, 0.0, 0.0)),
+        lambda: quaternion_to_rotvec((0.0, 0.0, 0.0, 0.0)),
+        lambda: quaternion_inverse((0.0, 0.0, 0.0, 0.0)),
+    ):
+        try:
+            bad_call()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("a zero-length quaternion must raise")
+    print("  zero-length quaternion rejected: OK")
+
+
+def test_max_body_velocity():
+    """The derived limits must match the hardware, not a guess.
+
+    Pins the numbers that replace ``lekiwi_control.py``'s old +/-2.0 m/s clamp.
+    With the stock geometry (50 mm wheels, 125 mm base radius, 4096 ticks/rev)
+    and the upstream 3000 ticks/s ceiling, forward tops out near 0.27 m/s -- so
+    the old clamp was about 7.5x too permissive and never bound at all.
+    """
+    kin = Omni3Kinematics()
+    lim = kin.max_body_velocity(max_raw=3000)
+
+    # 3000 ticks/s / (4096/2pi ticks/rad) * 0.05 m = 0.2301 m/s at the contact point
+    expected_wheel = (3000.0 / (4096.0 / (2.0 * np.pi))) * 0.05
+    assert abs(lim["wheel_linear"] - expected_wheel) < 1e-9, lim
+    print(f"  per-wheel contact speed : {lim['wheel_linear']:.4f} m/s")
+
+    # Contact angles are [150, -90, 30] deg, so max|cos| = cos(30) = 0.866 and
+    # max|sin| = 1. Forward therefore beats sideways by 1/0.866 = 1.155x.
+    assert abs(lim["vx"] - expected_wheel / np.cos(np.radians(30.0))) < 1e-9, lim
+    assert abs(lim["vy"] - expected_wheel) < 1e-9, lim
+    assert abs(lim["omega"] - expected_wheel / 0.125) < 1e-9, lim
+    print(f"  max vx / vy / omega     : {lim['vx']:.4f} m/s / {lim['vy']:.4f} m/s / {lim['omega']:.4f} rad/s")
+    assert 0.26 < lim["vx"] < 0.27, f"forward limit moved: {lim['vx']}"
+    assert lim["vx"] > lim["vy"], "a kiwi drive is faster forward than sideways"
+    print(f"  the old +/-2.0 m/s clamp was {2.0 / lim['vx']:.1f}x the real limit")
+
+    # A command at exactly the limit must not be scaled down; just past it must be.
+    at_limit = kin.body_to_wheel_raw(lim["vx"], 0.0, 0.0, max_raw=3000)
+    assert np.max(np.abs(at_limit)) <= 3000, at_limit
+    assert np.max(np.abs(at_limit)) >= 2999, at_limit
+    over = kin.body_to_wheel_raw(lim["vx"] * 10.0, 0.0, 0.0, max_raw=3000)
+    assert np.max(np.abs(over)) <= 3000, over
+    print(f"  at the limit -> {list(at_limit)}; 10x over -> {list(over)} (scaled, direction kept)")
+
+
+def test_lekiwi_control_path_to_twist():
+    """lekiwi_control must convert a camera-frame path to Twist, and clamp it.
+
+    Also the regression guard for the dependency: importing this node must not
+    pull in lerobot or torch, neither of which fits on the X5.
+    """
+    try:
+        import rclpy
+    except ImportError:
+        print("  rclpy unavailable, skipped")
+        return
+
+    import builtins
+
+    real_import = builtins.__import__
+    banned = ("lerobot", "torch")
+
+    def guarded_import(name, *a, **kw):
+        if name.split(".")[0] in banned:
+            raise AssertionError(f"lekiwi_control must not import {name!r} -- it does not fit on the X5")
+        return real_import(name, *a, **kw)
+
+    builtins.__import__ = guarded_import
+    try:
+        from tinynav.platforms.lekiwi_control import LeKiwiControlNode
+    finally:
+        builtins.__import__ = real_import
+    print("  imported with lerobot and torch blocked: OK")
+
+    from geometry_msgs.msg import PoseStamped
+    from nav_msgs.msg import Path
+
+    rclpy.init(args=["--ros-args", "-p", "cmd_vel_topic:=/test/cmd_vel"])
+    try:
+        node = LeKiwiControlNode()
+        node.timer.cancel()
+        dt = node.trajectory_dt
+
+        def make_path(dz_per_step, n=10, stamp_now=True):
+            path = Path()
+            if stamp_now:
+                path.header.stamp = node.get_clock().now().to_msg()
+            for i in range(n):
+                ps = PoseStamped()
+                ps.pose.position.z = i * dz_per_step  # camera +z is forward
+                ps.pose.orientation.w = 1.0
+                path.poses.append(ps)
+            return path
+
+        # 0.1 m/s forward: dz per step = 0.1 * dt
+        node.path_callback(make_path(0.1 * dt))
+        cmd = node._sample_velocity()
+        assert cmd is not None, "a fresh path must produce a command"
+        assert abs(cmd.linear.x - 0.1) < 1e-6, cmd.linear.x
+        assert abs(cmd.angular.z) < 1e-9, cmd.angular.z
+        print(f"  0.1 m/s forward -> linear.x={cmd.linear.x:.4f}")
+
+        # Well over the hardware limit: must clamp, not pass through.
+        node.path_callback(make_path(5.0 * dt))
+        cmd = node._sample_velocity()
+        assert abs(cmd.linear.x - node.max_linear_x) < 1e-6, (cmd.linear.x, node.max_linear_x)
+        print(f"  5.0 m/s demanded -> clamped to {cmd.linear.x:.4f} m/s (hardware limit)")
+
+        # Reverse clamps symmetrically.
+        node.path_callback(make_path(-5.0 * dt))
+        cmd = node._sample_velocity()
+        assert abs(cmd.linear.x + node.max_linear_x) < 1e-6, cmd.linear.x
+        print(f"  -5.0 m/s demanded -> clamped to {cmd.linear.x:.4f} m/s")
+
+        # A stale path yields no sample, so the bus owner's watchdog can act.
+        stale = make_path(0.1 * dt, stamp_now=False)
+        stale.header.stamp.sec = 1  # far in the past
+        node.path_callback(stale)
+        assert node._sample_velocity() is None, "a stale path must not produce a command"
+        print("  stale path -> no command (downstream watchdog takes over)")
+
+        # And a path too short to difference must not raise.
+        node.path_callback(Path())
+        assert node._sample_velocity() is None
+        print("  empty path -> no command, no exception")
+
+        node.destroy_node()
+    finally:
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
 TESTS = [
     test_kinematics_roundtrip,
+    test_quaternion_helpers,
+    test_max_body_velocity,
+    test_lekiwi_control_path_to_twist,
     test_wrap_tick_delta,
     test_se2_integration,
     test_sign_magnitude,
     test_feetech_framing,
     test_fake_bus_wraps,
+    test_eeprom_lock_semantics,
+    test_node_configures_velocity_mode,
     test_node_straight_and_circle,
 ]
 
