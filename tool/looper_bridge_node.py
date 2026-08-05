@@ -331,11 +331,18 @@ def parse_args():
     parser.add_argument(
         "--pose-sync-slop",
         type=float,
-        default=0.02,
-        help="Maximum stamp difference for approximate matching, seconds. 0.02 is "
-             "one wheel-odometry period at the default 50 Hz; at a 0.15 m/s "
-             "mapping speed a 10 ms mismatch is 1.5 mm of position and 0.23 deg "
-             "of yaw, both well under the 3 cm keyframe threshold.",
+        default=0.06,
+        help="Maximum stamp difference for approximate matching, seconds. Sized "
+             "from the pose rate actually observed, not the configured one: the "
+             "LeKiwi's servo bus loses reads, and /wheel/camera_pose arrived at "
+             "28 Hz against a configured 50 Hz in a measured recording, in bursts "
+             "rather than evenly. 0.02 -- one nominal period -- silently drops "
+             "every depth frame whose nearest pose fell in a burst, and a dropped "
+             "keyframe looks exactly like a keyframe that was never worth keeping. "
+             "0.06 covers a two-period gap. The cost is bounded: at a 0.15 m/s "
+             "mapping speed 60 ms is 9 mm of position and 1.4 deg of yaw, still "
+             "under the 3 cm keyframe threshold. Ignored on the VIO path, which is "
+             "matched by exact stamp.",
     )
     parser.add_argument(
         "--publish-camera-info-alias",
