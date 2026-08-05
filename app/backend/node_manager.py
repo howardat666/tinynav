@@ -103,6 +103,50 @@ _WHEEL_RADIUS = os.environ.get('TINYNAV_WHEEL_RADIUS', '0.050385')
 _WHEEL_BASE_RADIUS = os.environ.get('TINYNAV_BASE_RADIUS', '0.127083')
 _WHEEL_CAMERA_OFFSET = os.environ.get('TINYNAV_WHEEL_CAMERA_OFFSET', '0.06,0.05,0.18')
 
+# ---------------------------------------------------------------------------- #
+# Offline map build resources
+# ---------------------------------------------------------------------------- #
+# All four exist because an unmodified build is not survivable on the X5, whose
+# 1307 MB is shared with the camera firmware and has no swap. Defaults reproduce
+# the previous behaviour exactly, so nothing changes on a workstation.
+#
+# The vocabulary is the sharpest edge. ORBvoc.txt needs 1735 MB to load -- more
+# than the board physically has, so the build is OOM-killed before the first
+# keyframe -- and it is not even shipped to the board, which makes the failure a
+# missing file rather than an obvious out-of-memory. A k10L5 vocabulary trained on
+# office footage loads in 407 MB.
+_DBOW3_VOCAB = os.environ.get(
+    'TINYNAV_DBOW3_VOCAB', os.path.join(_TINYNAV_ROOT, 'docs/Vocabulary/ORBvoc.txt')
+)
+# Unpaced playback fills the keyframe sync queue faster than the board drains it.
+# Measured: OOM at 0.5% progress, 645 MiB resident. A positive rate paces the bag.
+_MAP_PLAY_RATE = os.environ.get('TINYNAV_MAP_PLAY_RATE', '')
+# Each queue slot holds three full-resolution images, ~1.4 MB at 544x640, so the
+# 200 default reserves 280 MB the board does not have.
+_MAP_SYNC_QUEUE = os.environ.get('TINYNAV_MAP_SYNC_QUEUE', '')
+# The rviz-only publishes dominated per-keyframe cost on the board: 13351 ms fell
+# to 321-774 ms with them off, and nothing in the saved map depends on them.
+_MAP_VISUALIZATION = os.environ.get('TINYNAV_MAP_VISUALIZATION', '1') == '1'
+
+
+def _build_map_argv(map_save_path: str, bag_file: str) -> list[str]:
+    """build_map_node argv, with the board's resource limits applied if set."""
+    argv = [
+        'python3', os.path.join(_TINYNAV_ROOT, 'tinynav/core/build_map_node.py'),
+        '--map_save_path', map_save_path,
+        '--bag_file', bag_file,
+        '--loop-closure-mode', 'bow',
+        '--loop-closure-use-bow',
+        '--dbow3-vocabulary-path', _DBOW3_VOCAB,
+    ]
+    if _MAP_PLAY_RATE:
+        argv += ['--play-rate', _MAP_PLAY_RATE]
+    if _MAP_SYNC_QUEUE:
+        argv += ['--sync-queue-size', _MAP_SYNC_QUEUE]
+    if not _MAP_VISUALIZATION:
+        argv.append('--no-visualization')
+    return argv
+
 
 def _keyframe_pose_topic() -> str:
     """Pose the bridge builds /slam/keyframe_odom from."""
@@ -755,6 +799,16 @@ class BackendNode(Ros2NodeManager):
                 'baseRadius': float(_WHEEL_BASE_RADIUS),
                 'cameraOffsetForwardLeftUp': [float(v) for v in _WHEEL_CAMERA_OFFSET.split(',')],
             } if _ACTUATOR == 'wheel' else None,
+            # Reported for the same reason as the rest: a build that dies for lack
+            # of memory looks like a build that failed for an unknown reason, and
+            # the vocabulary path is the single most likely cause.
+            'mapBuild': {
+                'vocabulary': _DBOW3_VOCAB,
+                'vocabularyExists': os.path.exists(_DBOW3_VOCAB),
+                'playRate': _MAP_PLAY_RATE or None,
+                'syncQueueSize': _MAP_SYNC_QUEUE or None,
+                'visualization': _MAP_VISUALIZATION,
+            },
         }
 
     def get_image_topics(self) -> list[str]:
@@ -1333,16 +1387,11 @@ class BackendNode(Ros2NodeManager):
             source_node_cmd,
             env=_env,
         )
+        build_argv = _build_map_argv(self.map_path, bag_file)
+        self.get_logger().info(f'map build: {" ".join(build_argv[2:])}')
         self.processes['build_map'] = self._launch_proc_tee(
             'build_map_node',
-            [
-                'python3', os.path.join(_TINYNAV_ROOT, 'tinynav/core/build_map_node.py'),
-                '--map_save_path', self.map_path,
-                '--bag_file', bag_file,
-                '--loop-closure-mode', 'bow',
-                '--loop-closure-use-bow',
-                '--dbow3-vocabulary-path', os.path.join(_TINYNAV_ROOT, 'docs/Vocabulary/ORBvoc.txt'),
-            ],
+            build_argv,
             env=_env,
         )
 

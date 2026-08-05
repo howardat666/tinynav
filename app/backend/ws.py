@@ -253,6 +253,21 @@ async def ws_preview(ws: WebSocket, topic: str = Query(...)):
 # /ws/teleop  — receives velocity commands and publishes to /cmd_vel          #
 # --------------------------------------------------------------------------- #
 
+# How often the last command is re-published while the socket is open, and the
+# watchdog it exists to satisfy. wheel_odometry_node zeroes the wheels when no
+# /cmd_vel has arrived for cmd_timeout_s (0.5 s by default), which is correct for
+# a robot whose controller may die mid-drive.
+#
+# The browser cannot satisfy that on its own: the joystick sends only on *change*,
+# so holding it steady sends nothing, and the robot drives for half a second and
+# stops until the stick is jiggled. Repeating here rather than in the frontend
+# keeps the watchdog contract where it belongs -- the browser should not have to
+# know a ROS timeout -- and it also covers network stalls, which a client-side
+# timer would not.
+_TELEOP_REPEAT_HZ = 20.0
+_TELEOP_REPEAT_PERIOD = 1.0 / _TELEOP_REPEAT_HZ
+
+
 @router.websocket('/ws/teleop')
 async def ws_teleop(ws: WebSocket):
     await ws.accept()
@@ -260,19 +275,41 @@ async def ws_teleop(ws: WebSocket):
     if node is None:
         await ws.close(code=1013)
         return
+
+    last = (0.0, 0.0, 0.0)
+    stop = asyncio.Event()
+
+    async def repeat():
+        """Re-publish the latest command until the socket closes."""
+        while not stop.is_set():
+            # Zero is the resting state, which the watchdog already produces;
+            # republishing it would only race a real command arriving.
+            if last != (0.0, 0.0, 0.0):
+                try:
+                    node.publish_cmd_vel(*last)
+                except Exception:
+                    pass
+            await asyncio.sleep(_TELEOP_REPEAT_PERIOD)
+
+    repeater = asyncio.create_task(repeat())
     try:
         while True:
             data = await ws.receive_text()
             msg = json.loads(data)
-            node.publish_cmd_vel(
+            last = (
                 float(msg.get('linear_x', 0.0)),
                 float(msg.get('linear_y', 0.0)),
                 float(msg.get('angular_z', 0.0)),
             )
+            node.publish_cmd_vel(*last)
     except WebSocketDisconnect:
         pass
     finally:
+        stop.set()
+        repeater.cancel()
         try:
+            # Explicit zero on the way out: closing the tab must stop the robot,
+            # and it must not have to wait out the watchdog to do it.
             node.publish_cmd_vel(0.0, 0.0, 0.0)
         except Exception:
             pass

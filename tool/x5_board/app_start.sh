@@ -94,12 +94,34 @@ do_start() {
     export TINYNAV_ODOM_SOURCE="${nav_src}"
     export TINYNAV_MAP_ODOM_SOURCE="${map_src}"
 
+    # Offline map build limits. Without all four the build is OOM-killed on this
+    # board: measured rc=137 at 0.5% progress, 645 MiB resident.
+    #   vocabulary  ORBvoc.txt needs 1735 MB, more than the board has, and is not
+    #               even shipped here -- so the failure looks like a missing file.
+    #               The office k10L5 vocabulary peaks at 407 MB.
+    #   play-rate   unpaced playback fills the sync queue faster than the board
+    #               drains it. 1.0 = real time, which the board keeps up with.
+    #   sync-queue  200 slots x 3 full-res images ~ 280 MB. 20 is 28 MB.
+    #   no-vis      the rviz-only publishes cost 12.6 s of the 13.4 s per keyframe
+    #               and nothing in the saved map depends on them.
+    export TINYNAV_DBOW3_VOCAB="${TINYNAV_DBOW3_VOCAB:-/userdata/x5/voc/voc_office_k10L5.dbow3}"
+    export TINYNAV_MAP_PLAY_RATE="${TINYNAV_MAP_PLAY_RATE:-1.0}"
+    export TINYNAV_MAP_SYNC_QUEUE="${TINYNAV_MAP_SYNC_QUEUE:-20}"
+    export TINYNAV_MAP_VISUALIZATION="${TINYNAV_MAP_VISUALIZATION:-0}"
+
+    if [[ ! -f "${TINYNAV_DBOW3_VOCAB}" ]]; then
+        echo "vocabulary missing: ${TINYNAV_DBOW3_VOCAB} -- map build will fail" >&2
+        exit 1
+    fi
+
     {
         echo "=============================================================="
         echo "scheme        : ${scheme}   (map=${map_src}, nav=${nav_src})"
         echo "board uptime  : $(cut -d' ' -f1 /proc/uptime)s"
         echo "robot/actuator: ${TINYNAV_ROBOT_TYPE} / ${TINYNAV_ACTUATOR}"
         echo "db            : ${TINYNAV_DB_PATH}"
+        echo "map vocab     : ${TINYNAV_DBOW3_VOCAB}"
+        echo "map build     : rate=${TINYNAV_MAP_PLAY_RATE} queue=${TINYNAV_MAP_SYNC_QUEUE} vis=${TINYNAV_MAP_VISUALIZATION}"
         echo "=============================================================="
     } >> "${LOGFILE}"
 
