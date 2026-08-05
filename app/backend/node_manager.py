@@ -47,7 +47,122 @@ _ROS2_NODE_LIST_RETRIES = int(os.environ.get('TINYNAV_ROS2_NODE_LIST_RETRIES', '
 # build_map_node.py emits "MAPPING_PERCENT:<float>" lines on stdout so the
 # parent process can track progress without a separate bridge subprocess.
 _MAPPING_PERCENT_PREFIX = 'MAPPING_PERCENT:'
-_ENABLE_CMD_VEL_NODE = os.environ.get('TINYNAV_ENABLE_CMD_VEL_NODE', '0') == '1'
+
+# ---------------------------------------------------------------------------- #
+# Platform, actuator and odometry source
+# ---------------------------------------------------------------------------- #
+# Environment variables rather than HTTP settings because they decide which
+# processes exist, and every one of them has to be fixed before the first node
+# starts. Set them in the unit file / launch wrapper, one config per run.
+#
+#   TINYNAV_ROBOT_TYPE    go2 | b2 | lekiwi   robot geometry (see robot_config.py)
+#   TINYNAV_ACTUATOR      unitree | wheel | none   what consumes /cmd_vel
+#   TINYNAV_ODOM_SOURCE   vio | wheel         what the pose consumers read
+#
+# TINYNAV_ACTUATOR is a separate knob from TINYNAV_ODOM_SOURCE on purpose: the
+# LeKiwi comparison runs need wheel *actuation* with VIO *odometry*, which is the
+# combination that isolates the odometry change from everything else.
+_ROBOT_TYPE = os.environ.get('TINYNAV_ROBOT_TYPE', 'go2')
+_ACTUATOR = os.environ.get('TINYNAV_ACTUATOR', 'unitree')
+_ODOM_SOURCE = os.environ.get('TINYNAV_ODOM_SOURCE', 'vio')
+
+# Which odometry the *offline map build* replays out of the bag, independent of
+# what navigation then runs on. Separate because the interesting comparison needs
+# all three combinations, and a single knob can only express two of them:
+#
+#   MAP_ODOM_SOURCE=vio    ODOM_SOURCE=vio      VIO map, VIO navigation (baseline)
+#   MAP_ODOM_SOURCE=vio    ODOM_SOURCE=wheel    VIO map, odometry navigation
+#   MAP_ODOM_SOURCE=wheel  ODOM_SOURCE=wheel    odometry throughout
+#
+# One recording serves all three, as long as it carries both pose topics: the
+# build takes its pose from a topic in the bag, so only this variable changes.
+_MAP_ODOM_SOURCE = os.environ.get('TINYNAV_MAP_ODOM_SOURCE', _ODOM_SOURCE)
+
+# cmd_vel_control does the closed-loop path following and publishes /cmd_vel.
+# unitree_control does its own, so it stays off for a Unitree base; a wheel base
+# has no equivalent and needs it. Still overridable for bring-up.
+_ENABLE_CMD_VEL_NODE = os.environ.get(
+    'TINYNAV_ENABLE_CMD_VEL_NODE', '1' if _ACTUATOR == 'wheel' else '0'
+) == '1'
+
+# Pose sources. The camera stamps /camera/camera/vio_image with the image's own
+# timestamp, which is what lets looper_bridge_node match keyframes exactly;
+# vio_100hz is the faster unbridged one the controller closes its loop on.
+# /wheel/camera_pose is wheel_odometry_node's integrated pose already pushed
+# through the base_link -> camera extrinsic and rotated into optical axes, so it
+# is a drop-in for either.
+_POSE_TOPIC_VIO_KEYFRAME = '/camera/camera/vio_image'
+_POSE_TOPIC_VIO_CONTROL = '/camera/camera/vio_100hz'
+_POSE_TOPIC_WHEEL = '/wheel/camera_pose'
+
+# Measured on this robot, not nominal. wheel_radius came from a driven 3 m
+# straight run (tape 3.030 m), base_radius from two driven spins agreeing to
+# 0.123%; camera offset is [forward, left, up] from the base centre in metres.
+_WHEEL_PORT = os.environ.get('TINYNAV_WHEEL_PORT', '/dev/ttyS3')
+_WHEEL_RADIUS = os.environ.get('TINYNAV_WHEEL_RADIUS', '0.050385')
+_WHEEL_BASE_RADIUS = os.environ.get('TINYNAV_BASE_RADIUS', '0.127083')
+_WHEEL_CAMERA_OFFSET = os.environ.get('TINYNAV_WHEEL_CAMERA_OFFSET', '0.06,0.05,0.18')
+
+
+def _keyframe_pose_topic() -> str:
+    """Pose the bridge builds /slam/keyframe_odom from."""
+    return _POSE_TOPIC_WHEEL if _ODOM_SOURCE == 'wheel' else _POSE_TOPIC_VIO_KEYFRAME
+
+
+def _control_pose_topic() -> str:
+    """Pose cmd_vel_control closes its loop on."""
+    return _POSE_TOPIC_WHEEL if _ODOM_SOURCE == 'wheel' else _POSE_TOPIC_VIO_CONTROL
+
+
+# The launch argv lives in these builders rather than inline at each call site
+# because most of these nodes are started from two or three places -- planning
+# from _launch_sensor_procs and cmd_restart_nav_nodes, cmd_vel_control from
+# cmd_start_nav_nodes and cmd_restart_nav_nodes, the bridge from
+# _launch_sensor_procs and _start_rosbag_build_map -- and the copies had already
+# drifted. A parameter added to one copy and not the others is a run that
+# silently uses different geometry after an emergency stop.
+
+def _node_argv(rel_path: str) -> list[str]:
+    return ['python3', os.path.join(_TINYNAV_ROOT, rel_path)]
+
+
+def _bridge_argv(*, for_map_build: bool = False) -> list[str]:
+    source = _MAP_ODOM_SOURCE if for_map_build else _ODOM_SOURCE
+    pose_topic = _POSE_TOPIC_WHEEL if source == 'wheel' else _POSE_TOPIC_VIO_KEYFRAME
+    return _node_argv('tool/looper_bridge_node.py') + ['--pose-topic', pose_topic]
+
+
+def _planning_argv() -> list[str]:
+    return _node_argv('tinynav/core/planning_node.py') + [
+        '--ros-args',
+        '-p', f'robot_type:={_ROBOT_TYPE}',
+        '-p', f'pose_topic:={_keyframe_pose_topic()}',
+    ]
+
+
+def _cmd_vel_control_argv() -> list[str]:
+    return _node_argv('tinynav/platforms/cmd_vel_control.py') + [
+        '--ros-args',
+        '-p', f'robot_type:={_ROBOT_TYPE}',
+        '-p', f'pose_topic:={_control_pose_topic()}',
+    ]
+
+
+def _wheel_odometry_argv() -> list[str]:
+    # enable_wheel_command makes this node the sole owner of the Feetech bus: it
+    # both reads the encoders and writes Goal_Velocity. That is not a convenience
+    # -- the bus is half duplex and a serial port has one owner, so lekiwi_control
+    # cannot run alongside it. This node is the LeKiwi counterpart of
+    # unitree_control: the thing that turns /cmd_vel into motion.
+    return _node_argv('tinynav/core/wheel_odometry_node.py') + [
+        '--ros-args',
+        '-p', f'port:={_WHEEL_PORT}',
+        '-p', f'wheel_radius:={_WHEEL_RADIUS}',
+        '-p', f'base_radius:={_WHEEL_BASE_RADIUS}',
+        '-p', f'camera_offset_xyz:=[{_WHEEL_CAMERA_OFFSET}]',
+        '-p', 'enable_wheel_command:=true',
+        '-p', 'cmd_vel_topic:=/cmd_vel',
+    ]
 
 _COLOR_TOPIC_REALSENSE = '/camera/camera/color/image_raw'
 _COLOR_TOPIC_LOOPER = '/camera/camera/color/image_rect_raw/compressed'
@@ -167,6 +282,9 @@ class BackendNode(Ros2NodeManager):
         self._perception_proc: subprocess.Popen | None = None
         self._planning_proc: subprocess.Popen | None = None
         self._unitree_proc: subprocess.Popen | None = None
+        # LeKiwi base driver: reads the wheel encoders and writes Goal_Velocity.
+        # Long-lived, see _launch_wheel_odometry_if_configured.
+        self._wheel_odom_proc: subprocess.Popen | None = None
 
         # Battery level from /battery topic (published by unitree_control)
         self._battery: float | None = None
@@ -593,6 +711,14 @@ class BackendNode(Ros2NodeManager):
         self.get_logger().info('Published nav target clear on /mapping/cmd_pois and /mapping/poi_change')
 
     def _start_unitree_if_configured(self):
+        # "if configured" used to mean "always". On a wheel base unitree_control
+        # would publish onto the same /cmd_vel that cmd_vel_control drives and
+        # fight it, so the actuator choice has to gate this.
+        if _ACTUATOR != 'unitree':
+            self.get_logger().info(
+                f'unitree_control not started: TINYNAV_ACTUATOR={_ACTUATOR}'
+            )
+            return
         _env = os.environ.copy()
         _env['PYTHONPATH'] = _VENV_SITE + ':' + _env.get('PYTHONPATH', '')
         self._unitree_proc = self._launch_proc(
@@ -604,6 +730,32 @@ class BackendNode(Ros2NodeManager):
 
     def get_sensor_mode(self) -> str:
         return self._sensor_mode
+
+    def get_platform_config(self) -> dict:
+        """The wiring this backend actually launched, for /device/platform.
+
+        Worth an endpoint because the three comparison runs differ only in
+        environment variables, and every one of them fails *quietly* when set
+        wrong: the wrong robot_type just tracks badly, the wrong pose topic just
+        never relocalizes. Reading it back beats inferring it from behaviour.
+        """
+        return {
+            'robotType': _ROBOT_TYPE,
+            'actuator': _ACTUATOR,
+            'odomSource': _ODOM_SOURCE,
+            'mapOdomSource': _MAP_ODOM_SOURCE,
+            'keyframePoseTopic': _keyframe_pose_topic(),
+            'controlPoseTopic': _control_pose_topic(),
+            'cmdVelNodeEnabled': _ENABLE_CMD_VEL_NODE,
+            'sensorMode': self._sensor_mode,
+            'wheelOdometryRunning': self._proc_alive(getattr(self, '_wheel_odom_proc', None)),
+            'wheel': {
+                'port': _WHEEL_PORT,
+                'wheelRadius': float(_WHEEL_RADIUS),
+                'baseRadius': float(_WHEEL_BASE_RADIUS),
+                'cameraOffsetForwardLeftUp': [float(v) for v in _WHEEL_CAMERA_OFFSET.split(',')],
+            } if _ACTUATOR == 'wheel' else None,
+        }
 
     def get_image_topics(self) -> list[str]:
         if self._sensor_mode == 'looper':
@@ -774,6 +926,33 @@ class BackendNode(Ros2NodeManager):
         run_env['PKG_CONFIG_PATH'] = f"{_LOCAL_PREFIX}/lib/pkgconfig:" + run_env.get('PKG_CONFIG_PATH', '')
         return run_env
 
+    def _launch_wheel_odometry_if_configured(self, env: dict):
+        """Bring up the LeKiwi base driver, once, and leave it up.
+
+        Deliberately absent from _stop_sensor_procs and from the nav-node toggle.
+        Two reasons, both learned the hard way elsewhere in this file:
+
+        * It owns the serial bus.  Killing and respawning it churns the EEPROM
+          unlock sequence and leaves a window where nothing zeroes Goal_Velocity,
+          i.e. a moving robot with no controller.
+        * It is the odometry origin.  A restart resets the integrated pose to
+          zero, which teleports every consumer -- including, mid-recording, the
+          /wheel/camera_pose being written into the bag.
+
+        So it behaves like a driver: started with the sensors, torn down only on
+        full backend shutdown.
+        """
+        if not self._manage_processes or _ACTUATOR != 'wheel':
+            return
+        if self._proc_alive(getattr(self, '_wheel_odom_proc', None)):
+            return
+        self._wheel_odom_proc = self._launch_proc(
+            'wheel_odometry', _wheel_odometry_argv(), env=env,
+        )
+        self.get_logger().info(
+            f'wheel_odometry started (port={_WHEEL_PORT}, odom_source={_ODOM_SOURCE})'
+        )
+
     def _stop_sensor_procs(self):
         if not self._manage_processes:
             return
@@ -787,6 +966,7 @@ class BackendNode(Ros2NodeManager):
         for attr in (
             '_looper_bridge_proc', '_realsense_proc', '_perception_proc',
             '_planning_proc', '_unitree_proc', '_map_node_proc', '_cmd_vel_proc',
+            '_wheel_odom_proc',
         ):
             self._kill_proc(getattr(self, attr, None))
             if hasattr(self, attr):
@@ -911,18 +1091,15 @@ class BackendNode(Ros2NodeManager):
         """Start sensor procs based on current _sensor_mode."""
         if not self._manage_processes:
             return
+        self._launch_wheel_odometry_if_configured(env)
         if self._sensor_mode == 'looper':
             if not self._proc_alive(self._looper_bridge_proc):
                 self._looper_bridge_proc = self._launch_proc(
-                    'looper_bridge',
-                    ['python3', os.path.join(_TINYNAV_ROOT, 'tool/looper_bridge_node.py')],
-                    env=env,
+                    'looper_bridge', _bridge_argv(), env=env,
                 )
             if not self._proc_alive(self._planning_proc):
                 self._planning_proc = self._launch_proc(
-                    'planning',
-                    ['python3', os.path.join(_TINYNAV_ROOT, 'tinynav/core/planning_node.py')],
-                    env=env,
+                    'planning', _planning_argv(), env=env,
                 )
         elif self._sensor_mode == 'realsense':
             if not self._proc_alive(self._realsense_proc):
@@ -937,11 +1114,7 @@ class BackendNode(Ros2NodeManager):
                     env=env,
                 )
             if not self._proc_alive(self._planning_proc):
-                self._planning_proc = self._launch_proc(
-                    'planning',
-                    ['python3', os.path.join(_TINYNAV_ROOT, 'tinynav/core/planning_node.py')],
-                    env=env,
-                )
+                self._planning_proc = self._launch_proc('planning', _planning_argv(), env=env)
 
     def _restart_sensor_procs(self):
         if not self._manage_processes:
@@ -973,9 +1146,7 @@ class BackendNode(Ros2NodeManager):
         )
         if _ENABLE_CMD_VEL_NODE:
             self._cmd_vel_proc = self._launch_proc(
-                'cmd_vel_control',
-                ['python3', os.path.join(_TINYNAV_ROOT, 'tinynav/platforms/cmd_vel_control.py')],
-                env=_env,
+                'cmd_vel_control', _cmd_vel_control_argv(), env=_env,
             )
         else:
             self._cmd_vel_proc = None
@@ -1011,10 +1182,9 @@ class BackendNode(Ros2NodeManager):
         _env = os.environ.copy()
         _env['PYTHONPATH'] = _VENV_SITE + ':' + _env.get('PYTHONPATH', '')
 
+        self._launch_wheel_odometry_if_configured(_env)
         self._planning_proc = self._launch_proc(
-            'planning',
-            ['python3', os.path.join(_TINYNAV_ROOT, 'tinynav/core/planning_node.py')],
-            env=_env,
+            'planning', _planning_argv(), env=_env,
         )
         self._map_node_proc = self._launch_proc(
             'map_node',
@@ -1027,9 +1197,7 @@ class BackendNode(Ros2NodeManager):
         )
         if _ENABLE_CMD_VEL_NODE:
             self._cmd_vel_proc = self._launch_proc(
-                'cmd_vel_control',
-                ['python3', os.path.join(_TINYNAV_ROOT, 'tinynav/platforms/cmd_vel_control.py')],
-                env=_env,
+                'cmd_vel_control', _cmd_vel_control_argv(), env=_env,
             )
         else:
             self._cmd_vel_proc = None
@@ -1146,10 +1314,15 @@ class BackendNode(Ros2NodeManager):
             _env['ROS_DOMAIN_ID'] = _MAP_BUILD_DOMAIN_LOOPER
         _env['PYTHONPATH'] = _VENV_SITE + ':' + _env.get('PYTHONPATH', '')
         source_node_cmd = (
-            ['python3', os.path.join(_TINYNAV_ROOT, 'tool/looper_bridge_node.py')]
+            _bridge_argv(for_map_build=True)
             if self._sensor_mode == 'looper'
-            else ['python3', os.path.join(_TINYNAV_ROOT, 'tinynav/core/perception_node.py')]
+            else _node_argv('tinynav/core/perception_node.py')
         )
+        if self._sensor_mode == 'looper':
+            self.get_logger().info(
+                f'map build pose source: {_MAP_ODOM_SOURCE} '
+                f'({source_node_cmd[-1]}); navigation will run on {_ODOM_SOURCE}'
+            )
         source_node_name = 'looper_bridge' if self._sensor_mode == 'looper' else 'perception'
         self.processes[source_node_name] = self._launch_proc(
             source_node_name,

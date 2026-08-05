@@ -51,6 +51,8 @@ class LooperBridgeNode(Node):
         self.sync_group = MutuallyExclusiveCallbackGroup()
         self.misc_group = MutuallyExclusiveCallbackGroup()
 
+        self._exact_pose_prefixes = ("/camera/camera/vio",)
+
         self.camera_info_sub = self.create_subscription(
             CameraInfo, "/camera/camera/infra1/camera_info", self.camera_info_callback,
             self.sensor_qos, callback_group=self.misc_group
@@ -80,9 +82,35 @@ class LooperBridgeNode(Node):
             self, Image, "/camera/camera/infra1/image_rect_raw",
             qos_profile=self.sensor_qos, callback_group=self.sync_group
         )
-        self.sync = message_filters.TimeSynchronizer(
-            [self.depth_sub, self.pose_sub, self.image_sub], queue_size=20
-        )
+        # Exact vs approximate, and why this is not a style choice.
+        #
+        # message_filters.TimeSynchronizer matches on the exact (sec, nanosec)
+        # pair. That works for the camera's own VIO because the firmware stamps
+        # /camera/camera/vio_image with the *image's* timestamp -- hence the name --
+        # so depth, infra1 and pose all carry byte-identical stamps; 58/58 depth
+        # frames matched over a 12 s measurement against a live camera.
+        #
+        # A wheel-odometry pose has no such relationship: wheel_odometry_node
+        # stamps with its own clock minus the measured bus read latency, so its
+        # nanoseconds never coincide with an image's. Exact matching then yields
+        # *zero* synced frames, and TimeSynchronizer reports nothing at all -- no
+        # warning, no error, just permanent silence on /slam/keyframe_*. That is
+        # the same silent-failure shape as the /insight/* topics that stopped
+        # existing, which cost a debugging session to find.
+        #
+        # So `auto` uses exact only for a pose topic that is stamp-locked to the
+        # images, approximate otherwise, and logs which branch it took.
+        use_exact = self._pose_sync_is_exact()
+        if use_exact:
+            self.sync = message_filters.TimeSynchronizer(
+                [self.depth_sub, self.pose_sub, self.image_sub], queue_size=20
+            )
+        else:
+            self.sync = message_filters.ApproximateTimeSynchronizer(
+                [self.depth_sub, self.pose_sub, self.image_sub],
+                queue_size=20,
+                slop=args.pose_sync_slop,
+            )
         self.sync.registerCallback(self.sync_callback)
 
         self.odom_visual_pub = self.create_publisher(
@@ -107,8 +135,21 @@ class LooperBridgeNode(Node):
         self.keyframe_depth_pub = self.create_publisher(Image, "/slam/keyframe_depth", 10)
 
         self.get_logger().info(
-            "Bridging /insight/vio_20hz + /camera/camera/depth/image_rect_raw + /camera/camera/infra1/image_rect_raw into TinyNav /slam topics."
+            f"Bridging {args.pose_topic} + /camera/camera/depth/image_rect_raw + "
+            "/camera/camera/infra1/image_rect_raw into TinyNav /slam topics."
         )
+        self.get_logger().info(
+            f"keyframe sync: {'exact' if use_exact else f'approximate slop={args.pose_sync_slop}s'}"
+        )
+
+    def _pose_sync_is_exact(self) -> bool:
+        """Whether the pose topic's stamps are byte-identical to the image stamps."""
+        mode = self.args.pose_sync
+        if mode == "exact":
+            return True
+        if mode == "approx":
+            return False
+        return self.args.pose_topic.startswith(self._exact_pose_prefixes)
 
     def camera_info_callback(self, msg: CameraInfo):
         self.cached_camera_info = msg
@@ -275,6 +316,26 @@ def parse_args():
              "/insight/vio_20hz, which does not exist on the camera any more. "
              "Point this at a wheel-odometry pose topic to drive mapping from "
              "odometry instead of from VIO.",
+    )
+    parser.add_argument(
+        "--pose-sync",
+        choices=("auto", "exact", "approx"),
+        default="auto",
+        help="How the keyframe synchroniser matches the pose against depth and "
+             "infra1. `auto` -- the default -- uses exact (sec, nanosec) matching "
+             "for a /camera/camera/vio* topic, which the firmware stamps with the "
+             "image's own timestamp, and approximate matching for anything else. "
+             "Forcing `exact` on a pose from a different clock, such as wheel "
+             "odometry, produces zero keyframes with no diagnostic whatsoever.",
+    )
+    parser.add_argument(
+        "--pose-sync-slop",
+        type=float,
+        default=0.02,
+        help="Maximum stamp difference for approximate matching, seconds. 0.02 is "
+             "one wheel-odometry period at the default 50 Hz; at a 0.15 m/s "
+             "mapping speed a 10 ms mismatch is 1.5 mm of position and 0.23 deg "
+             "of yaw, both well under the 3 cm keyframe threshold.",
     )
     parser.add_argument(
         "--publish-camera-info-alias",

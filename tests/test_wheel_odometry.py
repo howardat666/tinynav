@@ -34,7 +34,9 @@ from tinynav.platforms.feetech_bus import (  # noqa: E402
     encode_sign_magnitude,
 )
 from tinynav.platforms.omni3_kinematics import (  # noqa: E402
+    QUAT_BASE_CAMERA,
     Omni3Kinematics,
+    base_pose_to_camera_pose,
     integrate_se2,
     quaternion_inverse,
     quaternion_matrix,
@@ -833,8 +835,65 @@ def test_lekiwi_control_path_to_twist():
             rclpy.shutdown()
 
 
+def test_base_pose_to_camera_pose():
+    """The base -> camera conversion has to satisfy what the nav stack computes.
+
+    planning_node and cmd_vel_control both derive heading as
+    ``atan2(f[1], f[0])`` where ``f = R @ [0, 0, 1]``, and the control centre as
+    ``t - R @ cam_offset_3d``.  So this is not "some rotation that looks right":
+    the recovered yaw must equal the base yaw exactly, the camera's down axis must
+    point along world ``-z``, and its right axis must stay horizontal.  Get the
+    convention wrong and the controller reads the forward axis as "up", which
+    turns the robot on the spot rather than failing visibly.
+    """
+    # The quaternion constant must agree with the matrix it documents.
+    expected = np.array([[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]])
+    assert np.allclose(quaternion_matrix(QUAT_BASE_CAMERA), expected, atol=1e-12), (
+        f"QUAT_BASE_CAMERA is not R_base_camera:\n{quaternion_matrix(QUAT_BASE_CAMERA)}"
+    )
+
+    offset = [0.06, 0.05, 0.18]  # forward, left, up -- the measured LeKiwi mount
+    for theta in (0.0, 0.3, np.pi / 2, -0.7, np.pi, 2.9):
+        position, quat = base_pose_to_camera_pose(1.0, -2.0, theta, offset)
+        rot = quaternion_matrix(quat)
+
+        forward = rot @ np.array([0.0, 0.0, 1.0])
+        recovered = np.arctan2(forward[1], forward[0])
+        assert abs(wrap_angle(recovered - theta)) < 1e-12, (
+            f"theta={theta}: heading recovered as {recovered}, off by "
+            f"{np.degrees(wrap_angle(recovered - theta)):.6f} deg"
+        )
+
+        down = rot @ np.array([0.0, 1.0, 0.0])
+        assert np.allclose(down, [0.0, 0.0, -1.0], atol=1e-12), f"down axis is {down}"
+        right = rot @ np.array([1.0, 0.0, 0.0])
+        assert abs(right[2]) < 1e-12, f"right axis is not horizontal: {right}"
+
+        # Position: the offset rotates with the base, the height does not.
+        cos_t, sin_t = np.cos(theta), np.sin(theta)
+        assert np.allclose(
+            position,
+            [1.0 + cos_t * 0.06 - sin_t * 0.05, -2.0 + sin_t * 0.06 + cos_t * 0.05, 0.18],
+            atol=1e-12,
+        ), f"theta={theta}: position {position}"
+
+    # And the round trip the consumers actually perform: subtracting the offset in
+    # camera axes must land back on the base centre. This is what catches the
+    # camera_y sign, which is why LEKIWI's 50 mm lateral offset is in the fixture.
+    from tinynav.core.robot_config import LEKIWI_CONFIG
+
+    for theta in (0.0, 1.1, -2.2):
+        position, quat = base_pose_to_camera_pose(0.4, 0.7, theta, offset)
+        rot = quaternion_matrix(quat)
+        centre = position - rot @ np.asarray(LEKIWI_CONFIG.cam_offset_3d, dtype=float)
+        assert np.allclose(centre[:2], [0.4, 0.7], atol=1e-9), (
+            f"theta={theta}: control centre recovered as {centre[:2]}, expected [0.4, 0.7]"
+        )
+
+
 TESTS = [
     test_kinematics_roundtrip,
+    test_base_pose_to_camera_pose,
     test_quaternion_helpers,
     test_max_body_velocity,
     test_lekiwi_control_path_to_twist,

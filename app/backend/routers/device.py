@@ -36,6 +36,27 @@ def device_status():
     }
 
 
+@router.get('/platform')
+def device_platform():
+    """Robot geometry, actuator and odometry source this backend launched with.
+
+    Read-only: these come from environment variables that have to be fixed before
+    the first node starts, so there is nothing to PUT. It exists because the
+    comparison runs differ only in those variables and each one fails quietly when
+    set wrong -- the wrong robot_type merely tracks badly, the wrong pose topic
+    merely never relocalizes.
+    """
+    if is_display_role():
+        manager_platform = get_manager_json('/device/platform')
+        if manager_platform is not None:
+            return manager_platform
+
+    node = runner.node
+    if node is None:
+        return {'online': False}
+    return {'online': True, **node.get_platform_config()}
+
+
 @router.get('/sysinfo')
 def device_sysinfo():
     cpu = psutil.cpu_percent(interval=0.2)

@@ -31,14 +31,21 @@ Frames
 ------
 The repo's existing convention is ``world`` as the root frame with ``camera`` as
 the moving child (see ``perception_node.py`` and ``math_utils.np2tf``).  This
-node measures *base* motion, not camera motion, so it publishes
-``world -> base_link`` by default.  If you want the existing ``world -> camera``
-consumers to see this odometry you must also publish the fixed
-``base_link -> camera`` extrinsic yourself, e.g.::
+node measures *base* motion, not camera motion, so ``Odometry`` and TF are
+``world -> base_link`` in REP-103 axes (``+x`` forward, ``+y`` left, ``+z`` up).
 
-    ros2 run tf2_ros static_transform_publisher X Y Z QX QY QZ QW base_link camera
+That message cannot drive navigation on its own.  ``planning_node``,
+``cmd_vel_control`` and ``looper_bridge_node`` all consume a ``PoseStamped``
+holding the *camera* pose in the *optical* convention (``+z`` forward, ``+x``
+right, ``+y`` down) -- that is what the Looper VIO publishes, and feeding them
+REP-103 base axes makes them read the forward axis as "up".  So this node also
+publishes ``camera_pose_topic`` (default ``/wheel/camera_pose``), the same
+integrated pose pushed through the fixed ``base_link -> camera`` extrinsic
+``camera_offset_xyz`` and rotated into optical axes.  Point those three nodes at
+it and the run navigates on wheel odometry with no code change.
 
-This node intentionally does not guess that extrinsic.
+No ``static_transform_publisher`` is involved, and none is needed: ``base_link``
+appears nowhere else in the navigation stack.
 
 Bus ownership
 -------------
@@ -56,12 +63,12 @@ import time
 
 import numpy as np
 import rclpy
-from geometry_msgs.msg import TransformStamped, Twist
+from geometry_msgs.msg import PoseStamped, TransformStamped, Twist
 from nav_msgs.msg import Odometry
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from std_srvs.srv import Empty
-from tf2_ros import TransformBroadcaster
+from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 
 from tinynav.platforms.feetech_bus import (
     FakeFeetechBus,
@@ -73,7 +80,9 @@ from tinynav.platforms.omni3_kinematics import (
     DEFAULT_BASE_RADIUS,
     DEFAULT_TICKS_PER_REV,
     DEFAULT_WHEEL_RADIUS,
+    QUAT_BASE_CAMERA,
     Omni3Kinematics,
+    base_pose_to_camera_pose,
     integrate_se2,
     wrap_tick_delta,
     yaw_to_quaternion,
@@ -138,6 +147,23 @@ class WheelOdometryNode(Node):
         self.declare_parameter("base_frame", "base_link")
         self.declare_parameter("publish_tf", True)
         self.declare_parameter("qos_depth", 50)
+
+        # -- camera-pose output --------------------------------------------- #
+        # The three switches above are all PoseStamped in the camera's *optical*
+        # convention (see base_pose_to_camera_pose), not Odometry in REP-103 base
+        # axes, so nav_msgs/Odometry alone cannot drive them. This publishes the
+        # same integrated pose in the form they consume, which is what makes an
+        # odometry-navigated run a set of topic parameters instead of a rewrite.
+        #
+        # camera_offset_xyz is base_link -> camera as [forward, left, up] in
+        # metres. The default is the LeKiwi + Looper mount measured on the robot:
+        # 60 mm ahead of the base centre, 50 mm to its left, 180 mm above the
+        # floor. There is deliberately no static_transform_publisher involved --
+        # `base_link` appears nowhere else in the navigation stack, which works
+        # entirely in camera poses, so a TF would be decoration.
+        self.declare_parameter("camera_pose_topic", "/wheel/camera_pose")
+        self.declare_parameter("camera_offset_xyz", [0.06, 0.05, 0.18])
+        self.declare_parameter("camera_frame", "camera")
 
         # -- covariance model ---------------------------------------------- #
         # Two separate error mechanisms, because they grow at different rates and
@@ -239,7 +265,30 @@ class WheelOdometryNode(Node):
         # -- publishers / subscribers --------------------------------------- #
         qos_depth = int(p("qos_depth").value)
         self.odom_pub = self.create_publisher(Odometry, str(p("odom_topic").value), qos_depth)
+        camera_pose_topic = str(p("camera_pose_topic").value)
+        self.camera_pose_pub = (
+            self.create_publisher(PoseStamped, camera_pose_topic, qos_depth)
+            if camera_pose_topic
+            else None
+        )
+        self.camera_offset_xyz = np.asarray(
+            [float(v) for v in p("camera_offset_xyz").value], dtype=float
+        )
+        if self.camera_offset_xyz.shape != (3,):
+            raise ValueError(
+                f"camera_offset_xyz must have 3 elements, got {self.camera_offset_xyz.tolist()}"
+            )
+        self.camera_frame = str(p("camera_frame").value)
         self.tf_broadcaster = TransformBroadcaster(self) if self.publish_tf else None
+        # base_link -> camera as a static TF too. Not needed by any node -- the
+        # stack passes camera poses around in messages, not through TF -- but it
+        # completes the chain for rviz, which otherwise cannot place anything
+        # stamped in the `camera` frame: map_node broadcasts only world -> map and
+        # nothing at all publishes world -> camera.
+        self.static_tf_broadcaster = None
+        if self.publish_tf and self.camera_frame:
+            self.static_tf_broadcaster = StaticTransformBroadcaster(self)
+            self.static_tf_broadcaster.sendTransform(self._base_to_camera_tf())
         self.create_service(Empty, "~/reset", self._reset_srv)
         if self.enable_wheel_command:
             self.create_subscription(Twist, str(p("cmd_vel_topic").value), self._cmd_cb, 10)
@@ -250,6 +299,11 @@ class WheelOdometryNode(Node):
             f"wheel odometry up: ids={self.motor_ids} source={self.velocity_source} "
             f"r_wheel={self.kin.wheel_radius:.4f}m r_base={self.kin.base_radius:.4f}m "
             f"rate={rate:.1f}Hz -> {p('odom_topic').value} ({self.odom_frame} -> {self.base_frame})"
+        )
+        self.get_logger().info(
+            f"camera pose -> {camera_pose_topic or '<disabled>'} "
+            f"offset[fwd,left,up]={self.camera_offset_xyz.tolist()} "
+            f"cmd={'/' + str(p('cmd_vel_topic').value).lstrip('/') if self.enable_wheel_command else '<disabled>'}"
         )
 
     # -- setup helpers ------------------------------------------------------ #
@@ -493,6 +547,22 @@ class WheelOdometryNode(Node):
 
     # -- output ------------------------------------------------------------- #
 
+    def _base_to_camera_tf(self) -> TransformStamped:
+        """The fixed ``base_frame -> camera_frame`` extrinsic, in optical axes."""
+        tf = TransformStamped()
+        tf.header.stamp = self.get_clock().now().to_msg()
+        tf.header.frame_id = self.base_frame
+        tf.child_frame_id = self.camera_frame
+        tf.transform.translation.x = float(self.camera_offset_xyz[0])
+        tf.transform.translation.y = float(self.camera_offset_xyz[1])
+        tf.transform.translation.z = float(self.camera_offset_xyz[2])
+        qx, qy, qz, qw = QUAT_BASE_CAMERA
+        tf.transform.rotation.x = qx
+        tf.transform.rotation.y = qy
+        tf.transform.rotation.z = qz
+        tf.transform.rotation.w = qw
+        return tf
+
     def _publish(self, stamp, twist: np.ndarray, twist_cov: np.ndarray) -> None:
         # Re-checked here as well as in _tick: the signal can land between the
         # two, and this is the call that actually raises.
@@ -521,6 +591,22 @@ class WheelOdometryNode(Node):
         msg.twist.twist.angular.z = float(twist[2])
         self._fill_covariance(msg.twist.covariance, twist_cov)
         self.odom_pub.publish(msg)
+
+        if self.camera_pose_pub is not None:
+            position, quaternion = base_pose_to_camera_pose(
+                self.x, self.y, self.theta, self.camera_offset_xyz
+            )
+            pose_msg = PoseStamped()
+            pose_msg.header.stamp = stamp
+            pose_msg.header.frame_id = self.odom_frame
+            pose_msg.pose.position.x = float(position[0])
+            pose_msg.pose.position.y = float(position[1])
+            pose_msg.pose.position.z = float(position[2])
+            pose_msg.pose.orientation.x = float(quaternion[0])
+            pose_msg.pose.orientation.y = float(quaternion[1])
+            pose_msg.pose.orientation.z = float(quaternion[2])
+            pose_msg.pose.orientation.w = float(quaternion[3])
+            self.camera_pose_pub.publish(pose_msg)
 
         if self.tf_broadcaster is not None:
             tf = TransformStamped()

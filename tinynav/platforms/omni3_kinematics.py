@@ -338,3 +338,51 @@ def quaternion_to_rotvec(q) -> np.ndarray:
 def quaternion_relative_rotvec(q_a, q_b) -> np.ndarray:
     """Rotation vector of ``q_a^-1 * q_b``."""
     return quaternion_to_rotvec(quaternion_multiply(quaternion_inverse(q_a), q_b))
+
+
+# -- base pose -> camera pose ------------------------------------------------ #
+# The rotation that takes camera-optical axes into REP-103 base axes:
+#
+#     camera +x (right)   = base -y      column 0 = ( 0, -1,  0)
+#     camera +y (down)    = base -z      column 1 = ( 0,  0, -1)
+#     camera +z (forward) = base +x      column 2 = ( 1,  0,  0)
+#
+# i.e. R_base_camera = [[0, 0, 1], [-1, 0, 0], [0, -1, 0]], whose quaternion is
+# below.  Written as a literal rather than derived because it is a fixed
+# convention constant, and ``test_omni3_kinematics`` checks it against the matrix.
+QUAT_BASE_CAMERA = (-0.5, 0.5, -0.5, 0.5)
+
+
+def base_pose_to_camera_pose(x, y, theta, offset_xyz):
+    """Camera-optical pose from a planar base pose.
+
+    Every pose consumer in the navigation stack -- ``planning_node``,
+    ``cmd_vel_control``, ``looper_bridge_node`` -- works in the camera's *optical*
+    convention (body ``+z`` forward, ``+x`` right, ``+y`` down) expressed in a
+    gravity-aligned, ``z``-up ``world`` frame.  That is what the Looper VIO
+    publishes on ``/camera/camera/vio_*``, and it is why ``cmd_vel_control``
+    computes heading as ``atan2(R[1, 2], R[0, 2])`` (see its ``_control_loop``).
+
+    Wheel odometry natively produces the *base* pose in REP-103 axes (``+x``
+    forward, ``+y`` left, ``+z`` up), so handing ``Odometry.pose`` straight to
+    those consumers makes them read the forward axis as "up" and the robot turns
+    on the spot.  This converts, so that a wheel-odometry-navigated run is a
+    topic swap rather than a rewrite.
+
+    ``offset_xyz`` is ``base_link -> camera`` in REP-103 base axes, i.e.
+    ``[forward, left, up]`` in metres.  Returns ``(position, quaternion)`` with
+    the quaternion as ``(x, y, z, w)``.
+    """
+    offset = np.asarray(offset_xyz, dtype=float)
+    if offset.shape != (3,):
+        raise ValueError(f"offset_xyz must have 3 elements, got {offset.shape}")
+    cos_t, sin_t = np.cos(float(theta)), np.sin(float(theta))
+    position = np.array(
+        [
+            float(x) + cos_t * offset[0] - sin_t * offset[1],
+            float(y) + sin_t * offset[0] + cos_t * offset[1],
+            float(offset[2]),
+        ]
+    )
+    quaternion = quaternion_multiply(yaw_to_quaternion(theta), QUAT_BASE_CAMERA)
+    return position, quaternion

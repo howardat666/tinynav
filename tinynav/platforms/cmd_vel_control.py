@@ -13,10 +13,12 @@ from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Path
 from tinynav.core.math_utils import pose_msg2np
+from tinynav.core.robot_config import robot_config
 
 
 class CmdVelDebugRecorder:
-    def __init__(self, output_dir):
+    def __init__(self, output_dir, cam_offset_3d):
+        self.cam_offset_3d = np.asarray(cam_offset_3d, dtype=np.float64)
         self.output_dir = Path(output_dir).expanduser()
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.trajectory_dir = self.output_dir / "trajectories"
@@ -81,9 +83,8 @@ class CmdVelDebugRecorder:
         return math.atan2(float(forward[1]), float(forward[0]))
 
     def record_odom(self, wall_time_ns, odom_stamp, raw_position, raw_rotation, filtered_position, filtered_rotation):
-        camera_offset = np.array([0.0, 0.0, 0.35], dtype=np.float64)
-        raw_robot = raw_position - raw_rotation @ camera_offset
-        filtered_robot = filtered_position - filtered_rotation @ camera_offset
+        raw_robot = raw_position - raw_rotation @ self.cam_offset_3d
+        filtered_robot = filtered_position - filtered_rotation @ self.cam_offset_3d
         self._odom_writer.writerow(
             {
                 "wall_time_ns": int(wall_time_ns),
@@ -179,7 +180,18 @@ class CmdVelControlNode(Node):
     def __init__(self, debug_dir=None):
         super().__init__('cmd_vel_control_node')
         self.logger = self.get_logger()  # Use ROS2 logger
-        self._debug_recorder = CmdVelDebugRecorder(debug_dir) if debug_dir else None
+
+        # Must match planning_node's robot_type: the planner and this controller
+        # have to agree on where the control centre sits relative to the camera,
+        # or the controller chases a target the planner placed somewhere else.
+        self.declare_parameter("robot_type", "go2")
+        self.robot = robot_config(str(self.get_parameter("robot_type").value))
+        self._cam_offset_3d = np.asarray(self.robot.cam_offset_3d, dtype=np.float64)
+        self.logger.info(f"Robot: {self.robot.describe()}")
+
+        self._debug_recorder = (
+            CmdVelDebugRecorder(debug_dir, self._cam_offset_3d) if debug_dir else None
+        )
         if self._debug_recorder is not None:
             self.logger.info(f"cmd_vel debug recorder enabled: {self._debug_recorder.output_dir}")
 
@@ -376,9 +388,10 @@ class CmdVelControlNode(Node):
             )
             return
 
-        # Keep this consistent with planning_node.camera_to_robot_center().
-        camera_offset = np.array([0.0, 0.0, 0.35], dtype=np.float64)  # GO2 control center to camera.
-        robot_pos = self.position - self.rotation @ camera_offset
+        # Same vector planning_node.camera_to_robot_center() uses, from the same
+        # RobotConfig, so the two cannot drift apart. They used to: this line held
+        # a 0.35 literal while GO2_CONFIG.camera_x was 0.2.
+        robot_pos = self.position - self.rotation @ self._cam_offset_3d
         forward = self.rotation @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
         robot_yaw = math.atan2(forward[1], forward[0])
 

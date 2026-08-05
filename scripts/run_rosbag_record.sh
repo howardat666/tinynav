@@ -3,6 +3,17 @@ set -euo pipefail
 
 # Usage: run_rosbag_record.sh [--output DIR]
 #   If --output is not given, a timestamped dir is created under XDG_DATA_HOME/tinynav/rosbags.
+#
+# The VIO topics are the ones current Looper firmware actually publishes, verified
+# against a live camera: /camera/camera/vio_image (PoseStamped, 19.99 Hz) and
+# /camera/camera/vio_100hz (99.23 Hz). The /insight/* names this used to list do
+# not exist any more, so bags recorded before that fix carry no pose at all.
+#
+# /wheel/camera_pose and /wheel/odometry come from wheel_odometry_node and are
+# what makes one recording serve both mapping comparisons: build_map_node takes
+# its pose from a topic, so the same bag builds a VIO map and an odometry map by
+# pointing looper_bridge_node's --pose-topic at one or the other. They are simply
+# absent from the bag if that node is not running, which costs nothing.
 
 output_dir=""
 while [[ $# -gt 0 ]]; do
@@ -38,6 +49,9 @@ ros2 bag record \
     /camera/camera/color/image_raw \
     /camera/camera/color/camera_info \
     /camera/camera/color/image_rect_raw/compressed \
-    /insight/vio_20hz \
-    /insight/vio_status \
+    /camera/camera/vio_image \
+    /camera/camera/vio_100hz \
+    /camera/camera/vio_status \
+    /wheel/camera_pose \
+    /wheel/odometry \
     /tf_static

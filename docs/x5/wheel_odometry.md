@@ -239,45 +239,77 @@ Verified topology in this repo:
 | `/slam/odometry` | `nav_msgs/Odometry` | `perception_node.py` | `map_node.py`, `build_map_node.py`, `imu_propagator_node.py` |
 | `/slam/keyframe_odom` | `nav_msgs/Odometry` | `perception_node.py`, `looper_bridge_node.py` | `map_node.py`, `build_map_node.py` |
 | `/slam/odometry_visual` | `nav_msgs/Odometry` | `looper_bridge_node.py` | nothing in `tinynav/core` |
-| `/insight/vio_20hz` | `geometry_msgs/PoseStamped` | Insight VIO (external) | `planning_node.py` |
-| `/wheel/odometry` | `nav_msgs/Odometry` | **this node** | nothing yet |
+| `/camera/camera/vio_image` | `geometry_msgs/PoseStamped` | Looper firmware, 19.99 Hz | `looper_bridge_node.py`, `planning_node.py` |
+| `/camera/camera/vio_100hz` | `geometry_msgs/PoseStamped` | Looper firmware, 99.23 Hz | `cmd_vel_control.py` |
+| `/wheel/odometry` | `nav_msgs/Odometry` | **this node** | nothing (diagnostics, bags) |
+| `/wheel/camera_pose` | `geometry_msgs/PoseStamped` | **this node** | any of the three pose consumers |
 
-Two things worth knowing before wiring this in:
+Three things worth knowing before wiring this in:
 
 - `map_node.py` consumes `/slam/odometry`, **not** `/slam/odometry_visual`. The
   `_visual` topic that `looper_bridge_node.py` publishes has no consumer inside
-  `tinynav/core`.
-- `planning_node.py` does not take `Odometry` at all for its pose input; it takes
-  `PoseStamped` on `/insight/vio_20hz`. Feeding planning from wheel odometry
-  would need a small `Odometry -> PoseStamped` republisher, which this node does
-  not provide.
+  `tinynav/core`. On the Looper path nothing publishes `/slam/odometry` at all.
+- **None of the three pose consumers takes `Odometry`.** `planning_node`,
+  `cmd_vel_control` and `looper_bridge_node` all take a `PoseStamped` carrying the
+  *camera* pose in the *optical* convention. `/wheel/odometry` is the base pose in
+  REP-103 axes and is not interchangeable with it — see below.
+- The default `odom_topic` is `/wheel/odometry` so that starting this node can
+  never silently fight the VIO.
 
-The default `odom_topic` is `/wheel/odometry` so that starting this node can
-never silently fight the VIO. To drive mapping from wheels instead:
+### Frames, and the conversion that makes odometry navigation possible
 
-```bash
-ros2 run ... wheel_odometry_node --ros-args -p odom_topic:=/slam/odometry
-# and do NOT run perception_node's odometry at the same time
+The repo convention is `world` as the root with `camera` as the moving child. What
+the pose consumers assume is more specific than that, and it is not written down
+anywhere else, so here it is — read off `cmd_vel_control._control_loop` and
+`planning_node.publish_footprint`, which both do:
+
+```python
+forward = R @ [0, 0, 1]                 # body +z is FORWARD
+robot_yaw = atan2(forward[1], forward[0])  # world xy is the GROUND plane
+centre = t - R @ cam_offset_3d             # offset expressed in camera axes
 ```
 
-### Frames
+So the pose is:
 
-The repo convention is `world` as the root with `camera` as the moving child
-(`perception_node.py`, `math_utils.np2tf`). There is no `odom` or `base_link`
-frame anywhere in the existing tree.
+| | axes |
+| --- | --- |
+| body (camera optical) | +x right, +y **down**, +z forward |
+| world | gravity-aligned, **+z up** |
 
-This node measures **base** motion, not camera motion, so it publishes
-`world -> base_link` by default. If the existing `world -> camera` consumers
-should see wheel odometry, you must publish the fixed base-to-camera extrinsic
-yourself:
+That is what the Looper VIO publishes. Wheel odometry natively produces the
+**base** pose in REP-103 axes (+x forward, +y left, +z up), so handing
+`Odometry.pose` to those consumers makes them read the forward axis as "up" and
+the robot turns on the spot rather than failing visibly.
+
+`camera_pose_topic` (default `/wheel/camera_pose`) is the same integrated pose
+pushed through the fixed extrinsic and rotated into optical axes, via
+`omni3_kinematics.base_pose_to_camera_pose`. `camera_offset_xyz` is
+`base_link -> camera` as `[forward, left, up]` in metres. Point any of the three
+consumers at that topic and the run navigates on wheel odometry with no code
+change:
 
 ```bash
-ros2 run tf2_ros static_transform_publisher X Y Z QX QY QZ QW base_link camera
+# navigation on wheel odometry: all three switches, and they must agree
+python3 tool/looper_bridge_node.py --pose-topic /wheel/camera_pose
+python3 tinynav/core/planning_node.py --ros-args -p robot_type:=lekiwi -p pose_topic:=/wheel/camera_pose
+python3 tinynav/platforms/cmd_vel_control.py --ros-args -p robot_type:=lekiwi -p pose_topic:=/wheel/camera_pose
 ```
 
-The node deliberately does not guess that extrinsic. Publishing base motion
-labelled as `camera` would be wrong by whatever the mounting offset is, and a
-lever-arm error shows up as spurious translation during every turn.
+**All three, not just the last two.** `map_node`'s relocalization emits a
+`world -> map` correction, and its `world` is defined by whatever pose reached
+`/slam/keyframe_odom`. Leave the bridge on VIO while navigating on wheels and the
+correction gets applied to a different world frame — different origin, different
+heading — which fails as a diverging run, not as an error message.
+
+No `static_transform_publisher` is needed: `base_link` appears nowhere else in the
+navigation stack, which passes camera poses in messages rather than through TF.
+The node does publish `base_link -> camera` as a static TF anyway, purely so rviz
+can place anything stamped in the `camera` frame — nothing else broadcasts
+`world -> camera`.
+
+Body axes for `Odometry` and `twist` follow REP-103: +x forward, +y left, +z up,
+`omega` positive counter-clockwise from above. The `twist` field is in
+`child_frame_id` (the body frame), which is what the kinematics natively produces.
 
 Body axes follow REP-103: +x forward, +y left, +z up, `omega` positive
 counter-clockwise from above. The `twist` field is in `child_frame_id` (the body
@@ -631,8 +663,14 @@ and scheduling, not bandwidth.
    baseline; the node handles that by re-baselining after a `max_dt` gap.
 5. **Bus contention.** Cannot co-exist with `lekiwi_control.py` on the same
    serial port. See `enable_wheel_command`.
-6. **No base-to-camera extrinsic.** Publishes `world -> base_link`; the existing
-   consumers want `world -> camera`. Supply the static transform yourself.
+6. **The base-to-camera extrinsic is a tape measurement, not a calibration.**
+   `camera_offset_xyz` defaults to the measured LeKiwi mount (60 mm forward, 50 mm
+   left, 180 mm up), good to maybe ±5 mm. A lever-arm error shows up as spurious
+   translation during every turn: 5 mm of error is 5 mm of phantom sideways motion
+   per radian of yaw. It is also assumed level — the calibration run measured the
+   IMU's gravity vector 4.6° off vertical on a nominally level mount, so a real
+   `base_link -> camera` rotation calibration would be worth doing before trusting
+   this below the centimetre.
 7. **Yaw-only pose.** A planar SE(2) model. Ramps and thresholds are not
    represented; `z`, `roll` and `pitch` are always zero with a planar prior.
 8. **Timestamps are estimated, not hardware.** The servos have no timestamping,

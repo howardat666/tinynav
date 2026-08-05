@@ -1,4 +1,5 @@
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from sensor_msgs.msg import Image, CameraInfo, PointField
 from nav_msgs.msg import Path, Odometry, OccupancyGrid
@@ -17,54 +18,25 @@ from std_msgs.msg import Header
 from codetiming import Timer
 import cv2
 from tinynav.core.math_utils import rotvec_to_matrix, quat_to_matrix, matrix_to_quat, pose_msg2np
-
-
-@dataclass
-class RobotConfig:
-    """Robot geometry. Body frame: +x forward, +y left."""
-    name: str = 'go2'
-    shape: str = 'square'
-    length: float = 0.7
-    width: float = 0.3
-    radius: float = 0.3
-    camera_x: float = 0.35
-    camera_y: float = 0.0
-    control_x: float = 0.0
-    control_y: float = 0.0
-    safety_radius: float = 0.1
-
-    @property
-    def cam_offset_3d(self):
-        """Offset [left, up, forward] from control center to camera in body frame."""
-        return np.array([self.camera_y - self.control_y, 0.0, self.camera_x - self.control_x], dtype=np.float32)
-
-    @property
-    def half_size(self):
-        if self.shape == 'circle':
-            return (self.radius, self.radius)
-        return (self.length / 2.0, self.width / 2.0)
-
-    def footprint_from_control(self):
-        """Returns (front_len, rear_len, half_w) relative to control center."""
-        hl, hw = self.half_size
-        return float(hl - self.control_x), float(hl + self.control_x), float(hw)
-
-
-GO2_CONFIG = RobotConfig(
-    name='go2', shape='square',
-    length=0.4, width=0.3,
-    camera_x=0.2, camera_y=0.0,
-    control_x=0.0, control_y=0.0,
-    safety_radius=0.2,
+# Re-exported so `from planning_node import GO2_CONFIG` keeps working
+# (tool/planning_bag_viser.py does exactly that).
+from tinynav.core.robot_config import (
+    B2_CONFIG,
+    GO2_CONFIG,
+    LEKIWI_CONFIG,
+    ROBOT_CONFIGS,
+    RobotConfig,
+    robot_config,
 )
 
-B2_CONFIG = RobotConfig(
-    name='b2', shape='square',
-    length=1.0, width=0.5,
-    camera_x=0.5, camera_y=0.0,
-    control_x=-0.5, control_y=0.0,
-    safety_radius=0.1,
-)
+__all__ = [
+    "B2_CONFIG",
+    "GO2_CONFIG",
+    "LEKIWI_CONFIG",
+    "ROBOT_CONFIGS",
+    "RobotConfig",
+    "robot_config",
+]
 
 # === Helper functions ===
 @njit(cache=True)
@@ -364,13 +336,9 @@ def roll_occupancy_grid(occupancy_grid, old_origin, new_origin, resolution):
 class PlanningNode(Node):
     def __init__(self):
         super().__init__('planning_node')
-        self.robot = GO2_CONFIG
-        self.get_logger().info(
-            f"Robot: {self.robot.name} ({self.robot.shape} {self.robot.length}x{self.robot.width}m, "
-            f"cam=({self.robot.camera_x},{self.robot.camera_y}), "
-            f"ctrl=({self.robot.control_x},{self.robot.control_y}), "
-            f"safety_r={self.robot.safety_radius}m)"
-        )
+        self.declare_parameter('robot_type', 'go2')
+        self.robot = robot_config(str(self.get_parameter('robot_type').value))
+        self.get_logger().info(f"Robot: {self.robot.describe()}")
         self.bridge = CvBridge()
         self.path_pub = self.create_publisher(Path, '/planning/trajectory_path', 10)
         self.height_map_pub = self.create_publisher(Image, "/planning/height_map", 10)
@@ -822,6 +790,12 @@ def main(args=None):
         node.destroy_node()
         rclpy.shutdown()
     except KeyboardInterrupt:
+        pass
+    except ExternalShutdownException:
+        # SIGTERM, which is how the app's node manager stops this process. rclpy's
+        # signal handler invalidates the context before spin() returns, so without
+        # this every ordinary stop prints a traceback -- noise that matters when the
+        # logs are what you read to compare runs.
         pass
 
 if __name__ == '__main__':
