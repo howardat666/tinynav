@@ -4,11 +4,17 @@ TinyNav backend — FastAPI + uvicorn.
 Usage:
     cd /tinynav
     TINYNAV_DB_PATH=/tinynav/tinynav_db uv run uvicorn app.backend.main:app --host 0.0.0.0 --port 8000
+
+It can also serve the Flutter web bundle itself, so that one process on one port
+is the whole app. See SERVING THE WEB UI below.
 """
+import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from .manager_client import BACKEND_ROLE, is_display_role
 from .state import runner
@@ -50,3 +56,34 @@ else:
     app.include_router(nav.router, prefix='/nav')
     app.include_router(files.router)
     app.include_router(action.router)
+
+
+# SERVING THE WEB UI
+# ------------------
+# Mounted last and only last: a mount at '/' matches every path the routers above
+# did not claim, so registering it any earlier would shadow the API.
+#
+# Serving the bundle from the same origin as the API is the point, not a
+# convenience. The frontend derives its endpoints from a stored device IP that
+# defaults to 169.254.10.1 and appends :8000, so a page fetched from
+# http://169.254.10.1:8000/ talks back to exactly where it came from -- no IP to
+# type in, no CORS preflight, and one uvicorn instead of a second static server.
+# That matters here because the X5 inside the camera is the only computer in the
+# system; the laptop is a browser and nothing else.
+#
+# Absent bundle is not an error. In the docker dev flow the frontend runs under
+# `flutter run -d chrome` on a different port and this directory does not exist,
+# so mounting is skipped and the API behaves exactly as before.
+_DEFAULT_WEB_ROOT = Path(__file__).resolve().parents[1] / 'frontend' / 'build' / 'web'
+WEB_ROOT = Path(os.environ.get('TINYNAV_WEB_ROOT', _DEFAULT_WEB_ROOT))
+
+if (WEB_ROOT / 'index.html').is_file():
+    # html=True makes a directory path serve its index.html, so '/' returns the
+    # app. It is not an SPA fallback: an unknown path still 404s. That is correct
+    # here because this frontend keeps all its state in widgets and never puts a
+    # route in the URL -- there are no deep links to preserve. Should it ever grow
+    # URL routing, this mount would need a catch-all returning index.html instead.
+    app.mount('/', StaticFiles(directory=str(WEB_ROOT), html=True), name='web')
+    print(f'[backend] serving web UI from {WEB_ROOT}', flush=True)
+else:
+    print(f'[backend] no web bundle at {WEB_ROOT}, API only', flush=True)

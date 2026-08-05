@@ -23,8 +23,22 @@ On the Looper's D-Robotics X5 those are the only two free UARTs, and both are
 genuinely pinmuxed out to pads: ``uart3grp`` on pins 10/11 and ``uart5grp`` on
 pins 28/29, unlike uart1/2/4/7 whose pins are left as GPIO. ttyS0 is the boot
 console at 921600 and must not be touched. Which of the two reaches the camera's
-10-pin GH1.25 connector is a PCB question that no datasheet we have answers, so
-this script simply tries both and tells you which one replied.
+8-pin GH1.25 connector is a PCB question that no datasheet we have answers, so
+this script simply tries both and tells you which one replied. (That connector is
+8-pin and is the only GH1.25 on the camera; an earlier version of this file said
+10-pin, which was wrong.)
+
+THE GH1.25 POWER PIN IS 12 V, NOT 5 V
+-------------------------------------
+Type-C is the camera's 5 V input; the GH1.25 is its 12 V one. What that pin
+actually receives is set by whatever feeds the LeKiwi board's 2-pin input, and
+feeding it well under 12 V has been observed to take the camera down and hold it
+there. Measured on this robot: the servo bus read 9.4 V -- a 3S pack at 3.13 V per
+cell, i.e. nearly flat -- and plugging the GH1.25 killed the camera instantly and
+kept it dead until the connector was pulled, at which point it booted normally in
+36 s. Three times out of three, at idle, with the CPU at 78 C against a 110 C trip
+and 906 MB free, so neither heat nor load nor memory was involved. Check the supply
+voltage before suspecting anything else.
 
 It uses ``tinynav.platforms.feetech_bus``, the same bus implementation the
 odometry node uses, so a successful scan here means the real driver will work

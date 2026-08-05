@@ -5,7 +5,21 @@ set -euo pipefail
 #
 #     bash tool/x5_board/sync_to_board.sh              # code only
 #     bash tool/x5_board/sync_to_board.sh --with-app   # also app/ (web backend)
+#     bash tool/x5_board/sync_to_board.sh --with-web   # also the built Flutter bundle
 #     BOARD=root@169.254.10.1 bash tool/x5_board/sync_to_board.sh
+#
+# --with-web needs app/frontend/build/web to exist, which means it was built first.
+# The board has no Flutter and does not need one: `flutter build web` emits plain
+# HTML/JS/WASM with no architecture in it, so an x86 host builds a bundle the
+# aarch64 board serves unchanged. There is no Flutter on this host either -- it
+# lives in the uniflexai/tinynav:latest image at /opt/flutter/bin:
+#
+#     docker run --rm -v "$PWD/app/frontend":/fe -w /fe --entrypoint bash \
+#       uniflexai/tinynav:latest -c \
+#       'export PATH=$PATH:/opt/flutter/bin; flutter pub get && flutter build web --release'
+#
+# (that writes build/ as root; building a copy elsewhere and moving it in avoids
+# root-owned files in the checkout.)
 #
 # WHY A SCRIPT
 #   The board has no rsync and no network route to a git remote, so the checkout
@@ -27,11 +41,13 @@ BOARD="${BOARD:-root@169.254.10.1}"
 BOARD_PASS="${BOARD_PASS:-looper@0731}"
 BOARD_ROOT="${BOARD_ROOT:-/userdata/x5/tinynav}"
 with_app=0
+with_web=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --with-app) with_app=1; shift ;;
-        *) echo "Usage: $0 [--with-app]" >&2; exit 1 ;;
+        --with-web) with_web=1; shift ;;
+        *) echo "Usage: $0 [--with-app] [--with-web]" >&2; exit 1 ;;
     esac
 done
 
@@ -41,6 +57,13 @@ cd "${repo_root}"
 paths=(tinynav tool tests scripts)
 if [[ ${with_app} -eq 1 ]]; then
     paths+=(app/backend)
+fi
+if [[ ${with_web} -eq 1 ]]; then
+    if [[ ! -f app/frontend/build/web/index.html ]]; then
+        echo "--with-web: app/frontend/build/web/index.html missing -- build it first (see header)" >&2
+        exit 1
+    fi
+    paths+=(app/frontend/build/web)
 fi
 
 echo "syncing ${paths[*]} -> ${BOARD}:${BOARD_ROOT}"

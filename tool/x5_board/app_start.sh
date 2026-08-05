@@ -1,0 +1,184 @@
+#!/bin/bash
+set -uo pipefail
+
+# Run the whole TinyNav app -- backend, web UI and every ROS node -- on the X5
+# inside the Looper camera. Runs ON THE BOARD.
+#
+#     bash tool/x5_board/app_start.sh start a     # VIO map,      VIO nav
+#     bash tool/x5_board/app_start.sh start b     # VIO map,      odometry nav
+#     bash tool/x5_board/app_start.sh start c     # odometry map, odometry nav
+#     bash tool/x5_board/app_start.sh status
+#     bash tool/x5_board/app_start.sh log
+#     bash tool/x5_board/app_start.sh stop
+#
+# Then, from the laptop's browser:  http://169.254.10.1:8000/
+#
+# WHY A SCHEME LETTER AND NOT A CONFIG FILE
+#   The three schemes are the comparison. Each one is a fixed combination of
+#   TINYNAV_MAP_ODOM_SOURCE and TINYNAV_ODOM_SOURCE, and they must be set before
+#   the first node starts because they decide which processes exist at all --
+#   node_manager reads them at import. A letter on the command line makes the
+#   run's configuration visible in the log and impossible to half-change: there is
+#   no state to forget to reset between runs.
+#
+# WHY ROBOT_TYPE AND ACTUATOR ARE PINNED, NOT DERIVED
+#   All three schemes drive the same LeKiwi chassis; only the odometry differs.
+#   The defaults in node_manager are go2/unitree, so leaving them alone starts
+#   unitree_control against a chassis that has no Unitree in it -- observed, and
+#   it starts happily and silently does nothing useful. Pin them here.
+#
+# WHY IT SERVES THE UI ITSELF
+#   The X5 is the only computer in this system; the laptop is a browser. uvicorn
+#   mounts app/frontend/build/web at '/', so page and API share an origin and
+#   there is nothing to configure in the UI. If the bundle is missing the backend
+#   still starts, API-only, and says so in the log -- see sync_to_board.sh
+#   --with-web for how it gets there.
+
+BOARD_ROOT="${BOARD_ROOT:-/userdata/x5/tinynav}"
+LOG_DIR="${LOG_DIR:-/userdata/x5/logs}"
+ENV_SH="${ENV_SH:-/userdata/x5/env.sh}"
+DB_PATH="${TINYNAV_DB_PATH:-/userdata/x5/tinynav_db}"
+PORT="${PORT:-8000}"
+PIDFILE="${LOG_DIR}/app.pid"
+LOGFILE="${LOG_DIR}/app.log"
+SCHEMEFILE="${LOG_DIR}/app.scheme"
+
+usage() { sed -n '3,20p' "$0" >&2; exit 1; }
+
+# Sourcing env.sh is not optional: without it rosbag2_py cannot find
+# libtinyxml2.so.9, which lives in /userdata/hobot/opt/hobot/deps. The failure
+# surfaces as an import error deep inside a map build, long after startup.
+load_env() {
+    if [[ ! -f "${ENV_SH}" ]]; then
+        echo "missing ${ENV_SH} -- ROS and its deps will not resolve" >&2
+        exit 1
+    fi
+    # shellcheck disable=SC1090
+    . "${ENV_SH}"
+}
+
+app_pid() {
+    [[ -f "${PIDFILE}" ]] || return 1
+    local pid; pid="$(cat "${PIDFILE}" 2>/dev/null)"
+    [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null && { echo "${pid}"; return 0; }
+    return 1
+}
+
+do_start() {
+    local scheme="${1:-}"
+    case "${scheme}" in
+        a) map_src=vio;   nav_src=vio   ;;
+        b) map_src=vio;   nav_src=wheel ;;
+        c) map_src=wheel; nav_src=wheel ;;
+        *) echo "scheme must be a, b or c (got '${scheme}')" >&2; usage ;;
+    esac
+
+    if pid="$(app_pid)"; then
+        echo "already running as pid ${pid} (scheme $(cat "${SCHEMEFILE}" 2>/dev/null || echo '?'))" >&2
+        echo "stop it first: bash $0 stop" >&2
+        exit 1
+    fi
+
+    # A stale insight_full means no camera topics at all, which the app reports as
+    # an empty sensor list rather than as an error. Cheaper to check here.
+    if ! pgrep -x insight_full >/dev/null 2>&1; then
+        echo "WARNING: insight_full is not running -- no camera topics will appear" >&2
+    fi
+
+    mkdir -p "${LOG_DIR}" "${DB_PATH}"
+    load_env
+
+    export TINYNAV_DB_PATH="${DB_PATH}"
+    export TINYNAV_ROBOT_TYPE=lekiwi
+    export TINYNAV_ACTUATOR=wheel
+    export TINYNAV_ODOM_SOURCE="${nav_src}"
+    export TINYNAV_MAP_ODOM_SOURCE="${map_src}"
+
+    {
+        echo "=============================================================="
+        echo "scheme        : ${scheme}   (map=${map_src}, nav=${nav_src})"
+        echo "board uptime  : $(cut -d' ' -f1 /proc/uptime)s"
+        echo "robot/actuator: ${TINYNAV_ROBOT_TYPE} / ${TINYNAV_ACTUATOR}"
+        echo "db            : ${TINYNAV_DB_PATH}"
+        echo "=============================================================="
+    } >> "${LOGFILE}"
+
+    # setsid so the whole thing survives this ssh session closing, and so that
+    # stop can signal the process group -- the backend spawns ROS nodes as
+    # children and signalling the pid alone orphans them.
+    cd "${BOARD_ROOT}" || exit 1
+    setsid nohup python3 -m uvicorn app.backend.main:app \
+        --host 0.0.0.0 --port "${PORT}" \
+        >> "${LOGFILE}" 2>&1 < /dev/null &
+    local pid=$!
+    echo "${pid}" > "${PIDFILE}"
+    echo "${scheme} (map=${map_src}, nav=${nav_src})" > "${SCHEMEFILE}"
+
+    # Startup is ~10 s on this board: rclpy init, then the sensor bridge and
+    # planning node. Report what actually came up rather than just the pid.
+    sleep 12
+    if ! kill -0 "${pid}" 2>/dev/null; then
+        echo "FAILED to start -- last 30 lines of ${LOGFILE}:" >&2
+        tail -30 "${LOGFILE}" >&2
+        rm -f "${PIDFILE}"
+        exit 1
+    fi
+    echo "started pid ${pid}, scheme ${scheme} (map=${map_src}, nav=${nav_src})"
+    echo
+    do_status
+}
+
+do_stop() {
+    if ! pid="$(app_pid)"; then
+        echo "not running"
+        rm -f "${PIDFILE}"
+        return 0
+    fi
+    # Negative pid = the process group setsid created, so the ROS children die too.
+    kill -TERM "-${pid}" 2>/dev/null || kill -TERM "${pid}" 2>/dev/null
+    for _ in $(seq 20); do
+        kill -0 "${pid}" 2>/dev/null || break
+        sleep 0.5
+    done
+    if kill -0 "${pid}" 2>/dev/null; then
+        echo "did not exit on TERM, sending KILL" >&2
+        kill -KILL "-${pid}" 2>/dev/null
+        sleep 1
+    fi
+    rm -f "${PIDFILE}"
+    echo "stopped"
+    # wheel_odometry_node is deliberately long-lived and is not in the backend's
+    # own shutdown path, so say whether anything is still holding the servo bus.
+    pgrep -af 'wheel_odometry_node' && echo "  ^ wheel odometry still up (expected: it owns the servo bus)"
+    return 0
+}
+
+do_status() {
+    if pid="$(app_pid)"; then
+        echo "backend  : running pid ${pid}"
+        echo "scheme   : $(cat "${SCHEMEFILE}" 2>/dev/null || echo '?')"
+    else
+        echo "backend  : not running"
+    fi
+    # netstat, not ss: this board's busybox userland has no ss at all, and
+    # `ss ... | grep -c` on an empty stream cheerfully reports 0 listeners.
+    echo "port     : $(netstat -tln 2>/dev/null | grep -c ":${PORT}[[:space:]]") listener(s) on ${PORT}"
+    echo "web UI   : http://169.254.10.1:${PORT}/"
+    echo "nodes    :"
+    pgrep -af 'looper_bridge_node|planning_node|cmd_vel_control|wheel_odometry_node|map_node|unitree' \
+        | sed 's/^/  /' || echo "  (none)"
+    echo "resources:"
+    printf '  cpu %s mC   ddr %s mC   load %s   avail %s kB\n' \
+        "$(cat /sys/class/thermal/thermal_zone1/temp 2>/dev/null)" \
+        "$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null)" \
+        "$(cut -d' ' -f1 /proc/loadavg)" \
+        "$(awk '/MemAvailable/{print $2}' /proc/meminfo)"
+}
+
+case "${1:-}" in
+    start)  shift; do_start "${1:-}" ;;
+    stop)   do_stop ;;
+    status) do_status ;;
+    log)    tail -n "${2:-60}" -f "${LOGFILE}" ;;
+    *)      usage ;;
+esac
