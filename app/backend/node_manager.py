@@ -319,8 +319,23 @@ class BackendNode(Ros2NodeManager):
             self._tf_buffer = tf2_ros.Buffer()
             self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
 
-        # Publisher for POI nav target consumed by map_node via /mapping/cmd_pois
-        self._cmd_pois_pub = self.create_publisher(String, '/mapping/cmd_pois', 10)
+        # Publisher for POI nav target consumed by map_node via /mapping/cmd_pois.
+        #
+        # Latched, because this topic carries *state* -- "the current nav target" --
+        # not an event, and it is published exactly once per user click. map_node is
+        # started by the same request that then sends the POI, and it needs about
+        # 15 s before it subscribes: 11 s to load 575 map keyframes plus 4 s to
+        # compile the path-search kernels. A VOLATILE one-shot publish inside that
+        # window is gone for good. Measured on the board: 61 consecutive nav-path
+        # attempts logged skip_no_poi, planning fell back to a hold-position local
+        # trajectory, cmd_vel_control correctly commanded zero, and the robot sat
+        # still with a trajectory drawn on screen and no error anywhere.
+        #
+        # map_node's subscription must be TRANSIENT_LOCAL too: a TRANSIENT_LOCAL
+        # publisher and a VOLATILE subscriber still connect, but the late joiner
+        # gets no history, which is the entire point here.
+        latched_poi_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self._cmd_pois_pub = self.create_publisher(String, '/mapping/cmd_pois', latched_poi_qos)
         self._poi_change_pub = self.create_publisher(Odometry, '/mapping/poi_change', 10)
 
         # Latched publisher — new subscribers (cmd_vel_control) get current state immediately on connect
@@ -1571,6 +1586,15 @@ class BackendNode(Ros2NodeManager):
                 all_pois = json.load(f)
             payload = {str(pid): all_pois[str(pid)] for pid in poi_ids if str(pid) in all_pois}
             self._cmd_pois_pub.publish(String(data=json.dumps(payload)))
+            # Logged because the silence here cost real debugging time: the clear
+            # path logs, the two failure paths log, and the success path did not, so
+            # a POST that published a target and a POST that published nothing left
+            # identical traces.
+            missing = [p for p in poi_ids if str(p) not in all_pois]
+            self.get_logger().info(
+                f'Published nav target on /mapping/cmd_pois: {sorted(payload)}'
+                + (f' (requested but absent from pois.json: {missing})' if missing else '')
+            )
         with self._lock:
             nav_running = self._nav_nodes_running
         if nav_running:

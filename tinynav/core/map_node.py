@@ -1,6 +1,7 @@
 import rclpy
 import os
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path, Odometry
 from std_msgs.msg import Bool, String
@@ -475,7 +476,16 @@ class MapNode(Node):
         self.keyframe_image_sub = Subscriber(self, Image, '/slam/keyframe_image')
         self.keyframe_odom_sub = Subscriber(self, Odometry, '/slam/keyframe_odom')
         self.continuous_odom_sub = self.create_subscription(Odometry, '/slam/odometry', self.continuous_odom_callback, 100)
-        self.pois_sub = self.create_subscription(String, '/mapping/cmd_pois', self.pois_callback, 10)
+        # TRANSIENT_LOCAL to match the publisher. The nav target is state, published
+        # once per user click, and this node is always the late joiner: it is started
+        # by the same request that then sends the POI, and needs ~15 s to get here --
+        # 11 s to load the map keyframes plus kernel compilation. With a volatile
+        # subscription the target published inside that window is lost for good and
+        # every nav-path attempt logs skip_no_poi from then on.
+        self.pois_sub = self.create_subscription(
+            String, '/mapping/cmd_pois', self.pois_callback,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+        )
 
         # pubs
         self.pose_graph_trajectory_pub = self.create_publisher(Path, "/mapping/pose_graph_trajectory", 10)
