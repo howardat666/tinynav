@@ -183,6 +183,56 @@ def checksum(payload: bytes | list[int]) -> int:
     return (~sum(payload)) & 0xFF
 
 
+def configure_velocity_mode(bus, motor_ids) -> None:
+    """Put servos into continuous-velocity mode with torque on, and verify it.
+
+    ``Operating_Mode`` 1 is the STS3215's constant-speed mode, the one that obeys
+    ``Goal_Velocity``.  It lives at address 33, inside the EEPROM region, so it
+    can only be written while the motor has torque **off** and its ``Lock``
+    register **cleared**.  A locked write is not refused: the servo acknowledges
+    the packet with error byte 0 and silently discards it.  So both the order
+    below and the read-back matter -- without the read-back the wheels stay in
+    position mode, every ``Goal_Velocity`` write reports success, and nothing
+    turns, with no error anywhere to explain it.
+
+    Note the sequence ends with ``Lock`` set again, which is what makes the wrong
+    version so convincing: writing ``Operating_Mode`` before unlocking works
+    exactly once on a factory-fresh servo and then fails silently forever after.
+
+    Lives here, rather than in whichever caller needs it, because there are now
+    three -- the odometry node, the geometry calibration tool and the yaw-source
+    comparison -- and a safety-relevant sequence that must not be got wrong is a
+    bad thing to have three copies of.
+
+    Raises:
+        FeetechBusError: if any servo does not read back mode 1 afterwards. An
+            unreadable mode counts as failure too: commanding a wheel whose mode
+            could not be confirmed is how a runaway starts.
+    """
+    for motor_id in motor_ids:
+        bus.write("Torque_Enable", motor_id, 0)  # EEPROM needs torque off
+        bus.write("Lock", motor_id, 0)  # ...and the lock cleared
+        bus.write("Operating_Mode", motor_id, 1)
+        bus.write("Lock", motor_id, 1)
+        bus.write("Torque_Enable", motor_id, 1)
+
+    wrong = {}
+    for motor_id in motor_ids:
+        try:
+            mode = bus.read("Operating_Mode", motor_id)
+        except FeetechBusError as exc:
+            wrong[motor_id] = f"read failed: {exc}"
+            continue
+        if mode != 1:
+            wrong[motor_id] = f"Operating_Mode={mode}, expected 1"
+    if wrong:
+        raise FeetechBusError(
+            "base servos did not enter velocity mode: "
+            + "; ".join(f"id {i}: {why}" for i, why in sorted(wrong.items()))
+            + ". The EEPROM unlock did not take effect, so Goal_Velocity would be ignored."
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Read results
 # --------------------------------------------------------------------------- #

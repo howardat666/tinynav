@@ -103,7 +103,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from tinynav.platforms.feetech_bus import (  # noqa: E402
     FakeFeetechBus,
     FeetechBus,
-    FeetechBusError,
+    configure_velocity_mode,
 )
 from tinynav.platforms.omni3_kinematics import (  # noqa: E402
     DEFAULT_BASE_RADIUS,
@@ -235,22 +235,10 @@ def make_stop_predicate(args, clock):
 def start_motion(args, bus, kin, motor_ids) -> None:
     if not args.drive or args.fake:
         return
-    for motor_id in motor_ids:
-        # Operating_Mode is at address 33, inside the EEPROM region, so it only
-        # takes effect while torque is off AND Lock is cleared. A locked write is
-        # acknowledged with error byte 0 and silently discarded, which would
-        # leave the wheel in position mode where Goal_Velocity does nothing.
-        bus.write("Torque_Enable", motor_id, 0)
-        bus.write("Lock", motor_id, 0)
-        bus.write("Operating_Mode", motor_id, 1)
-        bus.write("Lock", motor_id, 1)
-        bus.write("Torque_Enable", motor_id, 1)
-        mode = bus.read("Operating_Mode", motor_id)
-        if mode != 1:
-            raise FeetechBusError(
-                f"wheel {motor_id} reports Operating_Mode={mode} after being set to 1; "
-                "the EEPROM unlock did not take effect, so the wheels would not turn"
-            )
+    # The EEPROM unlock sequence and its read-back live in feetech_bus, shared
+    # with the odometry node and the yaw comparison tool; see that docstring for
+    # why a locked write is acknowledged and then silently discarded.
+    configure_velocity_mode(bus, motor_ids)
     if args.command == "spin":
         raw = kin.body_to_wheel_raw(0.0, 0.0, args.yaw_rate)
     else:

@@ -1,24 +1,36 @@
 #!/usr/bin/env python3
 """Compare two yaw sources against a counted ground truth: the gyro and the wheels.
 
-Rotate the robot in place by hand, deliberately unevenly -- speed up, slow down,
-pause, reverse briefly -- then press ENTER and type how many turns it actually
-made.  The script reports what the gyro thought and what the wheel encoders
-thought, so the two can be judged against the same external truth in one run.
+Spin the base in place at a deliberately uneven rate, press ENTER on a whole turn,
+and type how many turns it made.  The script reports what the gyro thought and
+what the wheel encoders thought, so both are judged against the same external
+truth in a single run instead of against each other.
 
-    python3 tool/x5_board/yaw_source_compare.py --port /dev/ttyS3 \
+    python3 tool/x5_board/yaw_source_compare.py --port /dev/ttyS3 --drive \
         --wheel-radius 0.050385 --base-radius 0.127083
 
-WHY BY HAND, AND WHY UNEVENLY
------------------------------
-Pushing the chassis around by hand is the *point* here, not a compromise.  A
-driven spin is smooth and slips little, which is exactly the case where the two
-sources agree and the test tells you nothing.  Hand rotation skids the rollers,
-so the wheels lose count while the gyro does not -- which is the error this
-comparison exists to size.  Uneven speed matters for the same reason: a constant
-rate lets a scale error and a bias error trade off against each other and both
-look fine, while a varying rate separates them, because bias accumulates with
-*time* and scale error accumulates with *angle*.
+WHY DRIVEN, AND WHY UNEVENLY
+----------------------------
+Use ``--drive``.  Hand-rotating the chassis seems like the more revealing test,
+since skidding the rollers is exactly the error wheel odometry cannot see -- but
+it measures a condition that never occurs in operation, and on this base hand
+pushing is wildly unrepresentative: measured over 3 m, a hand push yawed the
+chassis 23.7 deg and left the two driving wheels 10.8% apart, where driving all
+three gave 0.17 deg and 0.06%.  A geometry calibration done by hand on this robot
+reported an effective wheel radius 12.8% *above* the geometric one, which is
+physically impossible.  Validate under the conditions the robot will actually run
+in.
+
+Uneven speed is the part worth keeping, and ``--drive`` varies the commanded yaw
+rate on purpose.  At a constant rate a scale error and a bias error trade off
+against each other and both look fine; a varying rate separates them, because
+bias accumulates with *time* while scale error accumulates with *angle*.  The
+report prints peak/mean yaw rate so a run that was not actually uneven is visible
+rather than quietly believed.
+
+Hand rotation is still available (omit ``--drive``) and still worth one run: it
+sizes the worst case, i.e. what the wheels report when the robot is shoved,
+stalled against an obstacle, or lifted.
 
 WHAT MAKES THE GYRO USABLE WITHOUT ANY MOUNTING ASSUMPTION
 ----------------------------------------------------------
@@ -73,7 +85,11 @@ except ImportError as exc:  # pragma: no cover - environment problem, not logic
     print("on the board:  source /userdata/x5/env.sh", file=sys.stderr)
     sys.exit(2)
 
-from tinynav.platforms.feetech_bus import FakeFeetechBus, FeetechBus
+from tinynav.platforms.feetech_bus import (
+    FakeFeetechBus,
+    FeetechBus,
+    configure_velocity_mode,
+)
 from tinynav.platforms.omni3_kinematics import (
     DEFAULT_BASE_RADIUS,
     DEFAULT_TICKS_PER_REV,
@@ -83,6 +99,12 @@ from tinynav.platforms.omni3_kinematics import (
 )
 
 WHEEL_NAMES = ("left", "back", "right")
+
+# Multipliers on --yaw-rate, cycled one per --profile-step-s. Chosen to span a
+# ~4x range and to include a brief reversal: reversing is what makes a constant
+# *bias* separable from a constant *scale* error, because the bias keeps
+# accumulating in the same direction while the true rotation changes sign.
+YAW_RATE_PROFILE = (1.0, 0.4, 1.0, 0.6, -0.5, 0.8, 1.0, 0.3)
 
 
 class YawCompare(Node):
@@ -129,6 +151,14 @@ class YawCompare(Node):
         self.wheel_totals = dict.fromkeys(args.motor_ids, 0)
         self.wheel_prev: dict[int, int] | None = None
         self.read_failures = 0
+        self.driving = False
+        self.profile_index = -1
+        if args.drive and not args.fake:
+            # Done here, before the still window, so a servo that refuses velocity
+            # mode aborts the run before anyone has stood around waiting 4 s.
+            configure_velocity_mode(self.bus, args.motor_ids)
+            print("wheels are in velocity mode and energised -- they will NOT move "
+                  "until the still window ends")
 
         self.phase = "bias"
         self.phase_started = time.monotonic()
@@ -218,16 +248,22 @@ class YawCompare(Node):
                     )
             self.wheel_prev = curr
 
+        elapsed = time.monotonic() - (self.motion_started or time.monotonic())
+        commanded = self._update_drive(elapsed)
         wheel_yaw_deg = np.degrees(self._wheel_yaw_rad())
         imu_yaw_deg = np.degrees(self.imu_yaw_rad)
-        elapsed = time.monotonic() - (self.motion_started or time.monotonic())
-        print(f"\r  {elapsed:5.1f}s   gyro {imu_yaw_deg:+9.1f} deg ({imu_yaw_deg / 360.0:+6.3f} turns)"
+        print(f"\r  {elapsed:5.1f}s  {commanded}  gyro {imu_yaw_deg:+9.1f} deg ({imu_yaw_deg / 360.0:+6.3f} turns)"
               f"   wheels {wheel_yaw_deg:+9.1f} deg ({wheel_yaw_deg / 360.0:+6.3f} turns)   "
               "[ENTER to stop]", end="", flush=True)
 
         ready, _, _ = select.select([sys.stdin], [], [], 0.0)
         if ready:
             sys.stdin.readline()
+            # Stop before anything else, including before the report and the
+            # ground-truth prompt: the prompt blocks on input(), and a base that
+            # is still turning while it waits would invalidate the very number
+            # being typed in.
+            self.stop_wheels()
             self.done = True
 
     # -- phases ------------------------------------------------------------- #
@@ -259,12 +295,55 @@ class YawCompare(Node):
         print(f"    bias about yaw axis: {bias_yaw:+.4f} deg/s "
               f"-> {abs(bias_yaw) * 60:.2f} deg per minute of drift if left uncorrected")
         print()
-        print("PHASE 2/2 -- rotate the robot in place BY HAND, deliberately unevenly.")
-        print("  Vary the speed, pause, back up a little. Count the turns as you go.")
-        print("  Press ENTER when you stop.")
+        if self.args.drive:
+            print("PHASE 2/2 -- DRIVING NOW. The base will spin, changing rate every "
+                  f"{self.args.profile_step_s:.0f}s.")
+            print("  Count the turns. Press ENTER at the instant your floor and chassis")
+            print("  marks line up on a whole turn, so the ground truth is exact rather")
+            print("  than an estimated fraction -- reaction time is worth ~0.4%, guessing")
+            print("  a fraction is worth ~5%.")
+            print("  !! The tether winds up one turn per turn. Stop by ~4 and run again")
+            print("     with a negative --yaw-rate to unwind it.")
+        else:
+            print("PHASE 2/2 -- rotate the robot in place BY HAND, deliberately unevenly.")
+            print("  Vary the speed, pause, back up a little. Count the turns as you go.")
+            print("  Press ENTER at a whole-turn mark alignment.")
         print()
         self.phase = "motion"
         self.motion_started = time.monotonic()
+
+    def _update_drive(self, elapsed: float) -> str:
+        """Step the yaw-rate profile, writing Goal_Velocity when it changes.
+
+        Written only on a step boundary rather than every poll: the setpoint is
+        piecewise constant, and re-sending it 50 times a second would fill the
+        half-duplex bus with writes competing against the position reads that this
+        test actually depends on.
+        """
+        if not self.args.drive:
+            return "              "
+        index = int(elapsed // self.args.profile_step_s) % len(YAW_RATE_PROFILE)
+        rate = self.args.yaw_rate * YAW_RATE_PROFILE[index]
+        if index != self.profile_index:
+            self.profile_index = index
+            raw = self.kin.body_to_wheel_raw(0.0, 0.0, rate)
+            self.bus.sync_write("Goal_Velocity", dict(zip(self.args.motor_ids, (int(v) for v in raw))))
+            self.driving = True
+        return f"cmd {rate:+.2f} rad/s"
+
+    def stop_wheels(self) -> None:
+        """Zero Goal_Velocity. Must run on every exit path, including exceptions.
+
+        Without this an unhandled error anywhere above leaves the base spinning
+        while the traceback prints.
+        """
+        if not self.driving:
+            return
+        try:
+            self.bus.sync_write("Goal_Velocity", dict.fromkeys(self.args.motor_ids, 0))
+            self.driving = False
+        except Exception as exc:  # noqa: BLE001 - report, but keep unwinding
+            print(f"\n!! FAILED TO STOP THE WHEELS: {exc}  -- cut the power")
 
     def _wheel_yaw_rad(self) -> float:
         deltas = [self.wheel_totals[i] for i in self.args.motor_ids]
@@ -365,6 +444,7 @@ class YawCompare(Node):
             return value
 
     def shutdown(self) -> None:
+        self.stop_wheels()
         try:
             self.bus.disconnect()
         except Exception as exc:  # noqa: BLE001 - best effort on the way out
@@ -390,6 +470,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="how long to stand still measuring gyro bias and gravity")
     ap.add_argument("--still-tick-tolerance", type=int, default=3,
                     help="per-poll tick movement tolerated during the still window")
+    ap.add_argument("--drive", action="store_true",
+                    help="let this script spin the base, varying the rate. Recommended: "
+                         "hand rotation measures a condition the robot never operates in")
+    ap.add_argument("--yaw-rate", type=float, default=0.45,
+                    help="base yaw rate in rad/s; the profile scales this by 0.3x to 1.0x "
+                         "and briefly reverses")
+    ap.add_argument("--profile-step-s", type=float, default=4.0,
+                    help="how long to hold each rate before stepping to the next")
     ap.add_argument("--fake", action="store_true", help="synthesise wheels (IMU still real)")
     return ap
 

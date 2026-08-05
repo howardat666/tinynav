@@ -63,7 +63,12 @@ from rclpy.node import Node
 from std_srvs.srv import Empty
 from tf2_ros import TransformBroadcaster
 
-from tinynav.platforms.feetech_bus import FakeFeetechBus, FeetechBus, FeetechBusError
+from tinynav.platforms.feetech_bus import (
+    FakeFeetechBus,
+    FeetechBus,
+    FeetechBusError,
+    configure_velocity_mode,
+)
 from tinynav.platforms.omni3_kinematics import (
     DEFAULT_BASE_RADIUS,
     DEFAULT_TICKS_PER_REV,
@@ -252,53 +257,12 @@ class WheelOdometryNode(Node):
     def _configure_wheels_for_velocity_mode(self) -> None:
         """Put the three base servos in continuous-velocity mode with torque on.
 
-        Only called when this node owns wheel commands.  Operating_Mode 1 is the
-        STS3215 constant-speed mode driven by Goal_Velocity.
-
-        ``Operating_Mode`` is at address 33, i.e. inside the STS3215's EEPROM
-        region, so it can only be written while the motor has torque off *and*
-        its ``Lock`` register cleared.  A locked write is not refused: the servo
-        acknowledges the packet with error byte 0 and silently discards it.  So
-        the order below matters, and so does the read-back -- without it the
-        wheels stay in position mode, every Goal_Velocity write "succeeds", and
-        nothing turns.
-
-        This is self-inflicting if done wrong, which is why it is spelled out:
-        the sequence ends with ``Lock`` set, so a version that wrote
-        Operating_Mode *before* unlocking would work exactly once on a
-        factory-fresh servo and then fail silently on every later run.
+        Only called when this node owns wheel commands. The EEPROM unlock dance
+        and its read-back live in ``feetech_bus.configure_velocity_mode``, shared
+        with the calibration and yaw-comparison tools -- see that docstring for
+        why a locked write is acknowledged and then discarded.
         """
-        for motor_id in self.motor_ids:
-            self.bus.write("Torque_Enable", motor_id, 0)  # EEPROM needs torque off
-            self.bus.write("Lock", motor_id, 0)  # ...and the lock cleared
-            self.bus.write("Operating_Mode", motor_id, 1)
-            self.bus.write("Lock", motor_id, 1)
-            self.bus.write("Torque_Enable", motor_id, 1)
-
-        wrong = {}
-        for motor_id in self.motor_ids:
-            try:
-                mode = self.bus.read("Operating_Mode", motor_id)
-            except FeetechBusError as exc:
-                # Treat an unreadable mode as unverified rather than as proof of
-                # failure, but still refuse to drive: commanding a wheel whose
-                # mode we could not confirm is how you get a runaway.
-                wrong[motor_id] = f"read failed: {exc}"
-                continue
-            if mode != 1:
-                wrong[motor_id] = f"Operating_Mode={mode}, expected 1"
-        if wrong:
-            raise FeetechBusError(
-                "base servos did not enter velocity mode: "
-                + "; ".join(f"id {i}: {why}" for i, why in sorted(wrong.items()))
-                + ". The EEPROM unlock did not take effect, so Goal_Velocity would be ignored."
-            )
-
-        self.get_logger().info(
-            f"base servos {self.motor_ids} set to velocity mode (read back and confirmed), torque enabled"
-        )
-
-    # -- callbacks ---------------------------------------------------------- #
+        configure_velocity_mode(self.bus, self.motor_ids)
 
     def _cmd_cb(self, msg: Twist) -> None:
         self.last_cmd = msg
