@@ -345,6 +345,9 @@ class YawCompare(Node):
         except Exception as exc:  # noqa: BLE001 - report, but keep unwinding
             print(f"\n!! FAILED TO STOP THE WHEELS: {exc}  -- cut the power")
 
+    def _motion_duration(self) -> float:
+        return time.monotonic() - (self.motion_started or time.monotonic())
+
     def _wheel_yaw_rad(self) -> float:
         deltas = [self.wheel_totals[i] for i in self.args.motor_ids]
         # Only the yaw component of this is valid for a large rotation. Yaw is a
@@ -360,7 +363,7 @@ class YawCompare(Node):
     def report(self) -> int:
         if self.phase != "motion":
             return 1
-        duration = time.monotonic() - (self.motion_started or time.monotonic())
+        duration = self._motion_duration()
         wheel_yaw = self._wheel_yaw_rad()
         imu_yaw = self.imu_yaw_rad
         deltas = [self.wheel_totals[i] for i in self.args.motor_ids]
@@ -380,8 +383,26 @@ class YawCompare(Node):
             mean_rate = self.imu_rate_abs_sum / self.imu_rate_n
             print(f"  |yaw rate|: mean {np.degrees(mean_rate):.1f} deg/s, "
                   f"peak {np.degrees(self.imu_rate_peak):.1f} deg/s "
-                  f"(peak/mean = {self.imu_rate_peak / mean_rate:.1f}x"
-                  f"{' -- good, the rate really did vary' if self.imu_rate_peak > 2.5 * mean_rate else ' -- try harder to vary the speed'})")
+                  f"(peak/mean = {self.imu_rate_peak / mean_rate:.1f}x)")
+            if self.args.drive:
+                # No verdict here under --drive. The profile guarantees the
+                # variety that matters, and peak/mean cannot see it: with
+                # |multipliers| averaging 0.7 against a peak of 1.0 the commanded
+                # ratio is only 1.4x, so a threshold tuned for hand rotation
+                # scolds a run that did exactly what it was told. What actually
+                # separates bias from scale error is that the run contained a
+                # reversal, which is a property of the profile, not of this ratio.
+                steps = max(1, int(self._motion_duration() // self.args.profile_step_s))
+                reversals = sum(
+                    1 for k in range(min(steps, len(YAW_RATE_PROFILE) * 4))
+                    if YAW_RATE_PROFILE[k % len(YAW_RATE_PROFILE)] < 0
+                )
+                print(f"  profile: {steps} steps of {self.args.profile_step_s:.0f}s, "
+                      f"{reversals} reversal(s) -- reversing is what separates a constant "
+                      "bias from a constant scale error")
+            elif self.imu_rate_peak < 2.5 * mean_rate:
+                print("  -> try harder to vary the speed: at a near-constant rate a scale "
+                      "error and a bias error trade off and both look fine")
 
         truth = self._ask_turns()
         if truth is None:
