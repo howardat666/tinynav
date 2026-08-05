@@ -380,9 +380,18 @@ class PlanningNode(Node):
         self.occupancy_cloud_esdf_pub = self.create_publisher(PointCloud2, '/planning/occupied_voxels_with_esdf', 10)
         self.occupancy_grid_pub = self.create_publisher(OccupancyGrid, '/planning/occupancy_grid', 10)
         self.depth_sub = message_filters.Subscriber(self, Image, '/slam/depth')
-        self.pose_sub = message_filters.Subscriber(
-            self, PoseStamped, '/insight/vio_20hz'
-        )
+        # Where this node takes the robot pose from. A parameter rather than a
+        # literal for two reasons: /insight/vio_20hz does not exist on current
+        # Looper firmware (it is /camera/camera/vio_image, measured 19.99 Hz), and
+        # pointing this at a wheel-odometry topic is exactly how a VIO-mapped but
+        # odometry-navigated run gets configured, with no code change.
+        # Caveat for any replacement source: this is time-synchronised against
+        # /slam/depth by *exact* stamp equality, so the substitute must carry the
+        # camera's original stamps rather than restamping with its own clock.
+        self.declare_parameter('pose_topic', '/camera/camera/vio_image')
+        pose_topic = str(self.get_parameter('pose_topic').value)
+        self.get_logger().info(f"planning pose source: {pose_topic}")
+        self.pose_sub = message_filters.Subscriber(self, PoseStamped, pose_topic)
 
         self.ts = message_filters.TimeSynchronizer([self.depth_sub, self.pose_sub], queue_size=30)
         self.ts.registerCallback(self.sync_callback)

@@ -451,6 +451,11 @@ class MapNode(Node):
         super().__init__('map_node')
         self._warmup_nav_path_search_enabled = bool(warmup_nav_path_search)
         self._nav_warmed = False
+        # Throttle bookkeeping; see the constants above keyframe_callback. Both are
+        # keyed on message stamps rather than wall clock so that a bag replayed
+        # faster or slower than real time throttles the same way.
+        self._dropped_stale_keyframes = 0
+        self._last_relocalization_stamp_ns = 0
         self._nav_warmup_lock = threading.Lock()
         self._nav_warmup_thread = None
         self.logger = logging.getLogger(__name__)
@@ -702,7 +707,48 @@ class MapNode(Node):
                 save_finished_msg.data = False
                 self.localization_data_saved_pub.publish(save_finished_msg)
 
+    # Two independent throttles, because the node cannot keep up with the camera
+    # and the two ways of falling behind need different cures.
+    #
+    # Measured on the X5: keyframes arrive at up to 4.83 Hz (the bridge's exact
+    # stamp sync is capped by the 5 Hz depth stream, and with a 3 cm keyframe
+    # threshold anything above ~0.15 m/s makes every synced frame a keyframe),
+    # while one relocalization costs 374 ms p50. 200 ms in, 374 ms out: the queue
+    # grows without bound until the middleware starts dropping, by which point the
+    # pose being published is seconds stale.
+    #
+    # `max_keyframe_age_s` is the safety net. Note a "busy" flag would not work
+    # here: main() uses rclpy.spin(), a single-threaded executor, so callbacks are
+    # serialised and never re-enter -- by the time one returns, the backlog is
+    # already sitting in the executor queue. Rejecting on *age* does work, because
+    # each stale item is discarded in microseconds and the queue drains almost
+    # instantly, leaving the node working on the newest data.
+    #
+    # `min_relocalization_interval_s` attacks the cause rather than the symptom.
+    # Relocalization is the only expensive stage; the pose-graph bookkeeping either
+    # side of it is cheap. Running it once a second rather than five times keeps
+    # every keyframe in the graph while removing the overload -- and the
+    # relocalization budget for this robot is 5 s, so 1 Hz is already 5x margin.
+    max_keyframe_age_s = 0.5
+    min_relocalization_interval_s = 1.0
+
     def keyframe_callback(self, keyframe_image_msg:Image, keyframe_odom_msg:Odometry, depth_msg:Image):
+        now_ns = self.get_clock().now().nanoseconds
+        stamp_ns = int(keyframe_image_msg.header.stamp.sec * 1e9) + int(keyframe_image_msg.header.stamp.nanosec)
+        age_s = (now_ns - stamp_ns) / 1e9
+        if self.max_keyframe_age_s > 0.0 and age_s > self.max_keyframe_age_s:
+            # Logged as a running count rather than per drop: a message per
+            # discarded keyframe would itself cost time in the loop that is
+            # already behind, and the useful signal is the rate, not the events.
+            self._dropped_stale_keyframes += 1
+            if self._dropped_stale_keyframes % 20 == 1:
+                self.get_logger().warning(
+                    f"dropping stale keyframes: {self._dropped_stale_keyframes} so far, "
+                    f"latest was {age_s:.2f}s old (limit {self.max_keyframe_age_s:.2f}s). "
+                    "The node is not keeping up with the keyframe rate."
+                )
+            return
+
         t_start = time.perf_counter()
         stage_timings = {}
 
@@ -721,7 +767,14 @@ class MapNode(Node):
         sync_skew_ms = (max(keyframe_image_timestamp_ns, keyframe_odom_timestamp_ns, depth_timestamp_ns) - min(keyframe_image_timestamp_ns, keyframe_odom_timestamp_ns, depth_timestamp_ns)) / 1e6
         t_stage = mark_stage("timestamp_parse", t_stage)
 
-        success, pose_in_world = self.keyframe_relocalization(keyframe_image_msg.header.stamp, image)
+        since_last_s = (stamp_ns - self._last_relocalization_stamp_ns) / 1e9
+        if self._last_relocalization_stamp_ns == 0 or since_last_s >= self.min_relocalization_interval_s:
+            self._last_relocalization_stamp_ns = stamp_ns
+            success, pose_in_world = self.keyframe_relocalization(keyframe_image_msg.header.stamp, image)
+        else:
+            # Skipped, not failed. The keyframe still goes into the pose graph
+            # below; only the expensive relocalization is rate-limited.
+            success, pose_in_world = False, np.eye(4)
         t_stage = mark_stage("relocalization", t_stage)
 
         odom, _ = msg2np(keyframe_odom_msg)

@@ -113,11 +113,21 @@ class WheelOdometryNode(Node):
 
         # -- ROS interface -------------------------------------------------- #
         # Default is a fresh topic so this node never silently fights the VIO.
-        # Repo topology (verified): perception_node -> /slam/odometry, which is
-        # what map_node subscribes to; looper_bridge_node -> /slam/odometry_visual
-        # (nobody in tinynav/core reads it); planning_node takes PoseStamped on
-        # /insight/vio_20hz instead.  To feed map_node from wheels, set
-        # odom_topic:=/slam/odometry and do not run perception_node's odometry.
+        # Repo topology, verified against a live camera. On the RealSense path
+        # perception_node publishes /slam/odometry and map_node subscribes to it.
+        # On the Looper path perception_node does not run at all -- the camera
+        # supplies depth and VIO and looper_bridge_node converts them -- and
+        # *nothing* publishes /slam/odometry, so that subscription never fires and
+        # map_node's continuous_odom_recorder stays empty. odom_topic:=/slam/odometry
+        # therefore fills a genuinely vacant slot with no risk of a publisher fight.
+        #
+        # Filling it does not by itself make the robot navigate on wheel odometry:
+        # the pose that drives behaviour bypasses /slam/* entirely. planning_node
+        # and cmd_vel_control read the camera's PoseStamped topics directly
+        # (/camera/camera/vio_image at 20 Hz, vio_100hz at 100 Hz), and map_node's
+        # keyframe poses arrive on /slam/keyframe_odom, which the bridge derives
+        # from that same VIO. Those are the three switches that matter, and each is
+        # now a `pose_topic` parameter on its node.
         self.declare_parameter("odom_topic", "/wheel/odometry")
         self.declare_parameter("odom_frame", "world")
         self.declare_parameter("base_frame", "base_link")

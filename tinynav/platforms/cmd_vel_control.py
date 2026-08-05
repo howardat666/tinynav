@@ -199,7 +199,17 @@ class CmdVelControlNode(Node):
         self._trajectory_expire_grace_s = 0.05
         self._vx_gain_comp = 1.2
 
-        self.create_subscription(PoseStamped, "/insight/vio_100hz", self._odom_cb, 50)
+        # The pose this controller closes its loop on. A parameter rather than a
+        # literal because /insight/vio_100hz does not exist on current Looper
+        # firmware -- it is /camera/camera/vio_100hz, measured 99.23 Hz -- and
+        # because swapping it for a wheel-odometry topic is how an
+        # odometry-navigated run is configured. Unlike the planning node's pose
+        # input this one is not time-synchronised with anything, so a replacement
+        # only has to be a PoseStamped arriving fast enough for the control rate.
+        self.declare_parameter("pose_topic", "/camera/camera/vio_100hz")
+        self._pose_topic = str(self.get_parameter("pose_topic").value)
+        self.get_logger().info(f"control pose source: {self._pose_topic}")
+        self.create_subscription(PoseStamped, self._pose_topic, self._odom_cb, 50)
         self.create_subscription(Path, "/planning/trajectory_path", self._traj_cb, 10)
         self.cmd_pub = self.create_publisher(Twist, "/cmd_vel", 10)
 
@@ -239,7 +249,7 @@ class CmdVelControlNode(Node):
             if path_lag_s > 0.0:
                 self.logger.warning(
                     f"received stale /planning/trajectory_path: first pose stamp is "
-                    f"{path_lag_s:.3f}s behind latest /insight/vio_100hz "
+                    f"{path_lag_s:.3f}s behind latest {self._pose_topic} "
                     f"(path={path_start_sec:.3f}, odom={self._odom_stamp_sec:.3f}); "
                     "planning_node may be taking too long."
                 )

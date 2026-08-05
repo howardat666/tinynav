@@ -60,7 +60,7 @@ class LooperBridgeNode(Node):
             callback_group=self.misc_group
         )
         self.pose_visual_sub = self.create_subscription(
-            PoseStamped, "/insight/vio_20hz", self.pose_visual_callback,
+            PoseStamped, args.pose_topic, self.pose_visual_callback,
             self.fast_pose_qos, callback_group=self.fast_pose_group
         )
         self.depth_direct_sub = self.create_subscription(
@@ -68,13 +68,13 @@ class LooperBridgeNode(Node):
             self.fast_depth_qos, callback_group=self.fast_depth_group
         )
 
-        # Keep /insight/vio_100hz unbridged; cmd_vel_control consumes it directly.
+        # The 100 Hz pose stays unbridged; cmd_vel_control consumes it directly.
         self.depth_sub = message_filters.Subscriber(
             self, Image, "/camera/camera/depth/image_rect_raw",
             qos_profile=self.sensor_qos, callback_group=self.sync_group
         )
         self.pose_sub = message_filters.Subscriber(
-            self, PoseStamped, "/insight/vio_20hz", callback_group=self.sync_group
+            self, PoseStamped, args.pose_topic, callback_group=self.sync_group
         )
         self.image_sub = message_filters.Subscriber(
             self, Image, "/camera/camera/infra1/image_rect_raw",
@@ -91,8 +91,14 @@ class LooperBridgeNode(Node):
         self.depth_pub = self.create_publisher(Image, "/slam/depth", 10)
         self.disparity_pub_vis = self.create_publisher(Image, "/slam/disparity_vis", 10)
         self.slam_camera_info_pub = self.create_publisher(CameraInfo, "/slam/camera_info", 10)
-        self.camera_info_alias_pub = self.create_publisher(
-            CameraInfo, "/camera/camera/infra2/camera_info", 10
+        # Off unless asked for: see --publish-camera-info-alias. Against a live
+        # Looper this topic already has a publisher carrying the real stereo Tx,
+        # and adding a second one that carries Tx = 0 silently zeroes everyone's
+        # baseline about half the time.
+        self.camera_info_alias_pub = (
+            self.create_publisher(CameraInfo, "/camera/camera/infra2/camera_info", 10)
+            if args.publish_camera_info_alias
+            else None
         )
         self.keyframe_pose_visual_pub = self.create_publisher(
             Odometry, "/slam/keyframe_odom", 10
@@ -245,7 +251,8 @@ class LooperBridgeNode(Node):
 
         self.disparity_pub_vis.publish(disparity_vis_msg)
         self.slam_camera_info_pub.publish(camera_info_out)
-        self.camera_info_alias_pub.publish(camera_info_out)
+        if self.camera_info_alias_pub is not None:
+            self.camera_info_alias_pub.publish(camera_info_out)
 
         if self.should_add_keyframe(T_world_camera, stamp):
             self.keyframe_pose_visual_pub.publish(odom_msg)
@@ -260,6 +267,27 @@ def parse_args():
     parser.add_argument("--keyframe-translation", type=float, default=0.03)
     parser.add_argument("--keyframe-rotation-deg", type=float, default=1.0)
     parser.add_argument("--keyframe-static-interval", type=float, default=1.0)
+    parser.add_argument(
+        "--pose-topic",
+        default="/camera/camera/vio_image",
+        help="Camera pose input. The default is what current Looper firmware "
+             "actually publishes (PoseStamped, measured 19.99 Hz). It used to be "
+             "/insight/vio_20hz, which does not exist on the camera any more. "
+             "Point this at a wheel-odometry pose topic to drive mapping from "
+             "odometry instead of from VIO.",
+    )
+    parser.add_argument(
+        "--publish-camera-info-alias",
+        action="store_true",
+        help="Republish infra1's CameraInfo under the infra2 topic name. OFF by "
+             "default, and it must stay off against a live Looper: the camera "
+             "already publishes /camera/camera/infra2/camera_info carrying the "
+             "stereo Tx (P[3] = -31.009, a 100.2 mm baseline) while infra1's P[3] "
+             "is 0. Two publishers on one topic is last-writer-wins, so the alias "
+             "intermittently zeroes the baseline that build_map_node hands to "
+             "generate_occupancy_map() and that planning_node uses for its local "
+             "map. Enable it only for a source that has no infra2 info at all.",
+    )
     return parser.parse_args()
 
 
