@@ -41,6 +41,14 @@ _DEFAULT_LOG_DIR = os.environ.get('TINYNAV_LOG_DIR', '/userdata/junlinp/logs')
 _REALSENSE_SCRIPT = os.path.join(_TINYNAV_ROOT, 'scripts', 'run_realsense_sensor.sh')
 _VENV_SITE = os.path.join(_TINYNAV_ROOT, '.venv', 'lib', 'python3.10', 'site-packages')
 _MAP_BUILD_DOMAIN_LOOPER = '231'  # isolated domain to avoid live looper topic collision during map build
+class _SensorModeDecided(Exception):
+    """Control-flow marker: the sensor mode was set explicitly, skip probing.
+
+    Raised rather than returned so the shared preview-topic initialisation at the
+    end of _detect_and_init_sensor still runs exactly once, in one place.
+    """
+
+
 _ROS2_NODE_LIST_TIMEOUT = float(os.environ.get('TINYNAV_ROS2_NODE_LIST_TIMEOUT', '8'))
 _ROS2_NODE_LIST_RETRIES = int(os.environ.get('TINYNAV_ROS2_NODE_LIST_RETRIES', '3'))
 
@@ -173,7 +181,17 @@ def _node_argv(rel_path: str) -> list[str]:
 def _bridge_argv(*, for_map_build: bool = False) -> list[str]:
     source = _MAP_ODOM_SOURCE if for_map_build else _ODOM_SOURCE
     pose_topic = _POSE_TOPIC_WHEEL if source == 'wheel' else _POSE_TOPIC_VIO_KEYFRAME
-    return _node_argv('tool/looper_bridge_node.py') + ['--pose-topic', pose_topic]
+    # The synchroniser queue means opposite things in the two modes. Live, it is a
+    # latency budget: a deep queue makes a node that falls behind emit its oldest
+    # matched set, and map_node discards anything older than 0.5 s, so depth 20 on
+    # the X5 produced keyframes 1.49 s old and relocalization never ran at all.
+    # Offline, the bag is paced and latency is meaningless, but a dropped matched
+    # set is a keyframe lost from the map, so depth is what matters.
+    queue_size = '20' if for_map_build else '3'
+    return _node_argv('tool/looper_bridge_node.py') + [
+        '--pose-topic', pose_topic,
+        '--sync-queue-size', queue_size,
+    ]
 
 
 def _planning_argv() -> list[str]:
@@ -566,20 +584,48 @@ class BackendNode(Ros2NodeManager):
         domain = os.environ.get('ROS_DOMAIN_ID', '0')
         self.get_logger().info(f'BackendNode ROS_DOMAIN_ID={domain}')
         try:
+            forced = os.environ.get('TINYNAV_SENSOR_MODE', '').strip().lower()
+            if forced in ('looper', 'realsense'):
+                # An explicit answer beats probing on a machine whose sensor is not
+                # going to change. Guessing wrong is not a degraded mode, it launches
+                # an entirely different pipeline: observed on the X5, a mis-detect
+                # started the realsense driver and perception against a Looper, so no
+                # looper_bridge ran, no /slam keyframes existed, and navigation sat
+                # there relocalizing against nothing with no error anywhere.
+                self._sensor_mode = forced
+                self.get_logger().info(
+                    f'Sensor mode: {forced} (forced by TINYNAV_SENSOR_MODE)'
+                )
+                if self._manage_processes:
+                    _env = os.environ.copy()
+                    _env['PYTHONPATH'] = _VENV_SITE + ':' + _env.get('PYTHONPATH', '')
+                    self._launch_sensor_procs(_env)
+                raise _SensorModeDecided
+
             result = None
             last_err = None
-            for _ in range(max(1, _ROS2_NODE_LIST_RETRIES)):
+            # Retry while /insight_full is *absent*, not only when the command
+            # raises. DDS discovery is asynchronous, and the ros2 daemon caches a
+            # view that has been observed on this board to come back empty while the
+            # firmware was publishing 15 topics -- a successful call proves nothing
+            # about completeness. --no-daemon skips that cache entirely.
+            for attempt in range(max(1, _ROS2_NODE_LIST_RETRIES)):
                 try:
                     result = subprocess.run(
-                        ['ros2', 'node', 'list'],
+                        ['ros2', 'node', 'list', '--no-daemon'],
                         capture_output=True,
                         text=True,
                         timeout=_ROS2_NODE_LIST_TIMEOUT,
                     )
-                    break
+                    if '/insight_full' in result.stdout.splitlines():
+                        break
+                    self.get_logger().info(
+                        f'/insight_full not in node list (attempt {attempt + 1}/'
+                        f'{_ROS2_NODE_LIST_RETRIES}), waiting for discovery'
+                    )
                 except Exception as e:
                     last_err = e
-                    time.sleep(1.0)
+                time.sleep(2.0)
             if result is None:
                 raise RuntimeError(f'ros2 node list failed after retries: {last_err}')
 
@@ -596,6 +642,10 @@ class BackendNode(Ros2NodeManager):
                 _env = os.environ.copy()
                 _env['PYTHONPATH'] = _VENV_SITE + ':' + _env.get('PYTHONPATH', '')
                 self._launch_sensor_procs(_env)
+        except _SensorModeDecided:
+            # The forced path is done; fall through to the shared preview-topic
+            # setup below rather than duplicating it or returning early.
+            pass
         except Exception as e:
             self.get_logger().warn(f'Sensor detection failed: {e}')
             self._sensor_mode = 'unknown'

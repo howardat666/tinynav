@@ -96,6 +96,14 @@ do_start() {
     mkdir -p "${TINYNAV_LOG_DIR}"
     export TINYNAV_ROBOT_TYPE=lekiwi
     export TINYNAV_ACTUATOR=wheel
+    # Pinned for the same reason as the two above. Auto-detection greps `ros2 node
+    # list` for /insight_full, and a successful call proves nothing about
+    # completeness: DDS discovery is asynchronous and this board's ros2 daemon has
+    # been seen returning an empty view while the firmware published 15 topics.
+    # A mis-detect is not a degraded mode -- it starts the realsense driver and
+    # perception against a Looper, so no looper_bridge runs, no /slam keyframes
+    # exist, and navigation relocalizes against nothing with no error anywhere.
+    export TINYNAV_SENSOR_MODE="${TINYNAV_SENSOR_MODE:-looper}"
     export TINYNAV_ODOM_SOURCE="${nav_src}"
     export TINYNAV_MAP_ODOM_SOURCE="${map_src}"
 

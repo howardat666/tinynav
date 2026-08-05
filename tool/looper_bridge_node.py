@@ -103,12 +103,13 @@ class LooperBridgeNode(Node):
         use_exact = self._pose_sync_is_exact()
         if use_exact:
             self.sync = message_filters.TimeSynchronizer(
-                [self.depth_sub, self.pose_sub, self.image_sub], queue_size=20
+                [self.depth_sub, self.pose_sub, self.image_sub],
+                queue_size=args.sync_queue_size,
             )
         else:
             self.sync = message_filters.ApproximateTimeSynchronizer(
                 [self.depth_sub, self.pose_sub, self.image_sub],
-                queue_size=20,
+                queue_size=args.sync_queue_size,
                 slop=args.pose_sync_slop,
             )
         self.sync.registerCallback(self.sync_callback)
@@ -117,7 +118,11 @@ class LooperBridgeNode(Node):
             Odometry, "/slam/odometry_visual", 10
         )
         self.depth_pub = self.create_publisher(Image, "/slam/depth", 10)
-        self.disparity_pub_vis = self.create_publisher(Image, "/slam/disparity_vis", 10)
+        self.disparity_pub_vis = (
+            self.create_publisher(Image, "/slam/disparity_vis", 10)
+            if args.publish_disparity_vis
+            else None
+        )
         self.slam_camera_info_pub = self.create_publisher(CameraInfo, "/slam/camera_info", 10)
         # Off unless asked for: see --publish-camera-info-alias. Against a live
         # Looper this topic already has a publisher carrying the real stereo Tx,
@@ -271,7 +276,6 @@ class LooperBridgeNode(Node):
         odom_msg = self.make_odom_msg(T_world_camera, stamp)
         depth_m = self.decode_depth_meters(depth_msg)
         depth_out = self.build_depth_msg(depth_m, stamp)
-        disparity_vis_msg = self.build_disparity_vis(depth_m, stamp)
 
         stamp_s = self.stamp_to_sec(stamp)
         if self._last_sync_log_stamp is None or stamp_s - self._last_sync_log_stamp >= 1.0:
@@ -290,7 +294,14 @@ class LooperBridgeNode(Node):
         camera_info_out.header.stamp = stamp
         camera_info_out.header.frame_id = "camera"
 
-        self.disparity_pub_vis.publish(disparity_vis_msg)
+        # Built and published only if asked for. It runs on every synced set rather
+        # than every keyframe, and it is pure rviz decoration -- the only reference
+        # to /slam/disparity_vis anywhere is docs/vis.rviz. The work is a masked
+        # reciprocal over 544x640, a colour map, and serialising ~1 MB into DDS at
+        # up to 5 Hz, all of it inside the callback whose latency decides whether
+        # map_node accepts the keyframe at all.
+        if self.disparity_pub_vis is not None:
+            self.disparity_pub_vis.publish(self.build_disparity_vis(depth_m, stamp))
         self.slam_camera_info_pub.publish(camera_info_out)
         if self.camera_info_alias_pub is not None:
             self.camera_info_alias_pub.publish(camera_info_out)
@@ -343,6 +354,34 @@ def parse_args():
              "mapping speed 60 ms is 9 mm of position and 1.4 deg of yaw, still "
              "under the 3 cm keyframe threshold. Ignored on the VIO path, which is "
              "matched by exact stamp.",
+    )
+    parser.add_argument(
+        "--publish-disparity-vis",
+        action="store_true",
+        help="Publish the colour-mapped inverse-depth image on /slam/disparity_vis. "
+             "Off by default because nothing in the stack subscribes to it -- the only "
+             "reference is docs/vis.rviz -- and it is not cheap: a masked reciprocal "
+             "over 544x640, an OpenCV colour map, and ~1 MB serialised into DDS, on "
+             "every synced set rather than every keyframe. Turn it on when driving "
+             "rviz by hand, and expect the keyframe latency to rise.",
+    )
+    parser.add_argument(
+        "--sync-queue-size",
+        type=int,
+        default=3,
+        help="Depth of the keyframe synchroniser queue. This is a latency knob, not "
+             "a throughput one, and the right value depends on whether the output is "
+             "consumed live. A deep queue turns a CPU shortfall into unbounded delay: "
+             "message_filters delivers matched sets in order, so a node that falls "
+             "behind keeps emitting the *oldest* set it still holds. Measured on the "
+             "X5 with queue_size 20 and the board at load 14: /camera/camera/vio_image "
+             "arrived 40 ms old, and /slam/keyframe_image left this node 1.49 s old. "
+             "map_node drops keyframes older than max_keyframe_age_s (0.5 s), so every "
+             "single one was discarded and relocalization was never attempted once -- a "
+             "total failure that looked like a relocalization accuracy problem. "
+             "3 bounds the added delay to about two depth periods. Use a deep queue "
+             "only for an offline map build, where the bag is paced, latency is "
+             "meaningless, and dropping a matched set loses a keyframe for good.",
     )
     parser.add_argument(
         "--publish-camera-info-alias",
