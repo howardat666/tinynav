@@ -543,8 +543,28 @@ class TinyNavDB():
 
 class BagPlayer(Node):
     def __init__(self, bag_uri: str, storage_id: str = "sqlite3", serialization_format: str = "cdr",
+                 play_rate: float = 0.0,
     ):
         super().__init__("rosbag_player")
+
+        # play_rate 0 means "as fast as the reader goes", which is what this player
+        # has always done and what a PC wants: pacing can only ever slow down a
+        # build whose consumer already runs faster than real time.
+        #
+        # It is the wrong default on a slow machine. The consumer sits one process
+        # away behind DDS, so the self-throttling of the publish-one-then-spin-once
+        # loop below never reaches it, and frames pile up in build_map_node's
+        # ApproximateTimeSynchronizer, whose queue holds three full-resolution
+        # images per slot. Measured on the X5 inside the Looper camera: an unpaced
+        # build of a 71 s bag was OOM-killed after 59 s at 0.5% progress, peak RSS
+        # 645 MiB against 1307 MiB of RAM with no swap.
+        #
+        # So pass a positive rate on any machine that cannot outrun the bag.
+        if play_rate < 0.0:
+            raise ValueError(f"play_rate must be >= 0 (0 disables pacing), got {play_rate}")
+        self.play_rate = float(play_rate)
+        self._playback_start_timestamp_ns = None
+        self._playback_start_wall_time_s = None
 
         self._storage_options = StorageOptions(uri=bag_uri, storage_id="sqlite3",)
         self._converter_options = ConverterOptions(input_serialization_format="cdr", output_serialization_format="cdr",)
@@ -630,6 +650,24 @@ class BagPlayer(Node):
         percent = 100.0 * (timestamp_ns - self.start_timestamp_ns) / (self.end_timestamp_ns - self.start_timestamp_ns)
         self._publish_percent(percent)
 
+    def _pace_to_timestamp(self, timestamp_ns: int) -> None:
+        """Sleep so that bag time advances at most ``play_rate`` x wall time.
+
+        Never speeds anything up: if the consumer is already behind, the target
+        wall time is in the past and this returns immediately.
+        """
+        if self.play_rate <= 0.0:
+            return
+        if self._playback_start_timestamp_ns is None:
+            self._playback_start_timestamp_ns = timestamp_ns
+            self._playback_start_wall_time_s = time.monotonic()
+            return
+        elapsed_bag_s = (timestamp_ns - self._playback_start_timestamp_ns) * 1e-9
+        target_wall_s = self._playback_start_wall_time_s + elapsed_bag_s / self.play_rate
+        sleep_s = target_wall_s - time.monotonic()
+        if sleep_s > 0:
+            time.sleep(sleep_s)
+
     def play_next(self) -> bool:
         """
         Publish the next message from the bag.
@@ -639,6 +677,7 @@ class BagPlayer(Node):
             return False
 
         topic, serialized_msg, timestamp_ns = self._reader.read_next()
+        self._pace_to_timestamp(int(timestamp_ns))
         self._publish_percent_from_timestamp(int(timestamp_ns))
 
         # Find publisher + msg type for this topic
@@ -675,10 +714,20 @@ class BuildMapNode(Node):
         dbow3_vocabulary_path: str | None = None,
         verbose_timer: bool = True,
         global_frames_ratio: float = 1.1,
+        sync_queue_size: int = 200,
+        publish_visualization: bool = True,
     ):
         super().__init__('build_map_node')
         if global_frames_ratio < 1.0:
             raise ValueError(f"global_frames_ratio must be >= 1.0, got {global_frames_ratio}")
+        if sync_queue_size < 1:
+            raise ValueError(f"sync_queue_size must be >= 1, got {sync_queue_size}")
+        # Everything the local pointcloud and the trajectory Path are for is rviz.
+        # Nothing in the saved map depends on either, and on the X5 they were the
+        # two most expensive stages of the first keyframe by a wide margin
+        # (8538 ms and 4055 ms against 719 ms for all the real work combined), so a
+        # headless build should not pay for them.
+        self.publish_visualization = publish_visualization
         self.verbose_timer = verbose_timer
         self.logger = logging.getLogger(__name__)
         self.timer_logger = self.logger.info if verbose_timer else self.logger.debug
@@ -716,8 +765,16 @@ class BuildMapNode(Node):
         # Add stop signal subscription and save finished publisher
         self.mapping_stop_sub = self.create_subscription(Bool, '/benchmark/stop', self.mapping_stop_callback, 10)
         self.mapping_save_finished_pub = self.create_publisher(Bool, '/benchmark/data_saved', 10)
-        # Keep sync queue bounded to reduce memory spikes/OOM risk on Jetson during map building.
-        self.ts = ApproximateTimeSynchronizer([self.keyframe_image_sub, self.keyframe_odom_sub, self.depth_sub, self.rgb_image_sub], 200, 0.02)
+        # Keep the sync queue bounded to reduce memory spikes / OOM risk during map
+        # building. This used to say that while holding 200, which bounds nothing:
+        # each slot holds a keyframe image, a depth image and an RGB image, so at
+        # 544x640 that is roughly 1.4 MB per slot and 280 MB of headroom handed to a
+        # producer that, unpaced, will use all of it. On the X5 (1307 MB, no swap)
+        # that alone is the difference between a build and an OOM kill.
+        self.ts = ApproximateTimeSynchronizer(
+            [self.keyframe_image_sub, self.keyframe_odom_sub, self.depth_sub, self.rgb_image_sub],
+            sync_queue_size, 0.02,
+        )
         self.ts.registerCallback(self.keyframe_callback)
 
         self.K = None
@@ -909,12 +966,13 @@ class BuildMapNode(Node):
 
         self.maybe_run_global_refinement()
 
-        with self.stage_timer.timed("publish_local_pointcloud"):
-            cloud = depth_to_cloud(depth, self.K, 30, 3)
-            self.publish_local_map(cloud, 'camera_'+str(keyframe_image_timestamp))
+        if self.publish_visualization:
+            with self.stage_timer.timed("publish_local_pointcloud"):
+                cloud = depth_to_cloud(depth, self.K, 30, 3)
+                self.publish_local_map(cloud, 'camera_'+str(keyframe_image_timestamp))
 
-        with self.stage_timer.timed("pose_graph_trajectory_publish"):
-            self.pose_graph_trajectory_publish(keyframe_image_timestamp)
+            with self.stage_timer.timed("pose_graph_trajectory_publish"):
+                self.pose_graph_trajectory_publish(keyframe_image_timestamp)
         self.processed_keyframes += 1
         if self.processed_keyframes % self.db_sync_every == 0:
             self.db.sync()
@@ -1168,6 +1226,26 @@ def main(args=None):
         default=1.1,
         help="Minimum keyframe growth ratio before online pose graph solve and TF republish.",
     )
+    parser.add_argument(
+        "--play-rate", type=float, default=0.0,
+        help="Bag playback speed as a multiple of real time. 0, the default, is "
+             "unthrottled -- correct on a machine whose consumer outruns the bag. "
+             "Pass a positive value on a slow one: unpaced playback fills the "
+             "keyframe sync queue with full-resolution images and OOM-killed a "
+             "build on the X5 at 0.5%% progress.",
+    )
+    parser.add_argument(
+        "--sync-queue-size", type=int, default=200,
+        help="Keyframe synchroniser queue depth. Each slot holds three "
+             "full-resolution images, about 1.4 MB at 544x640, so the default 200 "
+             "is 280 MB of headroom. Use ~20 on a memory-constrained board.",
+    )
+    parser.add_argument(
+        "--no-visualization", dest="publish_visualization", action="store_false",
+        help="Skip the rviz-only local pointcloud and trajectory publishes. Nothing "
+             "in the saved map depends on them and they dominated the per-keyframe "
+             "cost on the X5.",
+    )
     parser.add_argument("--loop-closure-mode", type=str, default="embedding", choices=["embedding", "bow"])
     parser.add_argument("--loop-closure-use-bow", action="store_true", help="Use ORB+BF and DBoW3 for loop closure")
     parser.add_argument(
@@ -1196,7 +1274,7 @@ def main(args=None):
         embedding_extractor = Dinov2TRT()
 
     exec_ = SingleThreadedExecutor()
-    player_node = BagPlayer(parsed_args.bag_file)
+    player_node = BagPlayer(parsed_args.bag_file, play_rate=parsed_args.play_rate)
     map_node = BuildMapNode(
         parsed_args.map_save_path,
         extractor=extractor,
@@ -1207,6 +1285,8 @@ def main(args=None):
         dbow3_vocabulary_path=parsed_args.dbow3_vocabulary_path,
         verbose_timer=parsed_args.verbose_timer,
         global_frames_ratio=parsed_args.global_frames_ratio,
+        sync_queue_size=parsed_args.sync_queue_size,
+        publish_visualization=parsed_args.publish_visualization,
     )
     image_transports_node = ImageTransportsNode()
     exec_.add_node(player_node)

@@ -11,11 +11,27 @@
 
 三组只差环境变量，代码路径完全相同。
 
-## 为什么走 web app 而不是 tmux 脚本
+## 板上环境的既有事实（2026-08-05 实测）
 
-板上**没有 tmux 也没有 screen**，`scripts/run_*.sh` 在 X5 上根本跑不起来。
-`app/backend/node_manager.py` 启动的是同一批进程，而且带进程监管、bag 录制、
-建图和遥控的 HTTP 接口。所以板上的操作入口是 app。
+X5 是上位机，建图和导航都在板上跑，电脑只当浏览器。板上现状：
+
+| | 状态 |
+| --- | --- |
+| tmux / screen | **都没有** —— `scripts/run_*.sh` 在板上根本跑不起来 |
+| ROS 2 Humble | 有，但必须 `. /userdata/x5/env.sh`，否则 `rosbag2_py` 因缺 `libtinyxml2.so.9` 直接坏掉（`ros2 bag record` 报 MISSING） |
+| Python 依赖 | numpy 1.26.1 / scipy 1.15.3 / numba 0.61.2 / cv2 4.11 / einops / codetiming / tqdm / pyserial / rclpy / rosbag2_py / pydbow3 / onnxruntime 1.18.0 / **av 17.1.0** —— 全齐 |
+| decord | 无 aarch64 wheel，用 `pylibs/decord.py` 那个真实现顶（PyAV 后端） |
+| 外网 | **没有** —— pip 装不了东西，wheel 得从 PC 拷 |
+| `app/` | **板上没有**，fastapi/uvicorn/psutil 也没装 → web app 目前跑不起来 |
+| 代码同步 | 手工拷贝，会静默变旧。用 `tool/x5_board/sync_to_board.sh`，它会回读 md5 对比 |
+| `/userdata` | 53 G，剩 37 G |
+| 内存 | total 1307 MB，**无 swap**。`insight_full` 占 ~212 MB |
+
+所以 **web app 是目标，但不是今天的路径**：录制和建图用
+`tool/x5_board/map_record.sh` 直接跑（它用 `setsid` + nohup + 日志代替 tmux 的分屏）。
+
+> **词典是生死问题。** `MemTotal` 只有 1307 MB，默认 `ORBvoc` 要 1735 MB，必然 OOM。
+> 一律用 `/userdata/x5/voc/voc_office_k10L5.dbow3`（峰值 407 MB）。
 
 ## 为什么只开一趟车
 
@@ -79,6 +95,10 @@ curl -s localhost:8000/device/platform
 
 ### 2. 录建图 bag（只录这一次）
 
+实测码率（71 秒静止预演，`--sensor looper`）：**14.3 MB/s = 857 MB/min**，eMMC
+完全跟得上，**零丢帧** —— infra1 20.02 Hz、depth 5.01 Hz、vio_image 20.01 Hz、
+vio_100hz 99.0 Hz、color/compressed 30.0 Hz、imu 400 Hz。5 分钟约 4.3 GB。
+
 在 app 里开始录制（或 `POST /bag/start`），然后**驱动**着开一圈。遥控二选一：
 
 - app 的遥控（发 `/cmd_vel`，`wheel_odometry_node` 消费）
@@ -99,6 +119,43 @@ ros2 bag info <bag> | grep -E "vio_image|wheel/camera_pose"
 `/wheel/camera_pose` 缺了就说明录制时 `wheel_odometry_node` 没跑，方案 c 做不了。
 
 ### 3. 建 VIO 地图（方案 a 和 b 共用）
+
+⚠️ **板上建图必须带三个参数，否则会被 OOM 杀掉。** 2026-08-05 实测：不带参数跑一个
+71 秒的 bag，**59 秒后 rc=137 被 OOM 杀死，只建到第 1 个关键帧**，峰值 RSS 645 MiB
+（板子 1307 MiB、无 swap），MemAvailable 掉到 103 MiB。
+
+机理不是「模型太大」，是**生产快于消费**：
+
+- `BagPlayer` 原本**完全不节流**，`play_next()` 有多快读多快发。同进程内
+  `publish 一条 → spin_once` 看似自节流，但消费者 `build_map_node` 在
+  **另一个进程**、隔着 DDS，节流传不过去。
+- `build_map_node` 的 `ApproximateTimeSynchronizer` 队列是 **200**，每个 slot 装
+  关键帧图 + 深度 + RGB 三张全分辨率图 ≈ 1.4 MB → **280 MB 的敞口**。那行代码的
+  注释写着「Keep sync queue bounded to reduce OOM risk on Jetson」，值却是 200。
+
+另外第一个关键帧里 **12.6 秒是纯 rviz 可视化**（`publish_local_pointcloud` 8538 ms
++ `pose_graph_trajectory_publish` 4055 ms），而真正干活的特征提取 + 存图 + embedding
+合计只有 719 ms。板上无头运行，这些一分钱都不该花。
+
+所以板上一律这样跑：
+
+```bash
+. /userdata/x5/env.sh
+cd /userdata/x5/tinynav
+
+# 1) bridge（决定用哪个位姿源建图）
+python3 tool/looper_bridge_node.py --pose-topic /camera/camera/vio_image &
+
+# 2) 建图
+python3 tinynav/core/build_map_node.py \
+    --bag_file /userdata/x5/bags/<NAME>/<NAME>_0.db3 \
+    --map_save_path /userdata/x5/maps/<NAME>_vio \
+    --play-rate 1.0 --sync-queue-size 20 --no-visualization \
+    --loop-closure-mode bow --loop-closure-use-bow \
+    --dbow3-vocabulary-path /userdata/x5/voc/voc_office_k10L5.dbow3
+```
+
+方案 c 只改两处：`--pose-topic /wheel/camera_pose` 和 `--map_save_path ..._odom`。
 
 `TINYNAV_MAP_ODOM_SOURCE=vio` 时，在 app 里触发建图。建图跑在隔离的
 `ROS_DOMAIN_ID=231`，不会和相机的实时话题打架。

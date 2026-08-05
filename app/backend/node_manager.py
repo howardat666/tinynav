@@ -1225,9 +1225,13 @@ class BackendNode(Ros2NodeManager):
             shutil.rmtree(self.bag_path)
 
         script = os.path.join(_TINYNAV_ROOT, 'scripts', 'run_rosbag_record.sh')
+        # The topic set differs by sensor: the RealSense path records both infra
+        # images because perception_node runs stereo itself, while the Looper path
+        # takes depth from the camera and records the wheel pose instead.
         self.processes['bag_record'] = self._launch_proc(
             'bag_record',
-            ['bash', script, '--output', self.bag_path],
+            ['bash', script, '--output', self.bag_path,
+             '--sensor', 'looper' if self._sensor_mode == 'looper' else 'realsense'],
         )
 
     def cmd_bag_start(self):
