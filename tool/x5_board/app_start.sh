@@ -89,6 +89,11 @@ do_start() {
     load_env
 
     export TINYNAV_DB_PATH="${DB_PATH}"
+    # node_manager's default log directory is /userdata/junlinp/logs -- a path from
+    # someone else's machine that happens to be writable here, which is worse than
+    # a broken one because the logs go somewhere nobody thinks to look.
+    export TINYNAV_LOG_DIR="${TINYNAV_LOG_DIR:-${LOG_DIR}/nodes}"
+    mkdir -p "${TINYNAV_LOG_DIR}"
     export TINYNAV_ROBOT_TYPE=lekiwi
     export TINYNAV_ACTUATOR=wheel
     export TINYNAV_ODOM_SOURCE="${nav_src}"
@@ -120,6 +125,7 @@ do_start() {
         echo "board uptime  : $(cut -d' ' -f1 /proc/uptime)s"
         echo "robot/actuator: ${TINYNAV_ROBOT_TYPE} / ${TINYNAV_ACTUATOR}"
         echo "db            : ${TINYNAV_DB_PATH}"
+        echo "node logs     : ${TINYNAV_LOG_DIR}"
         echo "map vocab     : ${TINYNAV_DBOW3_VOCAB}"
         echo "map build     : rate=${TINYNAV_MAP_PLAY_RATE} queue=${TINYNAV_MAP_SYNC_QUEUE} vis=${TINYNAV_MAP_VISUALIZATION}"
         echo "=============================================================="

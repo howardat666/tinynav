@@ -1194,7 +1194,10 @@ class BackendNode(Ros2NodeManager):
                 '--tinynav_map_path', self.map_path,
                 '--loop-closure-mode', 'bow',
                 '--loop-closure-use-bow',
-                '--dbow3-vocabulary-path', os.path.join(_TINYNAV_ROOT, 'docs/Vocabulary/ORBvoc.txt'),
+                # Same vocabulary as the build, and for the same reason: relocalization
+                # has to query the descriptors the map was indexed with, and ORBvoc.txt
+                # would OOM the board here exactly as it does there.
+                '--dbow3-vocabulary-path', _DBOW3_VOCAB,
             ],
             env=_env,
         )
