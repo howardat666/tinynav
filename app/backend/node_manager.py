@@ -38,6 +38,11 @@ _TINYNAV_ROOT = os.environ.get('TINYNAV_ROOT', _DEFAULT_TINYNAV_ROOT)
 _LOCAL_PREFIX = os.environ.get('LOCAL_PREFIX', '/userdata/local')
 _DEVICE_VENV = os.environ.get('TINYNAV_VENV', '/userdata/junlinp/venv')
 _DEFAULT_LOG_DIR = os.environ.get('TINYNAV_LOG_DIR', '/userdata/junlinp/logs')
+# Fallback only. tool/x5_board/env.sh exports NUMBA_CACHE_DIR and its value wins; this
+# exists so a backend started by a launcher that does not source env.sh still gets a
+# warm JIT cache. Matches env.sh's path so the two share one cache rather than each
+# paying the cold compile.
+_NUMBA_CACHE_DIR = os.environ.get('TINYNAV_NUMBA_CACHE_DIR', '/userdata/x5/cache/numba')
 _REALSENSE_SCRIPT = os.path.join(_TINYNAV_ROOT, 'scripts', 'run_realsense_sensor.sh')
 _VENV_SITE = os.path.join(_TINYNAV_ROOT, '.venv', 'lib', 'python3.10', 'site-packages')
 _MAP_BUILD_DOMAIN_LOOPER = '231'  # isolated domain to avoid live looper topic collision during map build
@@ -133,8 +138,13 @@ _MAP_PLAY_RATE = os.environ.get('TINYNAV_MAP_PLAY_RATE', '')
 # 200 default reserves 280 MB the board does not have.
 _MAP_SYNC_QUEUE = os.environ.get('TINYNAV_MAP_SYNC_QUEUE', '')
 # The rviz-only publishes dominated per-keyframe cost on the board: 13351 ms fell
-# to 321-774 ms with them off, and nothing in the saved map depends on them.
-_MAP_VISUALIZATION = os.environ.get('TINYNAV_MAP_VISUALIZATION', '1') == '1'
+# to 321-774 ms with them off, and nothing in the saved map depends on them. Default
+# off, because a 17-40x slowdown is not a sensible thing to opt out of -- tool/x5_board/
+# app_start.sh pinned it to 0 for exactly that reason, which left the two supported
+# launch paths behaving differently. The cost is quadratic, not just large:
+# pose_graph_trajectory_publish sends every pose so far on every keyframe, ~165600
+# PoseStamped over a 575-keyframe build.
+_MAP_VISUALIZATION = os.environ.get('TINYNAV_MAP_VISUALIZATION', '0') == '1'
 
 
 def _build_map_argv(map_save_path: str, bag_file: str) -> list[str]:
@@ -310,8 +320,13 @@ class BackendNode(Ros2NodeManager):
             )
             self.create_subscription(Path, '/planning/trajectory_path', self._on_trajectory_path, 1)
             self.create_subscription(Path, '/mapping/global_plan', self._on_global_plan, 1)
+            # TRANSIENT_LOCAL to match map_node's publisher. The nav target is state and
+            # is published once per POI transition, so a volatile subscriber that
+            # reconnects -- a backend restart, or this node coming up after map_node --
+            # reports "no target" for a robot that has one.
             self.create_subscription(
-                Odometry, '/control/target_pose', self._on_nav_target_pose, 1
+                Odometry, '/control/target_pose', self._on_nav_target_pose,
+                QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
             )
             self.create_subscription(PointCloud, '/planning/footprint', self._on_footprint, 1)
             self.create_subscription(PointCloud2, '/planning/occupied_voxels', self._on_occupied_voxels, 1)
@@ -371,6 +386,8 @@ class BackendNode(Ros2NodeManager):
 
         # Nav nodes (map_node + cmd_vel_control) managed independently of _stop_all
         self._nav_nodes_running: bool = False
+        # Latch so the "nav node died" error is logged once, not at the UI poll rate.
+        self._reported_dead_procs: bool = False
         self._map_node_proc: subprocess.Popen | None = None
         self._cmd_vel_proc: subprocess.Popen | None = None
 
@@ -728,7 +745,11 @@ class BackendNode(Ros2NodeManager):
                 self.get_logger().warn(f'Failed to destroy preview subscription {topic}: {e}')
 
     def _on_compressed_image(self, msg: CompressedImage, topic: str):
-        now = time.time()
+        # monotonic, not time.time(): this board has no RTC, so the wall clock starts
+        # near zero every boot and jumps forward when sync_board_time.sh runs. A
+        # backward jump makes this delta negative and freezes the preview stream until
+        # the wall clock catches back up to the stored timestamp.
+        now = time.monotonic()
         if now - self._last_frame_time.get(topic, 0.0) < _PREVIEW_MIN_INTERVAL:
             return
         self._last_frame_time[topic] = now
@@ -742,7 +763,7 @@ class BackendNode(Ros2NodeManager):
                 pass
 
     def _on_image(self, msg: Image, topic: str):
-        now = time.time()
+        now = time.monotonic()  # see _on_compressed_image: no RTC on this board
         if now - self._last_frame_time.get(topic, 0.0) < _PREVIEW_MIN_INTERVAL:
             return
         self._last_frame_time[topic] = now
@@ -751,9 +772,17 @@ class BackendNode(Ros2NodeManager):
             if msg.encoding == '32FC1':
                 arr = np.frombuffer(msg.data, dtype=np.float32).reshape(msg.height, msg.width)
                 arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-                valid = arr[arr > 0]
-                if valid.size > 0:
-                    p95 = float(np.percentile(valid, 95))
+                # The 95th percentile is a normalisation constant for a 5 fps preview,
+                # so it does not need every pixel. Taken over the full 544x640 it was
+                # a compacting copy of up to 348k floats followed by a full sort --
+                # the most expensive line in this path, and the main reason uvicorn
+                # goes from 36% to 103% CPU while a browser holds the depth preview
+                # open. Every 4th pixel in each axis is 1/16 the work and moves the
+                # constant by far less than the JET colormap can show.
+                sample = arr[::4, ::4]
+                sample = sample[sample > 0]
+                if sample.size > 0:
+                    p95 = float(np.percentile(sample, 95))
                     arr = np.clip(arr / (p95 + 1e-6), 0.0, 1.0)
                 arr = (arr * 255).astype(np.uint8)
                 arr = cv2.applyColorMap(arr, cv2.COLORMAP_JET)
@@ -954,6 +983,45 @@ class BackendNode(Ros2NodeManager):
             'activeBagPath': active_bag,
         }
 
+    def _report_dead_nav_procs(self):
+        """Log nav children that exited, and stop claiming navigation is running.
+
+        There is no supervision anywhere in this class: _launch_sensor_procs is the only
+        thing that ever (re)starts a node, and its only callers are sensor detection and
+        the post-map-build restart. A planning_node that dies mid-navigation therefore
+        stays dead -- and navNodesRunning is read off the _nav_nodes_running *flag*, not
+        off poll(), so the UI kept reporting a navigating robot with no planner. That is
+        the same class of silent failure as the lost POI: everything looks fine and
+        nothing moves.
+
+        Detection and honest reporting only. Relaunching a nav node by itself would put
+        the robot back under control of a stack whose state the operator cannot see, and
+        that is their call to make, not this function's.
+
+        Reads the dedicated attributes rather than self.processes: that dict only ever
+        holds bag_record, the sensor source node and build_map, so the nav children are
+        not in it. recover_stale_error_state iterates the same dict, which is part of
+        why nothing noticed a dead planner.
+        """
+        dead = []
+        for name, proc in (
+            ('map_node', self._map_node_proc),
+            ('planning', self._planning_proc),
+            ('cmd_vel_control', self._cmd_vel_proc),
+            ('looper_bridge', self._looper_bridge_proc),
+        ):
+            if proc is not None and proc.poll() is not None:
+                dead.append(f'{name}(rc={proc.returncode})')
+        if not dead:
+            return False
+        if not self._reported_dead_procs:
+            self._reported_dead_procs = True
+            self.get_logger().error(
+                'nav nodes exited and nothing restarts them: ' + ', '.join(dead)
+                + ' -- navigation is not running; restart it from the UI'
+            )
+        return True
+
     def get_status(self) -> dict:
         self.recover_stale_error_state()
         with self._lock:
@@ -962,6 +1030,8 @@ class BackendNode(Ros2NodeManager):
             battery = self._battery
             nav_nodes = self._nav_nodes_running
             nav_paused = self._nav_paused
+        if nav_nodes and self._report_dead_nav_procs():
+            nav_nodes = False
         bag_recording = self.is_bag_recording()
         bag_files_exist = self.active_bag_path is not None
         map_files_exist = os.path.exists(os.path.join(self.map_path, 'occupancy_grid.npy'))
@@ -1043,6 +1113,16 @@ class BackendNode(Ros2NodeManager):
         )
         run_env['CMAKE_PREFIX_PATH'] = f"{_LOCAL_PREFIX}:" + run_env.get('CMAKE_PREFIX_PATH', '')
         run_env['PKG_CONFIG_PATH'] = f"{_LOCAL_PREFIX}/lib/pkgconfig:" + run_env.get('PKG_CONFIG_PATH', '')
+        # Every child node JITs numba kernels at import; without a cache directory they
+        # recompile from cold every launch, measured at 66.1 s of startup against 34.2 s
+        # with the cache warm. setdefault rather than assignment because tool/x5_board/
+        # env.sh already exports this, and that value should win -- but run_backend.sh
+        # does not source env.sh, so relying on the launcher meant the two supported
+        # launch paths differed by 32 seconds with nothing to indicate why. Numba writes
+        # .nbi/.nbc here rather than into __pycache__, so an empty __pycache__ is not
+        # evidence either way.
+        run_env.setdefault('NUMBA_CACHE_DIR', _NUMBA_CACHE_DIR)
+        os.makedirs(run_env['NUMBA_CACHE_DIR'], exist_ok=True)
         return run_env
 
     def _launch_wheel_odometry_if_configured(self, env: dict):
@@ -1274,6 +1354,7 @@ class BackendNode(Ros2NodeManager):
             self._cmd_vel_proc = None
         with self._lock:
             self._nav_nodes_running = True
+            self._reported_dead_procs = False
         self.get_logger().info('Nav nodes started')
 
     def cmd_stop_nav_nodes(self):
@@ -1314,7 +1395,10 @@ class BackendNode(Ros2NodeManager):
              '--tinynav_map_path', self.map_path,
              '--loop-closure-mode', 'bow',
              '--loop-closure-use-bow',
-             '--dbow3-vocabulary-path', os.path.join(_TINYNAV_ROOT, 'docs/Vocabulary/ORBvoc.txt')],
+             # _DBOW3_VOCAB, not a literal. cmd_start_nav_nodes uses it; this path did
+             # not, so a nav *restart* loaded ORBvoc.txt -- 1735 MB on a 1307 MB board --
+             # and map_node was OOM-killed where a nav *start* had worked.
+             '--dbow3-vocabulary-path', _DBOW3_VOCAB],
             env=_env,
         )
         if _ENABLE_CMD_VEL_NODE:
@@ -1325,6 +1409,7 @@ class BackendNode(Ros2NodeManager):
             self._cmd_vel_proc = None
         with self._lock:
             self._nav_nodes_running = True
+            self._reported_dead_procs = False
             self._localized = False
             self._map_pose = None
             self._trajectory = []

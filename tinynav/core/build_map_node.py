@@ -702,6 +702,14 @@ class BagPlayer(Node):
 
         return True
 
+# Loop closure is disabled on this branch: every call site into it is commented out
+# inside keyframe_callback. This constant exists so the disabling is stated in one
+# place rather than inferred from three comments, and so the expensive object it
+# guards is not built for code that cannot run. Flip it back together with those call
+# sites, never on its own.
+_LOOP_CLOSURE_ENABLED = os.environ.get('TINYNAV_MAP_LOOP_CLOSURE', '0') == '1'
+
+
 class BuildMapNode(Node):
     def __init__(
         self,
@@ -794,6 +802,18 @@ class BuildMapNode(Node):
 
         self.loop_similarity_threshold = 0.90
         self.loop_top_k = 1
+        # Only built when loop closure is actually reachable. Every call site is
+        # commented out ("temp disabled" at the add_timestamp and
+        # find_loop_and_pose_graph lines below), so on this branch the object had zero
+        # callers -- but constructing it in bow mode still ran DBoW3Engine's
+        # load_vocabulary + Database.setVocabulary, which the engine's own docstring
+        # measures at ~300 MiB resident, held for the entire build. On a 1307 MB board
+        # that is 23% of memory reserved for nothing, and it is what forced the
+        # --play-rate and --sync-queue-size limits that keep the build off the OOM
+        # killer. Re-enabling loop closure means flipping this flag *and* uncommenting
+        # those call sites; leaving it None makes a half-done re-enable fail loudly
+        # instead of silently skipping loop closure.
+        self.loop_closure_enabled = _LOOP_CLOSURE_ENABLED
         self.loop_closure = LoopClosure(
             db=self.db,
             timestamps=[],
@@ -801,7 +821,7 @@ class BuildMapNode(Node):
             dbow3_vocabulary_path=self.dbow3_vocabulary_path,
             embedding_similarity_threshold=self.loop_similarity_threshold,
             embedding_top_k=self.loop_top_k,
-        )
+        ) if self.loop_closure_enabled else None
 
         self.map_save_path = map_save_path
         self._save_completed = False
@@ -1218,7 +1238,8 @@ def main(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--bag_file", type=str, default="tinynav_db")
     parser.add_argument("--map_save_path", type=str, default="tinynav_db")
-    parser.add_argument("--verbose_timer", action="store_true", default=True, help="Enable verbose timer output")
+    # Default off, same reason as map_node: print() per keyframe onto the board's eMMC.
+    parser.add_argument("--verbose_timer", action="store_true", default=False, help="Enable verbose timer output")
     parser.add_argument("--no_verbose_timer", dest="verbose_timer", action="store_false", help="Disable verbose timer output")
     parser.add_argument(
         "--global-frames-ratio",

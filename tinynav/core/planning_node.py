@@ -1,3 +1,5 @@
+import os
+
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
@@ -9,6 +11,7 @@ from scipy.ndimage import distance_transform_edt, binary_dilation
 from dataclasses import dataclass
 from numba import njit
 import message_filters
+from rclpy.qos import DurabilityPolicy, QoSProfile
 from rclpy.time import Time
 from rclpy.duration import Duration
 from sensor_msgs.msg import PointCloud2, PointCloud
@@ -37,6 +40,24 @@ __all__ = [
     "RobotConfig",
     "robot_config",
 ]
+
+# codetiming's default logger is the builtin print, and node_manager._launch_proc
+# redirects stdout into an unrotated file on the board's eMMC. Eight of these fire per
+# planning cycle -- ~40 lines/s at the 5 Hz depth rate -- unconditionally, with no level
+# check and no way to turn them off, inside the loop that drives obstacle avoidance.
+# logger=None makes codetiming record into Timer.timers without emitting anything, so
+# the measurements survive and only the printing goes away.
+_TIMER_LOGGER = print if os.environ.get('TINYNAV_VERBOSE_TIMER', '0') == '1' else None
+
+# /planning/occupied_voxels_with_esdf has no subscriber anywhere in the repo -- the only
+# reference is docs/vis.rviz. Producing it is not free: a 100x100 meshgrid, an
+# applyColorMap over 10000 entries, a structured array and a ~160 KB PointCloud2, every
+# cycle, for the whole ground plane regardless of occupancy. Same reasoning and same
+# default as --publish-disparity-vis in looper_bridge_node. Its sibling
+# /planning/occupied_voxels stays unconditional: node_manager subscribes to that one for
+# the web UI.
+_PUBLISH_ESDF_CLOUD = os.environ.get('TINYNAV_PUBLISH_ESDF_CLOUD', '0') == '1'
+_PUBLISH_OBSTACLE_MASK = os.environ.get('TINYNAV_PUBLISH_OBSTACLE_MASK', '0') == '1'
 
 # === Helper functions ===
 @njit(cache=True)
@@ -361,8 +382,23 @@ class PlanningNode(Node):
         self.get_logger().info(f"planning pose source: {pose_topic}")
         self.pose_sub = message_filters.Subscriber(self, PoseStamped, pose_topic)
 
-        self.ts = message_filters.TimeSynchronizer([self.depth_sub, self.pose_sub], queue_size=30)
+        # Queue depth is a latency budget, not a completeness setting. message_filters
+        # delivers matched sets strictly in order, so a node that falls behind keeps
+        # emitting the *oldest* set it holds: 30 slots at the 5 Hz depth rate this
+        # board sustains is 6 seconds of backlog, and this callback is the only
+        # collision check on the trajectory that reaches the wheels. The same mistake
+        # cost 1.49 s of keyframe age in looper_bridge_node -- see its note at the
+        # sync-queue argument. 3 keeps the matcher's memory shorter than the reflex
+        # it feeds.
+        self.ts = message_filters.TimeSynchronizer([self.depth_sub, self.pose_sub], queue_size=3)
         self.ts.registerCallback(self.sync_callback)
+        # A shallow queue bounds how *much* staleness can accumulate; it cannot promise
+        # the set in hand is fresh. Planning on old geometry is worse than not planning:
+        # the robot reacts to obstacles that have moved and misses ones that have not.
+        # map_node guards its keyframes the same way (max_keyframe_age_s); planning had
+        # no age check at all.
+        self.max_input_age_s = 0.5
+        self._last_stale_log_ns = 0
         self.camerainfo_sub = self.create_subscription(CameraInfo, '/camera/camera/infra2/camera_info', self.info_callback, 10)
 
         self.grid_shape = (100, 100, 10)
@@ -387,7 +423,19 @@ class PlanningNode(Node):
         self.last_planned_traj_base_stamp = None
         self._last_static_log_ns = {}
 
-        self.create_subscription(Odometry, '/control/target_pose', self.target_pose_callback, 10)
+        # TRANSIENT_LOCAL because this topic carries state -- where the robot is going --
+        # not a stream. map_node publishes it once per POI transition, so a volatile
+        # subscriber that joins late never learns the target and this node publishes
+        # "No target pose, publishing static path" forever: trajectory drawn, cmd_vel
+        # zero, nothing logged as wrong. That is exactly how the POI target was lost on
+        # /mapping/cmd_pois, and this node is a late joiner every time
+        # cmd_restart_nav_nodes restarts it while map_node keeps running.
+        # Both ends must be TRANSIENT_LOCAL: a latched writer and a volatile reader still
+        # connect, but the reader gets no history.
+        self.create_subscription(
+            Odometry, '/control/target_pose', self.target_pose_callback,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+        )
         self.target_pose = None
 
         self.poi_change_sub = self.create_subscription(Odometry, "/mapping/poi_change", self.poi_change_callback, 10)
@@ -606,11 +654,21 @@ class PlanningNode(Node):
             self._last_static_log_ns[key] = now_ns
             self.get_logger().info(f"{reason}, publishing static path.")
 
-    @Timer(name="Planning Loop", text="\n\n[{name}] Elapsed time: {milliseconds:.0f} ms")
+    @Timer(name="Planning Loop", text="\n\n[{name}] Elapsed time: {milliseconds:.0f} ms", logger=_TIMER_LOGGER)
     def sync_callback(self, depth_msg, pose_msg):
         if self.K is None:
             return
-        with Timer(name='preprocess', text="[{name}] Elapsed time: {milliseconds:.0f} ms"):
+        age_s = (self.get_clock().now() - Time.from_msg(pose_msg.header.stamp)).nanoseconds / 1e9
+        if age_s > self.max_input_age_s:
+            now_ns = self.get_clock().now().nanoseconds
+            if now_ns - self._last_stale_log_ns >= 1_000_000_000:
+                self._last_stale_log_ns = now_ns
+                self.get_logger().warning(
+                    f"dropping stale synced set: {age_s:.2f}s old (limit {self.max_input_age_s:.2f}s) -- "
+                    "planning is not keeping up with the depth rate"
+                )
+            return
+        with Timer(name='preprocess', text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=_TIMER_LOGGER):
             depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='32FC1')
             stamp = Time.from_msg(pose_msg.header.stamp).nanoseconds / 1e9
             T = pose_msg2np(pose_msg)
@@ -624,7 +682,7 @@ class PlanningNode(Node):
             fx, fy = self.K[0, 0], self.K[1, 1]
             cx, cy = self.K[0, 2], self.K[1, 2]
 
-        with Timer(name='raycasting', text="[{name}] Elapsed time: {milliseconds:.0f} ms"):
+        with Timer(name='raycasting', text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=_TIMER_LOGGER):
             center = self.origin + np.array(self.grid_shape) * self.resolution / 2
             robot_pos = T[:3, 3]
             delta = robot_pos - center
@@ -639,21 +697,29 @@ class PlanningNode(Node):
 
             self.publish_3d_occupancy_cloud(self.occupancy_grid, self.resolution, self.origin)
 
-        with Timer(name='obstacle map', text="[{name}] Elapsed time: {milliseconds:.0f} ms"):
+        with Timer(name='obstacle map', text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=_TIMER_LOGGER):
             obstacle_mask = build_obstacle_map(
                 self.occupancy_grid, self.origin, self.resolution,
                 robot_z=T[2, 3], config=self.obstacle_config,
             )
             ESDF_map = distance_transform_edt(~obstacle_mask).astype(np.float32) * self.resolution
 
-        with Timer(name='vis', text="[{name}] Elapsed time: {milliseconds:.0f} ms"):
-            self.publish_3d_occupancy_cloud_with_esdf(self.occupancy_grid, ESDF_map, self.resolution, self.origin)
+        with Timer(name='vis', text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=_TIMER_LOGGER):
+            if _PUBLISH_ESDF_CLOUD:
+                self.publish_3d_occupancy_cloud_with_esdf(self.occupancy_grid, ESDF_map, self.resolution, self.origin)
+            # The obstacle mask is the only direct evidence of *why* every trajectory is
+            # rejected -- "All trajectories in collision" says the footprint is inside a
+            # dilated obstacle cell but not what put it there. The publish was commented
+            # out while node_manager kept subscribing, so the question was unanswerable
+            # and the app's overlay was silently blank. Off by default (it is an
+            # OccupancyGrid per cycle), on for diagnosis.
+            if _PUBLISH_OBSTACLE_MASK:
+                self.publish_obstacle_mask(obstacle_mask, depth_msg.header.stamp)
             #self.publish_height_map(T[:3,3], ESDF_map, depth_msg.header)
             #self.publish_2d_occupancy_grid(ESDF_map, self.origin, self.resolution, depth_msg.header.stamp, z_offset=self.grid_shape[2]*self.resolution/2)
-            #self.publish_obstacle_mask(obstacle_mask, depth_msg.header.stamp)
             #self.publish_footprint(T, depth_msg.header.stamp)
 
-        with Timer(name='traj gen', text="[{name}] Elapsed time: {milliseconds:.0f} ms"):
+        with Timer(name='traj gen', text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=_TIMER_LOGGER):
             query_stamp = stamp + self.planning_latency_s
             seed = self._seed_from_last_trajectory(query_stamp)
             planning_base_stamp = stamp
@@ -710,13 +776,11 @@ class PlanningNode(Node):
                 trajectories = np.concatenate([trajectories, vocab_trajs], axis=0)
                 params = np.concatenate([params, vocab_params], axis=0)
 
-        with Timer(name='traj score', text="[{name}] Elapsed time: {milliseconds:.0f} ms"):
+        with Timer(name='traj score', text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=_TIMER_LOGGER):
             front_len, rear_len, half_w = self.robot.footprint_from_control()
             scores, occ_points = score_trajectories_by_ESDF(trajectories, ESDF_map, self.origin, self.resolution, self.robot.safety_radius, front_len, rear_len, half_w)
-            top_k = 100
-            top_indices = np.argsort(scores, kind='stable')[:top_k]
 
-        with Timer(name='pub', text="[{name}] Elapsed time: {milliseconds:.0f} ms"):
+        with Timer(name='pub', text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=_TIMER_LOGGER):
             front_clearance = self._front_obstacle_dist(T, obstacle_mask)
             enter_threshold = 0.30
 

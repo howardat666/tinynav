@@ -38,6 +38,26 @@ class LooperBridgeNode(Node):
         self._last_sync_log_stamp = None
 
         self.sensor_qos = QoSProfile(depth=50, reliability=ReliabilityPolicy.RELIABLE)
+        # rclpy's own subscription queue sits *underneath* message_filters and delivers
+        # strictly FIFO, so --sync-queue-size does not bound it: a depth-50 reader hands
+        # the synchroniser 50 backlogged frames oldest-first the moment the sync thread
+        # stalls, and the keyframe that comes out is seconds old again. Capping the
+        # matcher alone fixed only half of the measured 1.49 s keyframe age; this is the
+        # other half.
+        #
+        # Sized as a duration, not a slot count. Slots are not comparable across these
+        # streams -- depth runs at ~5 Hz on this board while infra1 and the pose run at
+        # ~20 Hz -- so giving all three the same depth would silently shrink the fast
+        # streams' matching window to a quarter of depth's and cost matches that the
+        # exact-stamp synchroniser needs. One second of history each: 10 s -> 1 s for
+        # depth (34 MB -> 3.4 MB of reader history) and 2.5 s -> 1 s for infra1.
+        _SYNC_WINDOW_S = 1.0
+        self.sync_depth_qos = QoSProfile(
+            depth=max(1, round(_SYNC_WINDOW_S * 5.0)), reliability=ReliabilityPolicy.RELIABLE
+        )
+        self.sync_fast_qos = QoSProfile(
+            depth=max(1, round(_SYNC_WINDOW_S * 20.0)), reliability=ReliabilityPolicy.RELIABLE
+        )
         self.fast_pose_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE)
         self.fast_depth_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE)
         self.tf_static_qos = QoSProfile(
@@ -73,14 +93,15 @@ class LooperBridgeNode(Node):
         # The 100 Hz pose stays unbridged; cmd_vel_control consumes it directly.
         self.depth_sub = message_filters.Subscriber(
             self, Image, "/camera/camera/depth/image_rect_raw",
-            qos_profile=self.sensor_qos, callback_group=self.sync_group
+            qos_profile=self.sync_depth_qos, callback_group=self.sync_group
         )
         self.pose_sub = message_filters.Subscriber(
-            self, PoseStamped, args.pose_topic, callback_group=self.sync_group
+            self, PoseStamped, args.pose_topic,
+            qos_profile=self.sync_fast_qos, callback_group=self.sync_group
         )
         self.image_sub = message_filters.Subscriber(
             self, Image, "/camera/camera/infra1/image_rect_raw",
-            qos_profile=self.sensor_qos, callback_group=self.sync_group
+            qos_profile=self.sync_fast_qos, callback_group=self.sync_group
         )
         # Exact vs approximate, and why this is not a style choice.
         #

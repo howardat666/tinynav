@@ -12,6 +12,8 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Path
+from rclpy.qos import DurabilityPolicy, QoSProfile
+from std_msgs.msg import Bool
 from tinynav.core.math_utils import pose_msg2np
 from tinynav.core.robot_config import robot_config
 
@@ -207,6 +209,7 @@ class CmdVelControlNode(Node):
         self._last_traj_update_sec = None
         self._last_traj_log_sec = None
         self._last_zero_log_sec = {}
+        self._last_cmd_log_sec = None
         self._time_lookahead_s = 0.15
         self._trajectory_expire_grace_s = 0.05
         self._vx_gain_comp = 1.2
@@ -221,9 +224,27 @@ class CmdVelControlNode(Node):
         self.declare_parameter("pose_topic", "/camera/camera/vio_100hz")
         self._pose_topic = str(self.get_parameter("pose_topic").value)
         self.get_logger().info(f"control pose source: {self._pose_topic}")
-        self.create_subscription(PoseStamped, self._pose_topic, self._odom_cb, 50)
+        # Depth 1, not 50. This topic runs at 99 Hz and _odom_cb ends by calling
+        # _control_loop, so a queue is a backlog of *control iterations*: if this node
+        # stalls for half a second, a depth-50 queue makes it replay 50 loops against
+        # poses that are already history before it catches up. A controller only ever
+        # wants the newest measurement; an old one is not partial information, it is
+        # wrong information.
+        self.create_subscription(PoseStamped, self._pose_topic, self._odom_cb, 1)
         self.create_subscription(Path, "/planning/trajectory_path", self._traj_cb, 10)
         self.cmd_pub = self.create_publisher(Twist, "/cmd_vel", 10)
+
+        # /nav/paused is published latched by the backend when the user presses Pause.
+        # Until now nothing anywhere subscribed to it: the flag reached the UI through
+        # get_status and the button greyed out, but no code path ever stopped the
+        # wheels. Pause looked like it worked because the robot happened not to be
+        # moving. TRANSIENT_LOCAL to match the publisher, so a controller started while
+        # already paused comes up paused rather than driving.
+        self._nav_paused = False
+        self.create_subscription(
+            Bool, "/nav/paused", self._paused_cb,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+        )
 
     def _odom_cb(self, msg: PoseStamped):
         measured_pose = pose_msg2np(msg)
@@ -254,17 +275,10 @@ class CmdVelControlNode(Node):
 
     def _traj_cb(self, msg: Path):
         now = self._now_sec()
-        new_ref = self._rebuild_path(msg)
-        if msg.poses and self._odom_stamp_sec is not None:
-            path_start_sec = msg.poses[0].header.stamp.sec + msg.poses[0].header.stamp.nanosec * 1e-9
-            path_lag_s = self._odom_stamp_sec - path_start_sec
-            if path_lag_s > 0.0:
-                self.logger.warning(
-                    f"received stale /planning/trajectory_path: first pose stamp is "
-                    f"{path_lag_s:.3f}s behind latest {self._pose_topic} "
-                    f"(path={path_start_sec:.3f}, odom={self._odom_stamp_sec:.3f}); "
-                    "planning_node may be taking too long."
-                )
+        # Rate limit first. _rebuild_path walks every pose twice in Python -- a
+        # pose_msg2np quaternion-to-matrix per pose, then an np.unwrap and a second
+        # pass -- and paying that for a message we are about to discard is pure waste
+        # at the 5 Hz this drops to.
         if (
             self._last_traj_update_sec is not None
             and now - self._last_traj_update_sec < 0.2  # Drop path updates faster than 5 Hz.
@@ -274,10 +288,29 @@ class CmdVelControlNode(Node):
                     time.time_ns(),
                     accepted=False,
                     pose_count=len(msg.poses),
-                    path_ref=new_ref,
+                    path_ref=None,
                     reason="rate_limited",
                 )
             return
+
+        new_ref = self._rebuild_path(msg)
+        if msg.poses and self._odom_stamp_sec is not None:
+            path_start_sec = msg.poses[0].header.stamp.sec + msg.poses[0].header.stamp.nanosec * 1e-9
+            path_lag_s = self._odom_stamp_sec - path_start_sec
+            # Rate-limited like every other log here. This is a *warning*, not a
+            # rejection -- the path is still accepted below. It fires whenever
+            # planning's fixed planning_latency_s lookahead undershoots the real
+            # planning time, which on a loaded board it routinely does.
+            if path_lag_s > 0.0 and (
+                self._last_traj_log_sec is None or now - self._last_traj_log_sec >= 1.0
+            ):
+                self._last_traj_log_sec = now
+                self.logger.warning(
+                    f"received stale /planning/trajectory_path: first pose stamp is "
+                    f"{path_lag_s:.3f}s behind latest {self._pose_topic} "
+                    f"(path={path_start_sec:.3f}, odom={self._odom_stamp_sec:.3f}); "
+                    "planning_node may be taking too long."
+                )
 
         if new_ref is None:
             self._path_ref = None
@@ -373,7 +406,21 @@ class CmdVelControlNode(Node):
 
         return path_ref
 
+    def _paused_cb(self, msg: Bool):
+        if bool(msg.data) != self._nav_paused:
+            self._nav_paused = bool(msg.data)
+            self.logger.info(f"nav paused = {self._nav_paused}")
+            if self._nav_paused:
+                # Do not wait for the next odom tick to stop: the caller pressed Pause.
+                self._publish_zero("nav paused")
+
     def _control_loop(self):
+        # Checked before anything else, including the trajectory, so a stale path
+        # cannot drive the wheels while paused.
+        if self._nav_paused:
+            self._publish_zero("nav paused")
+            return
+
         if self._path_ref is None:
             self._publish_zero("no /planning/trajectory_path arrived yet")
             return
@@ -440,7 +487,13 @@ class CmdVelControlNode(Node):
                 query_t=now_sec + self._time_lookahead_s,
             )
 
-        self.logger.info(f"sent cmd_vel vx={v:.3f} vyaw={wz:.3f}")
+        # Rate-limited to 1 Hz, matching _publish_zero. This runs at the odometry rate
+        # -- 99 Hz on Looper -- and the f-string was evaluated unconditionally, so the
+        # one path that means "everything is working" was also the loudest thing in the
+        # stack, writing to an unrotated log on the board's eMMC.
+        if self._last_cmd_log_sec is None or now_sec - self._last_cmd_log_sec >= 1.0:
+            self._last_cmd_log_sec = now_sec
+            self.logger.info(f"sent cmd_vel vx={v:.3f} vyaw={wz:.3f}")
 
     def _find_tracking_target(self, robot_pos, robot_yaw, now_sec):
         if self._path_ref is None or len(self._path_ref) == 0:

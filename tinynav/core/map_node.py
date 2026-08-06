@@ -586,7 +586,17 @@ class MapNode(Node):
 
         self.current_pose_pub = self.create_publisher(Odometry, "/mapping/current_pose", 10)
         self.global_plan_pub = self.create_publisher(Path, '/mapping/global_plan', 10)
-        self.target_pose_pub = self.create_publisher(Odometry, "/control/target_pose", 10)
+        # Latched for the same reason as /mapping/cmd_pois above: this is state, not a
+        # stream. It is published once when a POI becomes the active target, and
+        # planning_node is restarted independently of this node (cmd_restart_nav_nodes),
+        # so it is routinely the late joiner. A volatile pair leaves it with
+        # target_pose=None and it publishes "No target pose, publishing static path"
+        # indefinitely -- a trajectory appears, cmd_vel stays zero, and nothing is
+        # logged as an error. Measured: 224 s of that in one run.
+        self.target_pose_pub = self.create_publisher(
+            Odometry, "/control/target_pose",
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+        )
 
         self.tf_broadcaster = TransformBroadcaster(self)
 
@@ -1460,7 +1470,6 @@ class MapNode(Node):
             or poi_goal_idx[2] < 0
             or poi_goal_idx[2] >= self.occupancy_map.shape[2]
         ):
-            print("here")
             log_generate_timing("out_of_bounds")
             return None 
 
@@ -1521,7 +1530,9 @@ def main(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--tinynav_db_path", type=str, default="tinynav_temp")
     parser.add_argument("--tinynav_map_path", type=str, required=True)
-    parser.add_argument("--verbose_timer", action="store_true", default=True, help="Enable verbose timer output")
+    # Default off: codetiming's default logger is print(), node_manager redirects stdout
+    # into an unrotated file on the board's eMMC, and these fire per keyframe.
+    parser.add_argument("--verbose_timer", action="store_true", default=False, help="Enable verbose timer output")
     parser.add_argument("--no_verbose_timer", dest="verbose_timer", action="store_false", help="Disable verbose timer output")
     parser.add_argument("--loop-closure-mode", type=str, default="embedding", choices=["embedding", "bow"])
     parser.add_argument("--loop-closure-use-bow", action="store_true", help="Use ORB+BF and DBoW3 for loop closure")

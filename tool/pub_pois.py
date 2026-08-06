@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 import rclpy
+from rclpy.qos import DurabilityPolicy, QoSProfile
 from std_msgs.msg import String
 
 
@@ -43,12 +44,23 @@ def load_selected_pois(tinynav_map_path: Path, pois: str | None) -> dict[str, ob
 def publish(payload: dict[str, object]) -> None:
     rclpy.init()
     node = rclpy.create_node("pub_pois")
-    publisher = node.create_publisher(String, "/mapping/cmd_pois", 10)
+    # Must match map_node's TRANSIENT_LOCAL subscription. DDS requires the writer's
+    # durability to be at least the reader's, so a plain volatile publisher here never
+    # matches at all -- and the failure surfaces as the timeout below, which reads like
+    # map_node being slow to start rather than the two ends being incompatible.
+    # Latching is also what this topic needs on its own merits: it carries the current
+    # nav target, published once, to a subscriber that may not exist yet.
+    publisher = node.create_publisher(
+        String, "/mapping/cmd_pois",
+        QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+    )
     msg = String()
     msg.data = json.dumps(payload, separators=(",", ":"))
-    deadline = time.time() + 5.0
+    # monotonic, not wall clock: the board has no RTC, so time.time() jumps when the
+    # clock is first set and a forward jump fires this timeout instantly.
+    deadline = time.monotonic() + 5.0
     while publisher.get_subscription_count() == 0:
-        if time.time() >= deadline:
+        if time.monotonic() >= deadline:
             node.destroy_node()
             rclpy.shutdown()
             raise RuntimeError("Timed out waiting for /mapping/cmd_pois subscribers")
