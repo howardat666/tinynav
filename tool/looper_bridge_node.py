@@ -49,14 +49,29 @@ class LooperBridgeNode(Node):
         # streams -- depth runs at ~5 Hz on this board while infra1 and the pose run at
         # ~20 Hz -- so giving all three the same depth would silently shrink the fast
         # streams' matching window to a quarter of depth's and cost matches that the
-        # exact-stamp synchroniser needs. One second of history each: 10 s -> 1 s for
-        # depth (34 MB -> 3.4 MB of reader history) and 2.5 s -> 1 s for infra1.
-        _SYNC_WINDOW_S = 1.0
+        # exact-stamp synchroniser needs.
+        #
+        # The window itself is a live-vs-offline decision, and getting it wrong costs
+        # opposite things in the two modes -- so it is a flag, not a constant, mirroring
+        # the split --sync-queue-size already makes for the matcher above it.
+        #
+        # Live, a deep reader queue hands the synchroniser backlogged frames oldest-first
+        # and the keyframe that comes out is seconds old; 1 s is what fixed the measured
+        # 1.49 s keyframe age. Offline the bag is paced and latency is meaningless, but
+        # the bridge runs ~3.4x slower than realtime on this board (measured: 240 s of
+        # wall clock for the 71 s dryrun_probe bag), so BagPlayer keeps handing it depth
+        # frames faster than it drains them. A 1 s depth window is 5 slots, and every
+        # frame that overflows it is a keyframe missing from the map -- a silent hole in
+        # coverage, not an error. 10 s offline costs ~34 MB of reader history for the
+        # duration of a build and nothing at all during navigation.
+        #
+        # NOT a measured regression: the 224-keyframe build this was first blamed for was
+        # a contaminated run whose bridge was fed 912 s of live camera instead of the bag.
         self.sync_depth_qos = QoSProfile(
-            depth=max(1, round(_SYNC_WINDOW_S * 5.0)), reliability=ReliabilityPolicy.RELIABLE
+            depth=max(1, round(args.sync_window_s * 5.0)), reliability=ReliabilityPolicy.RELIABLE
         )
         self.sync_fast_qos = QoSProfile(
-            depth=max(1, round(_SYNC_WINDOW_S * 20.0)), reliability=ReliabilityPolicy.RELIABLE
+            depth=max(1, round(args.sync_window_s * 20.0)), reliability=ReliabilityPolicy.RELIABLE
         )
         self.fast_pose_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE)
         self.fast_depth_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE)
@@ -403,6 +418,20 @@ def parse_args():
              "3 bounds the added delay to about two depth periods. Use a deep queue "
              "only for an offline map build, where the bag is paced, latency is "
              "meaningless, and dropping a matched set loses a keyframe for good.",
+    )
+    parser.add_argument(
+        "--sync-window-s",
+        type=float,
+        default=1.0,
+        help="Seconds of history the rclpy reader queues underneath the synchroniser "
+             "hold, converted to slots per stream from its own rate (depth ~5 Hz, "
+             "infra1 and the pose ~20 Hz) so the fast streams do not silently get a "
+             "quarter of depth's matching window. Same live-vs-offline split as "
+             "--sync-queue-size and for the same reason, one layer down: 1 s live, so a "
+             "stalled sync thread cannot serve up seconds-old frames, and 10 s for an "
+             "offline map build, where the bridge runs ~3.4x slower than realtime and a "
+             "depth frame dropped by an overflowing reader queue is a keyframe missing "
+             "from the map with nothing logged.",
     )
     parser.add_argument(
         "--publish-camera-info-alias",

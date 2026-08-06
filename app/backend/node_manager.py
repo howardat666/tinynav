@@ -232,9 +232,17 @@ def _bridge_argv(*, for_map_build: bool = False) -> list[str]:
     # Offline, the bag is paced and latency is meaningless, but a dropped matched
     # set is a keyframe lost from the map, so depth is what matters.
     queue_size = '20' if for_map_build else '3'
+    # The same split one layer down, in the rclpy reader queues the synchroniser sits on
+    # top of. Live, a deep reader queue is what let a stalled sync thread emit seconds-old
+    # frames even after the matcher was capped. Offline it is the opposite: the bridge runs
+    # ~3.4x slower than realtime on the X5 (240 s for a 71 s bag), so a 1 s depth window --
+    # 5 slots at 5 Hz -- overflows, and each dropped frame is a keyframe that never makes
+    # it into the map, silently.
+    sync_window_s = '10.0' if for_map_build else '1.0'
     return _node_argv('tool/looper_bridge_node.py') + [
         '--pose-topic', pose_topic,
         '--sync-queue-size', queue_size,
+        '--sync-window-s', sync_window_s,
     ]
 
 
