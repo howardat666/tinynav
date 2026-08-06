@@ -335,6 +335,7 @@ class BackendNode(Ros2NodeManager):
         self._grid_info: dict | None = None
         self._nav_target_pose: dict | None = None
         self._relocalization_stats: dict | None = None
+        self._poi_status: dict | None = None
 
         self._tf_buffer = None
         self._tf_listener = None
@@ -357,6 +358,15 @@ class BackendNode(Ros2NodeManager):
             # than waiting up to 10 s for the next window.
             self.create_subscription(
                 String, '/map/relocalization_stats', self._on_relocalization_stats,
+                QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+            )
+            # Arrival. map_node decides it and previously told nobody: /mapping/poi_change
+            # is a topic this class publishes and never subscribes to, and navStatus is
+            # derived from this backend's own state machine, which stays 'navigation'
+            # until someone disables the nav nodes. So the robot arrived and the UI went
+            # on saying "Navigating..." forever.
+            self.create_subscription(
+                String, '/mapping/poi_status', self._on_poi_status,
                 QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
             )
             self.create_subscription(Image, '/planning/height_map', self._on_height_map, 1)
@@ -412,6 +422,23 @@ class BackendNode(Ros2NodeManager):
         # Sensor mode detection and image subscriptions
         self._sensor_mode: str = 'unknown'  # 'looper' | 'realsense' | 'unknown'
         self._image_subs: dict = {}
+        # Preview subscriptions are created and destroyed on demand as browsers attach,
+        # but the request arrives on uvicorn's asyncio thread while rclpy.spin() is
+        # building its wait set on another. rclpy is not thread-safe across that
+        # boundary: destroy_subscription from the foreign thread raised
+        # `InvalidHandle: cannot use Destroyable because destruction was requested`
+        # inside the executor and *killed the spin thread*, after which the backend ran
+        # no ROS callbacks at all -- no preview frames, no /planning telemetry, and
+        # /map/current and /map/pois answering 503. Observed 5 times across 12 sessions
+        # on the board, each immediately after a /ws/preview connect or disconnect.
+        #
+        # So the websocket handlers only record what they want, and a timer applies it.
+        # Timer callbacks run on the spin thread, which is the only thread allowed to
+        # touch these handles.
+        self._preview_sub_wanted: dict[str, bool] = {}
+        # 0.2 s: a browser opening a preview waits at most one tick for its first frame,
+        # and the reconcile is a dict comparison over a handful of topics.
+        self._preview_sub_timer = self.create_timer(0.2, self._apply_preview_subs)
         self._last_frame: dict[str, bytes] = {}   # topic -> latest JPEG bytes
         self._last_frame_time: dict[str, float] = {}
         self._looper_bridge_proc: subprocess.Popen | None = None
@@ -496,6 +523,20 @@ class BackendNode(Ros2NodeManager):
             return
         with self._lock:
             self._relocalization_stats = stats
+
+    def _on_poi_status(self, msg: String):
+        try:
+            status = json.loads(msg.data)
+        except (ValueError, TypeError) as e:
+            self.get_logger().warn(f'bad /mapping/poi_status payload: {e}')
+            return
+        with self._lock:
+            previously_all = bool((self._poi_status or {}).get('allVisited'))
+            self._poi_status = status
+        if status.get('allVisited') and not previously_all:
+            self.get_logger().info(
+                f"arrived: all {status.get('total')} POI(s) visited"
+            )
 
     def _on_nav_target_pose(self, msg: Odometry):
         with self._lock:
@@ -745,26 +786,16 @@ class BackendNode(Ros2NodeManager):
             self.preview_callbacks[topic] = []
 
     def add_preview_callback(self, topic: str, cb) -> bool:
-        """Register a frame callback; creates the ROS subscription on the first caller."""
+        """Register a frame callback. The ROS subscription follows on the spin thread."""
         if topic not in self.preview_callbacks:
             return False
         with self._lock:
             self.preview_callbacks[topic].append(cb)
-            first = len(self.preview_callbacks[topic]) == 1
-        if first:
-            try:
-                self._create_image_sub(topic)
-            except Exception:
-                with self._lock:
-                    try:
-                        self.preview_callbacks[topic].remove(cb)
-                    except ValueError:
-                        pass
-                raise
+            self._preview_sub_wanted[topic] = True
         return True
 
     def remove_preview_callback(self, topic: str, cb):
-        """Unregister a frame callback; destroys the ROS subscription when the last caller leaves."""
+        """Unregister a frame callback; the subscription is dropped once none are left."""
         if topic not in self.preview_callbacks:
             return
         with self._lock:
@@ -772,9 +803,28 @@ class BackendNode(Ros2NodeManager):
                 self.preview_callbacks[topic].remove(cb)
             except ValueError:
                 pass
-            empty = len(self.preview_callbacks[topic]) == 0
-        if empty:
-            self._destroy_image_sub(topic)
+            self._preview_sub_wanted[topic] = len(self.preview_callbacks[topic]) > 0
+
+    def _apply_preview_subs(self):
+        """Reconcile subscriptions with what the websocket handlers asked for.
+
+        Runs on the spin thread (timer callback), which is the only thread that may
+        create or destroy rclpy entities while rclpy.spin() owns the executor.
+        Reconciling desired-vs-actual rather than replaying events also means a
+        connect/disconnect pair that lands between two ticks cancels out instead of
+        churning a subscription.
+        """
+        with self._lock:
+            wanted = dict(self._preview_sub_wanted)
+        for topic, want in wanted.items():
+            have = topic in self._image_subs
+            if want and not have:
+                try:
+                    self._create_image_sub(topic)
+                except Exception as e:
+                    self.get_logger().warn(f'preview subscribe {topic} failed: {e}')
+            elif have and not want:
+                self._destroy_image_sub(topic)
 
     def _create_image_sub(self, topic: str):
         if topic in self._image_subs:
@@ -893,6 +943,9 @@ class BackendNode(Ros2NodeManager):
         self._footprint = []
         self._voxel_points = []
         self._nav_target_pose = None
+        # Latched on the wire, so without this a cancelled or restarted run would keep
+        # reporting the previous run's arrival.
+        self._poi_status = None
 
     def _publish_nav_target_clear(self):
         """Clear map_node POIs and directly notify planning_node to drop its target."""
@@ -1087,6 +1140,7 @@ class BackendNode(Ros2NodeManager):
             nav_nodes = self._nav_nodes_running
             nav_paused = self._nav_paused
             reloc_stats = self._relocalization_stats
+            poi_status = self._poi_status
         if nav_nodes and self._report_dead_nav_procs():
             nav_nodes = False
         bag_recording = self.is_bag_recording()
@@ -1098,10 +1152,18 @@ class BackendNode(Ros2NodeManager):
             'bagFileReady': bag_files_exist,
             'mapStatus': self._derive_map_status(raw, pct, map_files_exist),
             'mappingPercent': pct,
-            'navStatus': 'navigating' if raw == 'navigation' else 'idle',
+            # 'arrived' rather than 'navigating' once map_node reports every POI visited.
+            # raw stays 'navigation' until the nav nodes are disabled, so on its own it
+            # can never express arrival.
+            'navStatus': self._derive_nav_status(raw, poi_status),
             'rawState': raw,
             'navNodesRunning': nav_nodes,
             'navPaused': nav_paused,
+            # {total, index, visited, allVisited, distanceXyM, arrivalRadiusXyM}.
+            # distanceXyM is what makes "closing in" visible instead of only the binary
+            # arrival, which matters when the arrival radius is 0.5 m and the operator is
+            # trying to work out why a robot 0.6 m away is not done.
+            'poiStatus': poi_status,
             # None until map_node's first 10 s window closes. Shape is
             # {window, total, lastFailureCode, secondsSinceLastSuccess}, each of window
             # and total carrying keyframes/attempts/success/failure, attemptHz,
@@ -1109,6 +1171,14 @@ class BackendNode(Ros2NodeManager):
             # whether relocalization is failing or simply not being attempted.
             'relocalization': reloc_stats,
         }
+
+    @staticmethod
+    def _derive_nav_status(raw: str, poi_status: dict | None) -> str:
+        if raw != 'navigation':
+            return 'idle'
+        if poi_status and poi_status.get('allVisited') and poi_status.get('total'):
+            return 'arrived'
+        return 'navigating'
 
     @staticmethod
     def _derive_map_status(raw: str, pct: float, files_exist: bool) -> str:
@@ -1393,6 +1463,19 @@ class BackendNode(Ros2NodeManager):
     def cmd_start_nav_nodes(self):
         if not self._manage_processes:
             raise RuntimeError('Nav node lifecycle is disabled in display backend role')
+        # Enable has to be idempotent. It was not: this launched map_node and
+        # cmd_vel_control unconditionally and overwrote the handles, so a second
+        # /nav/nodes/enable orphaned the first pair with nothing left holding a
+        # reference to kill. Measured on the board: a cmd_vel_control from 32 minutes
+        # earlier still running at ppid 1, 78 MB and 68% of a core, and -- because it
+        # still had a publisher -- /cmd_vel had three publishers and two controllers
+        # issuing wheel commands from different trajectories. Kill first.
+        for name, proc in (('map_node', self._map_node_proc), ('cmd_vel_control', self._cmd_vel_proc)):
+            if proc is not None and proc.poll() is None:
+                self.get_logger().warn(f'{name} already running (pid {proc.pid}), replacing it')
+                self._kill_proc(proc)
+        self._map_node_proc = None
+        self._cmd_vel_proc = None
         _env = os.environ.copy()
         _env['PYTHONPATH'] = _VENV_SITE + ':' + _env.get('PYTHONPATH', '')
         self._map_node_proc = self._launch_proc(

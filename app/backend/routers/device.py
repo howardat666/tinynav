@@ -94,4 +94,5 @@ def _empty_status():
         # Present-but-null rather than absent, so a client can read the key
         # unconditionally instead of branching on whether the node is up.
         'relocalization': None,
+        'poiStatus': None,
     }

@@ -483,6 +483,12 @@ class MapNode(Node):
             String, '/map/relocalization_stats',
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
         )
+        # Latched: arrival is state. A browser that reloads after the robot arrived
+        # must still learn that it arrived.
+        self._poi_status_pub = self.create_publisher(
+            String, '/mapping/poi_status',
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+        )
         self._nav_warmup_lock = threading.Lock()
         self._nav_warmup_thread = None
         self.logger = logging.getLogger(__name__)
@@ -1072,6 +1078,45 @@ class MapNode(Node):
         self._reloc_window = self._new_reloc_bucket()
         self._reloc_window_t0 = now
 
+    # Arrival is decided here and was reported nowhere. The advance below is the only
+    # place that knows the robot reached a POI, and its one output was
+    # /mapping/poi_change -- a topic the backend *publishes* (to cancel a target) and
+    # never subscribes to. get_status has no arrival field either, and the frontend
+    # renders navStatus, which is 'navigating' for as long as the backend's own state
+    # machine says so. So the robot could arrive, map_node could log "All POIs have been
+    # visited", and the UI would still read "Navigating..." indefinitely -- observed.
+    #
+    # A dedicated latched topic rather than more traffic on /mapping/poi_change, which
+    # already carries two different meanings in two directions and would make the
+    # backend hear its own cancels.
+    POI_ARRIVAL_RADIUS_XY_M = 0.5
+    POI_ARRIVAL_RADIUS_Z_M = 2.0
+
+    def _publish_poi_status(self, pose_in_map_position: np.ndarray, advanced: int) -> None:
+        total = len(self.pois)
+        idx = self.poi_index
+        active = self.pois[idx] if 0 <= idx < total else None
+        payload = {
+            'total': total,
+            'index': idx,
+            'visited': max(0, min(idx, total)),
+            'allVisited': idx >= total,
+            # Distance to the *current* target, so the UI can show closing-in rather
+            # than only the binary arrival.
+            'distanceXyM': (
+                round(float(np.linalg.norm(active[:2] - pose_in_map_position[:2])), 3)
+                if active is not None else None
+            ),
+            'arrivalRadiusXyM': self.POI_ARRIVAL_RADIUS_XY_M,
+            'advancedThisTick': advanced,
+        }
+        try:
+            msg = String()
+            msg.data = json.dumps(payload, separators=(',', ':'))
+            self._poi_status_pub.publish(msg)
+        except Exception as e:
+            self.get_logger().warn(f"could not publish POI status: {e}")
+
     def _relocalization_failed(self, reason: str, code: str = "unknown") -> tuple[bool, np.ndarray, float]:
         # code is a short stable slug for the failing layer, so the counts stay
         # aggregatable while `reason` keeps the numbers that explain the individual case.
@@ -1471,7 +1516,8 @@ class MapNode(Node):
             poi = self.pois[self.poi_index]
             diff_position_norm_xy = np.linalg.norm(poi[:2] - pose_in_map_position[:2])
             diff_position_norm_z = np.linalg.norm(poi[2] - pose_in_map_position[2])
-            if diff_position_norm_xy < 0.5 and diff_position_norm_z < 2.0:
+            if (diff_position_norm_xy < self.POI_ARRIVAL_RADIUS_XY_M
+                    and diff_position_norm_z < self.POI_ARRIVAL_RADIUS_Z_M):
                 self.poi_index += 1
                 advanced_poi_count += 1
                 dummy_pose = np.eye(4)
@@ -1484,6 +1530,7 @@ class MapNode(Node):
             else:
                 break
         t_stage = mark_stage("poi_advance", t_stage)
+        self._publish_poi_status(pose_in_map_position, advanced_poi_count)
 
         if self.poi_index >= len(self.pois):
             self.get_logger().info("All POIs have been visited, skip publishing nav path")

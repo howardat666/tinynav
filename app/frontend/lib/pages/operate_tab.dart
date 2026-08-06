@@ -755,9 +755,16 @@ class _PoiButtonState extends ConsumerState<_PoiButton> {
     final count = widget.poisAsync.valueOrNull?.length ?? 0;
     final isNavigating =
         widget.statusAsync.valueOrNull?.rawState == 'navigation';
+    // rawState stays 'navigation' until the nav nodes are disabled, so it cannot
+    // express arrival. navStatus can -- the backend turns it into 'arrived' once
+    // map_node reports every POI visited -- but nothing in the live UI read it, so a
+    // robot that reached its goal looked identical to one still driving. Observed:
+    // map_node logged "All POIs have been visited" and the screen never changed.
+    final hasArrived =
+        widget.statusAsync.valueOrNull?.navStatus == 'arrived';
 
     if (isNavigating) {
-      return FilledButton.icon(
+      final cancelButton = FilledButton.icon(
         onPressed: _canceling ? null : _cancelNav,
         style: FilledButton.styleFrom(
           backgroundColor: Colors.red.withOpacity(0.85),
@@ -773,6 +780,29 @@ class _PoiButtonState extends ConsumerState<_PoiButton> {
             : const Icon(Icons.cancel_outlined, size: 16),
         label: const Text('Cancel'),
       );
+      if (!hasArrived) return cancelButton;
+      // Cancel stays available: arriving does not stop the nav nodes, and the operator
+      // still has to end the run.
+      return Row(mainAxisSize: MainAxisSize.min, children: [
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          decoration: BoxDecoration(
+            color: Colors.green.withOpacity(0.85),
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: const Row(mainAxisSize: MainAxisSize.min, children: [
+            Icon(Icons.check_circle, size: 15, color: Colors.white),
+            SizedBox(width: 5),
+            Text('Arrived',
+                style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600)),
+          ]),
+        ),
+        const SizedBox(width: 8),
+        cancelButton,
+      ]);
     }
 
     return FilledButton.icon(

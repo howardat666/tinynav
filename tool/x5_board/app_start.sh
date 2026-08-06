@@ -201,10 +201,37 @@ do_stop() {
         sleep 1
     fi
     rm -f "${PIDFILE}"
+
+    # The process-group kill above does NOT reach the ROS nodes, and this is the whole
+    # reason they leak. node_manager._launch_proc spawns every child with
+    # preexec_fn=os.setsid, which makes each one a session leader in its own new process
+    # group -- so `kill -TERM -<backend_pid>` signals the backend and nothing else.
+    # Measured consequence: a cmd_vel_control survived 32 minutes past its backend, at
+    # ppid 1, still publishing to /cmd_vel alongside its replacement.
+    #
+    # Sweeping by name is the honest fix here rather than removing the setsid: the nodes
+    # want their own groups so that killing one does not take down its siblings. Names
+    # use the [x] trick so the pattern cannot match this script's own pgrep/pkill.
+    local leftovers=0
+    for pat in 'map_[n]ode\.py' 'planning_[n]ode\.py' 'cmd_vel_[c]ontrol\.py' 'looper_[b]ridge_node\.py'; do
+        if pgrep -f "${pat}" >/dev/null 2>&1; then
+            pkill -TERM -f "${pat}" 2>/dev/null
+            leftovers=$((leftovers + 1))
+        fi
+    done
+    if [[ ${leftovers} -gt 0 ]]; then
+        sleep 2
+        for pat in 'map_[n]ode\.py' 'planning_[n]ode\.py' 'cmd_vel_[c]ontrol\.py' 'looper_[b]ridge_node\.py'; do
+            pgrep -f "${pat}" >/dev/null 2>&1 && pkill -KILL -f "${pat}" 2>/dev/null
+        done
+        echo "swept ${leftovers} orphaned node group(s)"
+    fi
+
     echo "stopped"
     # wheel_odometry_node is deliberately long-lived and is not in the backend's
     # own shutdown path, so say whether anything is still holding the servo bus.
-    pgrep -af 'wheel_odometry_node' && echo "  ^ wheel odometry still up (expected: it owns the servo bus)"
+    # Left out of the sweep above for the same reason.
+    pgrep -af 'wheel_odometry_[n]ode' && echo "  ^ wheel odometry still up (expected: it owns the servo bus)"
     return 0
 }
 
