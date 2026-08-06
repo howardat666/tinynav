@@ -91,4 +91,7 @@ def _empty_status():
         'mappingPercent': 0.0,
         'navStatus': 'idle',
         'rawState': 'unknown',
+        # Present-but-null rather than absent, so a client can read the key
+        # unconditionally instead of branching on whether the node is up.
+        'relocalization': None,
     }
