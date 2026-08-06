@@ -121,6 +121,24 @@ do_start() {
     export TINYNAV_MAP_PLAY_RATE="${TINYNAV_MAP_PLAY_RATE:-1.0}"
     export TINYNAV_MAP_SYNC_QUEUE="${TINYNAV_MAP_SYNC_QUEUE:-20}"
     export TINYNAV_MAP_VISUALIZATION="${TINYNAV_MAP_VISUALIZATION:-0}"
+    # Both now default to these values in node_manager, so these lines only pin them
+    # against a future default change. Kept for the same reason the four above are
+    # pinned: this file is where a run's configuration is meant to be readable.
+    #
+    #   save-videos   the rgb and infra1 h264 encodes are 95% of save_image_and_depth --
+    #                 measured 95.3 s and 18.5 s over a 575-keyframe build against 5.9 s
+    #                 for the depth write. Nothing on the nav path reads either; the
+    #                 consumers are convert_to_nerf_format and poi_editor, both PC-side.
+    #                 Set to 1 for a map that is going to be exported for 3DGS.
+    #   db-sync-every dbm.dumb rewrites the whole .dir index on every sync(), so syncing
+    #                 all three shelves per keyframe is ~1700 rename+unlink pairs on
+    #                 eMMC. 50 risks losing up to 50 keyframes if the build is killed.
+    export TINYNAV_MAP_SAVE_VIDEOS="${TINYNAV_MAP_SAVE_VIDEOS:-0}"
+    export TINYNAV_DB_SYNC_EVERY="${TINYNAV_DB_SYNC_EVERY:-50}"
+    # Diagnostics, off unless asked for. obstacle-mask answers "why is every trajectory
+    # in collision" -- node_manager already subscribes, the publish was commented out.
+    export TINYNAV_PUBLISH_OBSTACLE_MASK="${TINYNAV_PUBLISH_OBSTACLE_MASK:-0}"
+    export TINYNAV_VERBOSE_TIMER="${TINYNAV_VERBOSE_TIMER:-0}"
 
     if [[ ! -f "${TINYNAV_DBOW3_VOCAB}" ]]; then
         echo "vocabulary missing: ${TINYNAV_DBOW3_VOCAB} -- map build will fail" >&2
@@ -135,7 +153,8 @@ do_start() {
         echo "db            : ${TINYNAV_DB_PATH}"
         echo "node logs     : ${TINYNAV_LOG_DIR}"
         echo "map vocab     : ${TINYNAV_DBOW3_VOCAB}"
-        echo "map build     : rate=${TINYNAV_MAP_PLAY_RATE} queue=${TINYNAV_MAP_SYNC_QUEUE} vis=${TINYNAV_MAP_VISUALIZATION}"
+        echo "map build     : rate=${TINYNAV_MAP_PLAY_RATE} queue=${TINYNAV_MAP_SYNC_QUEUE} vis=${TINYNAV_MAP_VISUALIZATION} videos=${TINYNAV_MAP_SAVE_VIDEOS} db_sync=${TINYNAV_DB_SYNC_EVERY}"
+        echo "diagnostics   : obstacle_mask=${TINYNAV_PUBLISH_OBSTACLE_MASK} verbose_timer=${TINYNAV_VERBOSE_TIMER}"
         echo "=============================================================="
     } >> "${LOGFILE}"
 

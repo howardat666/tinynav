@@ -145,6 +145,8 @@ _MAP_SYNC_QUEUE = os.environ.get('TINYNAV_MAP_SYNC_QUEUE', '')
 # pose_graph_trajectory_publish sends every pose so far on every keyframe, ~165600
 # PoseStamped over a 575-keyframe build.
 _MAP_VISUALIZATION = os.environ.get('TINYNAV_MAP_VISUALIZATION', '0') == '1'
+# See _build_map_argv: 114 s of h264 per build, for videos only PC-side tools read.
+_MAP_SAVE_VIDEOS = os.environ.get('TINYNAV_MAP_SAVE_VIDEOS', '0') == '1'
 
 
 # Bag topics with no consumer in a *looper* offline build, and only there.
@@ -186,6 +188,15 @@ def _build_map_argv(map_save_path: str, bag_file: str, skip_topics: tuple = ()) 
         argv.append('--no-visualization')
     if skip_topics:
         argv += ['--skip-topics', ','.join(skip_topics)]
+    # The two h264 encodes are 95% of the save_image_and_depth stage on the board --
+    # measured 95.3 s (rgb) and 18.5 s (infra1) over a 575-keyframe build, against 5.9 s
+    # for the depth shelve write that this stage's cost had been attributed to. Neither
+    # video is read by anything on the navigation path; the consumers are PC-side offline
+    # tools (convert_to_nerf_format for rgb, poi_editor for infra1). A map built through
+    # the app is a map for navigating, so it does not pay 114 s for them. Set
+    # TINYNAV_MAP_SAVE_VIDEOS=1 when the map is going to be exported instead.
+    if not _MAP_SAVE_VIDEOS:
+        argv += ['--no-rgb-video', '--no-infra1-video']
     return argv
 
 

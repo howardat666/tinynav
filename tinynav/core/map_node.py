@@ -525,7 +525,14 @@ class MapNode(Node):
             shared_dbow3_vocabulary = DBoW3Engine.load_vocabulary(self.dbow3_vocabulary_path)
 
         os.makedirs(f"{tinynav_db_path}/nav_temp", exist_ok=True)
-        self.nav_temp_db = TinyNavDB(f"{tinynav_db_path}/nav_temp", is_scratch=True)
+        # No image videos in the scratch db. This one exists to hold live keyframes for
+        # nav-side loop closure, and it never gets an image written to it -- but with the
+        # default it still opened two h264 encoders at every nav start, for a directory
+        # nothing ever reads back.
+        self.nav_temp_db = TinyNavDB(
+            f"{tinynav_db_path}/nav_temp", is_scratch=True,
+            save_infra1_video=False, save_rgb_video=False,
+        )
         self.nav_loop_closure = LoopClosure(
             db=self.nav_temp_db,
             timestamps=[],

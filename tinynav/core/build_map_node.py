@@ -5,7 +5,6 @@ from nav_msgs.msg import Path, Odometry
 from std_msgs.msg import Bool, Float32
 import numpy as np
 
-from sensor_msgs.msg import PointCloud2
 from std_msgs.msg import Header
 from visualization_msgs.msg import Marker, MarkerArray
 from std_msgs.msg import ColorRGBA
@@ -458,35 +457,63 @@ class OdomPoseRecorder:
 
 
 class TinyNavDB():
-    def __init__(self, map_save_path:str, is_scratch:bool = True):
+    def __init__(self, map_save_path:str, is_scratch:bool = True,
+                 save_infra1_video: bool = True, save_rgb_video: bool = True):
+        """
+        save_*_video only affects *writing*. Reading a map always opens whatever videos
+        it has, so a map built without them stays loadable and the consumers below
+        already handle absence.
+
+        These two h264 encodes are 95% of the save_image_and_depth stage, measured on
+        the board over a 575-keyframe build: rgb 165.8 ms/keyframe = 95.3 s, infra1
+        32.1 ms/keyframe = 18.5 s, against 5.9 s for the depth shelve write and
+        everything else. That is 113.8 s of the 188.2 s mapping_loop total -- and it had
+        been attributed to writing the 801 MB depths.dat, which turns out to be the cheap
+        part.
+
+        Nothing on the navigation path reads either video: the rgb_loader/infra1_loader
+        closures returned by get_depth_embedding_features_images have no call site
+        anywhere, and every caller unpacks them as _. The real consumers are two PC-side
+        offline tools -- tool/convert_to_nerf_format.py reads rgb_images_db and
+        tool/poi_editor.py reads infra1_images_db. Encoding them on the board costs 95 s
+        to serve a tool that does not run there.
+        """
         self.map_save_path = map_save_path
         self.is_scratch = is_scratch
         mode = "write" if is_scratch else "read"
+        write_infra1 = save_infra1_video or not is_scratch
+        write_rgb = save_rgb_video or not is_scratch
         self.infra1_video_db = VideoDB(
             dir_path=f"{map_save_path}/infra1_images_db",
             mode=mode,
             fps=30,
-        )
+        ) if write_infra1 else None
         self.rgb_video_db = VideoDB(
             dir_path=f"{map_save_path}/rgb_images_db",
             mode=mode,
             fps=30,
-        )
+        ) if write_rgb else None
         if is_scratch:
-            if os.path.exists(f"{map_save_path}/features.db"):
-                os.remove(f"{map_save_path}/features.db")
-            if os.path.exists(f"{map_save_path}/depths.db"):
-                os.remove(f"{map_save_path}/depths.db")
-            if os.path.exists(f"{map_save_path}/embeddings.db"):
-                os.remove(f"{map_save_path}/embeddings.db")
+            # These used to look for "<name>.db", which IntKeyShelf never writes: it is
+            # backed by dbm.dumb, whose files are <name>.dir, <name>.dat and <name>.bak.
+            # So all three removals were no-ops, and a scratch build into a directory
+            # that already held a map silently *inherited* every previous keyframe --
+            # the shelves are opened for append, so depths.dat would simply keep
+            # growing. Production only escaped this because node_manager rmtree's
+            # map_path first; scripts/run_rosbag_build_map.sh does not.
+            for name in ("features", "depths", "embeddings"):
+                for suffix in (".dir", ".dat", ".bak"):
+                    stale = f"{map_save_path}/{name}{suffix}"
+                    if os.path.exists(stale):
+                        os.remove(stale)
         self.features = IntKeyShelf(f"{map_save_path}/features")
         self.embeddings = IntKeyShelf(f"{map_save_path}/embeddings")
         self.depths = IntKeyShelf(f"{map_save_path}/depths")
 
     def set_entry(self, key:int,   depth:np.ndarray = None, embedding:np.ndarray = None, features:dict = None,  infra1_image:np.ndarray = None, rgb_image:np.ndarray = None):
-        if infra1_image is not None:
+        if infra1_image is not None and self.infra1_video_db is not None:
             self.infra1_video_db.write(key, infra1_image)
-        if rgb_image is not None:
+        if rgb_image is not None and self.rgb_video_db is not None:
             self.rgb_video_db.write(key, rgb_image)
         if depth is not None:
             self.depths[key] = depth
@@ -498,12 +525,12 @@ class TinyNavDB():
     def get_depth_embedding_features_images(self, key:int):
         key_int = int(key)
         def rgb_loader():
-            if self.is_scratch:
+            if self.is_scratch or self.rgb_video_db is None:
                 return None
             return self.rgb_video_db.read(key_int)
 
         def infra1_loader():
-            if self.is_scratch:
+            if self.is_scratch or self.infra1_video_db is None:
                 return None
             return self.infra1_video_db.read(key_int)
 
@@ -529,16 +556,18 @@ class TinyNavDB():
         self.features.close()
         self.embeddings.close()
         self.depths.close()
-        self.infra1_video_db.close()
-        self.rgb_video_db.close()
+        if self.infra1_video_db is not None:
+            self.infra1_video_db.close()
+        if self.rgb_video_db is not None:
+            self.rgb_video_db.close()
 
     def sync(self):
         self.features.sync()
         self.embeddings.sync()
         self.depths.sync()
-        if hasattr(self.infra1_video_db, "sync"):
+        if self.infra1_video_db is not None and hasattr(self.infra1_video_db, "sync"):
             self.infra1_video_db.sync()
-        if hasattr(self.rgb_video_db, "sync"):
+        if self.rgb_video_db is not None and hasattr(self.rgb_video_db, "sync"):
             self.rgb_video_db.sync()
 
 class BagPlayer(Node):
@@ -792,6 +821,8 @@ class BuildMapNode(Node):
         global_frames_ratio: float = 1.1,
         sync_queue_size: int = 200,
         publish_visualization: bool = True,
+        save_infra1_video: bool = True,
+        save_rgb_video: bool = True,
     ):
         super().__init__('build_map_node')
         if global_frames_ratio < 1.0:
@@ -831,12 +862,13 @@ class BuildMapNode(Node):
         self.continuous_odom_sub = self.create_subscription(Odometry, '/slam/odometry', self.continuous_odom_callback, 100)
 
         self.marker_pub = self.create_publisher(MarkerArray, '/mapping/pointcloud_markers', 10)
-        self.local_map_pub = self.create_publisher(PointCloud2, "/mapping/local_map", 10)
         self.pose_graph_trajectory_pub = self.create_publisher(Path, "/mapping/pose_graph_trajectory", 10)
-        self.project_3d_to_2d_pub = self.create_publisher(Image, "/mapping/project_3d_to_2d", 10)
-        self.matches_image_pub = self.create_publisher(Image, "/mapping/keyframe_matches_images", 10)
-        self.loop_matches_image_pub = self.create_publisher(Image, "/mapping/loop_matches_images", 10)
-        self.global_map_marker_pub = self.create_publisher(MarkerArray, "/mapping/global_map_marker", 10)
+        # Removed: /mapping/local_map, /mapping/project_3d_to_2d,
+        # /mapping/keyframe_matches_images, /mapping/loop_matches_images and
+        # /mapping/global_map_marker. Each had zero .publish() calls and zero
+        # subscribers anywhere in the repo -- not even in docs/vis.rviz -- so they were
+        # five DDS writers' worth of discovery traffic and memory advertising topics that
+        # never carried a message.
 
         # Add stop signal subscription and save finished publisher
         self.mapping_stop_sub = self.create_subscription(Bool, '/benchmark/stop', self.mapping_stop_callback, 10)
@@ -864,7 +896,21 @@ class BuildMapNode(Node):
         self.continuous_odom_recorder = OdomPoseRecorder(map_save_path, "mapping")
 
         os.makedirs(f"{map_save_path}", exist_ok=True)
-        self.db = TinyNavDB(map_save_path)
+        self.db = TinyNavDB(
+            map_save_path,
+            save_infra1_video=save_infra1_video,
+            save_rgb_video=save_rgb_video,
+        )
+        if not save_infra1_video:
+            self.get_logger().warn(
+                "not writing infra1_images_db -- tool/poi_editor.py cannot show camera "
+                "images for this map"
+            )
+        if not save_rgb_video:
+            self.get_logger().warn(
+                "not writing rgb_images_db -- tool/convert_to_nerf_format.py cannot "
+                "export this map for 3DGS/nerf"
+            )
 
         self.marker_id = 0
 
@@ -1306,6 +1352,13 @@ def main(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--bag_file", type=str, default="tinynav_db")
     parser.add_argument("--map_save_path", type=str, default="tinynav_db")
+    # Default on, so scripts and PC builds are unchanged. The board's nav build turns
+    # them off from node_manager: measured 95.3 s (rgb) + 18.5 s (infra1) of h264
+    # encoding per 575-keyframe build, for two videos only PC-side offline tools read.
+    parser.add_argument("--no-infra1-video", dest="save_infra1_video", action="store_false",
+                        help="Skip the infra1 h264 encode (tool/poi_editor.py reads it)")
+    parser.add_argument("--no-rgb-video", dest="save_rgb_video", action="store_false",
+                        help="Skip the rgb h264 encode (tool/convert_to_nerf_format.py reads it)")
     parser.add_argument(
         "--skip-topics", type=str, default="",
         help=(
@@ -1388,6 +1441,8 @@ def main(args=None):
         global_frames_ratio=parsed_args.global_frames_ratio,
         sync_queue_size=parsed_args.sync_queue_size,
         publish_visualization=parsed_args.publish_visualization,
+        save_infra1_video=parsed_args.save_infra1_video,
+        save_rgb_video=parsed_args.save_rgb_video,
     )
     image_transports_node = ImageTransportsNode()
     exec_.add_node(player_node)
