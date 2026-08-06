@@ -1,5 +1,7 @@
 import argparse
 import copy
+import os
+import time
 
 import cv2
 import message_filters
@@ -21,6 +23,12 @@ from sensor_msgs.msg import CameraInfo, Image
 from tf2_msgs.msg import TFMessage
 
 from tinynav.core.math_utils import np2msg, pose_msg2np
+
+# Same switch and same default as planning_node's, so one environment variable turns on
+# the whole pipeline's stage timing. None means the timing is not emitted at all rather
+# than emitted and filtered: node_manager._launch_proc redirects stdout into an
+# unrotated file on the board's eMMC, and this callback runs at up to 5 Hz.
+_TIMER_LOGGER = print if os.environ.get('TINYNAV_VERBOSE_TIMER', '0') == '1' else None
 
 
 class LooperBridgeNode(Node):
@@ -306,12 +314,19 @@ class LooperBridgeNode(Node):
             self.log_missing_inputs()
             return
 
+        # Timed, and split by whether this set became a keyframe, because that split is
+        # the measurement. Before the keyframe-only restructuring below, every set paid
+        # the keyframe path's cost, so the gap between the two buckets is exactly what
+        # stopped being spent on the other four sets in five -- an internal comparison,
+        # immune to the run-to-run spread that made process CPU% useless here (three
+        # 60 s windows on identical code measured 103.6%, 108.3% and 107.6%).
+        #
+        # Emitted in planning_node's codetiming format on purpose, so
+        # tool/x5_board/planning_timer_stats.py aggregates it with no changes.
+        t_cb = time.perf_counter()
+
         T_world_camera = pose_msg2np(pose_msg)
         stamp = pose_msg.header.stamp
-
-        odom_msg = self.make_odom_msg(T_world_camera, stamp)
-        depth_m = self.decode_depth_meters(depth_msg)
-        depth_out = self.build_depth_msg(depth_m, stamp)
 
         stamp_s = self.stamp_to_sec(stamp)
         if self._last_sync_log_stamp is None or stamp_s - self._last_sync_log_stamp >= 1.0:
@@ -319,12 +334,26 @@ class LooperBridgeNode(Node):
             self.get_logger().info(
                 "sync_callback: "
                 f"t={stamp_s:.3f}, "
-                f"depth={depth_m.shape}, image={image_msg.height}x{image_msg.width}"
+                f"depth={depth_msg.height}x{depth_msg.width}, image={image_msg.height}x{image_msg.width}"
             )
 
-        image_out = copy.deepcopy(image_msg)
-        image_out.header.stamp = stamp
-        image_out.header.frame_id = "camera"
+        # This callback fires on every synced set, up to 5 Hz, but keyframes land at
+        # roughly 1 Hz -- so four of every five sets used to pay for work nobody read: a
+        # depth decode over 544x640, a 1.39 MB float32 Image built from it, a deepcopy of
+        # the infra1 image and an Odometry, all constructed unconditionally above and then
+        # used only inside the keyframe branch at the bottom. The latency of this callback
+        # is what decides whether map_node accepts the keyframe at all, so the waste was
+        # not merely CPU.
+        #
+        # should_add_keyframe is a pure predicate -- it reads last_keyframe_pose/time and
+        # the caller does the mutating -- so hoisting the call is safe, and it has to be
+        # hoisted for anything below to become conditional on it.
+        is_keyframe = self.should_add_keyframe(T_world_camera, stamp)
+
+        # Decoded at most once per callback, and only when something will read it.
+        depth_m = None
+        if is_keyframe or self.disparity_pub_vis is not None:
+            depth_m = self.decode_depth_meters(depth_msg)
 
         camera_info_out = copy.deepcopy(self.cached_camera_info)
         camera_info_out.header.stamp = stamp
@@ -342,12 +371,21 @@ class LooperBridgeNode(Node):
         if self.camera_info_alias_pub is not None:
             self.camera_info_alias_pub.publish(camera_info_out)
 
-        if self.should_add_keyframe(T_world_camera, stamp):
-            self.keyframe_pose_visual_pub.publish(odom_msg)
+        if is_keyframe:
+            image_out = copy.deepcopy(image_msg)
+            image_out.header.stamp = stamp
+            image_out.header.frame_id = "camera"
+            self.keyframe_pose_visual_pub.publish(self.make_odom_msg(T_world_camera, stamp))
             self.keyframe_image_pub.publish(image_out)
-            self.keyframe_depth_pub.publish(depth_out)
+            self.keyframe_depth_pub.publish(self.build_depth_msg(depth_m, stamp))
             self.last_keyframe_pose = T_world_camera.copy()
             self.last_keyframe_time = self.stamp_to_sec(stamp)
+
+        if _TIMER_LOGGER is not None:
+            name = "sync:keyframe" if is_keyframe else "sync:plain"
+            _TIMER_LOGGER(
+                f"[{name}] Elapsed time: {(time.perf_counter() - t_cb) * 1000.0:.0f} ms"
+            )
 
 
 def parse_args():
