@@ -382,21 +382,30 @@ class PlanningNode(Node):
         self.get_logger().info(f"planning pose source: {pose_topic}")
         self.pose_sub = message_filters.Subscriber(self, PoseStamped, pose_topic)
 
-        # Queue depth is a latency budget, not a completeness setting. message_filters
-        # delivers matched sets strictly in order, so a node that falls behind keeps
-        # emitting the *oldest* set it holds: 30 slots at the 5 Hz depth rate this
-        # board sustains is 6 seconds of backlog, and this callback is the only
-        # collision check on the trajectory that reaches the wheels. The same mistake
-        # cost 1.49 s of keyframe age in looper_bridge_node -- see its note at the
-        # sync-queue argument. 3 keeps the matcher's memory shorter than the reflex
-        # it feeds.
-        self.ts = message_filters.TimeSynchronizer([self.depth_sub, self.pose_sub], queue_size=3)
+        # Deep on purpose, and NOT a latency setting. This is an exact-stamp
+        # TimeSynchronizer over two streams at different rates -- /slam/depth at ~5 Hz
+        # against a ~20 Hz pose -- and message_filters applies one queue_size to both.
+        # Slots therefore buy different amounts of *time* per topic: 30 slots is 6 s of
+        # depth but only 1.5 s of pose, and the pose side is what has to still be in the
+        # buffer when its depth twin finally arrives after the bridge's ~1.33 MB decode
+        # and DDS hop.
+        #
+        # Measured, because I got this wrong once: cutting this to 3 (0.15 s of pose
+        # history) to "fix latency" collapsed the publish interval from p50 1.17 s /
+        # max 2.68 s to p50 3.2 s / max 215.6 s, and since a trajectory only lives 3.0 s
+        # it then expired before its successor arrived -- `trajectory expired` in
+        # cmd_vel_control went from 1 occurrence to 342. The robot stopped moving.
+        #
+        # Depth and freshness are separate concerns and the fix for each is separate.
+        # The queue's job is to not miss matches; max_input_age_s below is what refuses
+        # stale data, and it does it by measuring age rather than by hoping a shallow
+        # queue implies freshness. The age check is also cheap and runs before any work,
+        # so a backlog is walked through quickly instead of being planned on.
+        self.ts = message_filters.TimeSynchronizer([self.depth_sub, self.pose_sub], queue_size=30)
         self.ts.registerCallback(self.sync_callback)
-        # A shallow queue bounds how *much* staleness can accumulate; it cannot promise
-        # the set in hand is fresh. Planning on old geometry is worse than not planning:
-        # the robot reacts to obstacles that have moved and misses ones that have not.
-        # map_node guards its keyframes the same way (max_keyframe_age_s); planning had
-        # no age check at all.
+        # Planning on old geometry is worse than not planning: the robot reacts to
+        # obstacles that have moved and misses ones that have not. map_node guards its
+        # keyframes the same way (max_keyframe_age_s); planning had no age check at all.
         self.max_input_age_s = 0.5
         self._last_stale_log_ns = 0
         self.camerainfo_sub = self.create_subscription(CameraInfo, '/camera/camera/infra2/camera_info', self.info_callback, 10)
