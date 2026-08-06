@@ -42,7 +42,7 @@ from scipy.spatial.transform import Rotation as R
 from scipy.ndimage import distance_transform_edt
 
 from rclpy.executors import SingleThreadedExecutor
-from rosbag2_py import SequentialReader, StorageOptions, ConverterOptions
+from rosbag2_py import ConverterOptions, Info, SequentialReader, StorageFilter, StorageOptions
 from rosidl_runtime_py.utilities import get_message
 from rosgraph_msgs.msg import Clock
 from rclpy.serialization import deserialize_message
@@ -543,7 +543,7 @@ class TinyNavDB():
 
 class BagPlayer(Node):
     def __init__(self, bag_uri: str, storage_id: str = "sqlite3", serialization_format: str = "cdr",
-                 play_rate: float = 0.0,
+                 play_rate: float = 0.0, skip_topics: set[str] | None = None,
     ):
         super().__init__("rosbag_player")
 
@@ -585,18 +585,49 @@ class BagPlayer(Node):
             serialization_format,
         )
 
+        # An exclude list, deliberately, not an allow list. Most of a bag is replayed for
+        # nobody -- measured on a 61847-message Looper bag, /camera/camera/imu alone is
+        # 69.8% of messages and /camera/camera/infra2/image_rect_raw is 27% of the bytes,
+        # and each message costs a deserialize plus three publishes. But the consumers
+        # are not all in this process: looper_bridge_node subscribes to the raw camera
+        # topics in a separate process and produces the /slam/keyframe_* topics
+        # build_map_node actually reads, so a list derived from this node's own
+        # subscriptions would starve the bridge and yield an empty map with no error.
+        # An exclude list cannot make that mistake: anything not named still plays, so a
+        # topic added later keeps working and only what has been proven dead is dropped.
+        # Default empty -- the caller names what to skip, because whether a topic is dead
+        # depends on which sensor pipeline is running (perception_node needs infra2;
+        # looper mode never launches it).
+        self._skip_topics = set(skip_topics or ())
+        played = [t for t in topic_infos if t.name not in self._skip_topics]
+        skipped = sorted(t.name for t in topic_infos if t.name in self._skip_topics)
+
+        # Push the filter into the reader as well as the publisher map, so the skipped
+        # rows are never read off eMMC in the first place rather than read and discarded.
+        # Best-effort: older rosbag2_py builds lack set_filter, and play_next drops them
+        # anyway.
+        if skipped:
+            try:
+                self._reader.set_filter(StorageFilter(topics=[t.name for t in played]))
+            except (AttributeError, NameError, TypeError) as e:
+                self.get_logger().warn(
+                    f"reader-level topic filter unavailable ({e}); skipping at publish time instead"
+                )
+
         # topic -> (publisher, msg_type)
         self._topic_publishers = {}
 
-        # Build publishers for all topics in the bag
-        for topic_info in topic_infos:
+        for topic_info in played:
             msg_type = get_message(topic_info.type)
             pub = self.create_publisher(msg_type, topic_info.name, 10)
             self._topic_publishers[topic_info.name] = (pub, msg_type)
 
         self.get_logger().info("Bag topics and message types:")
         for topic_info in sorted(topic_infos, key=lambda t: t.name):
-            self.get_logger().info(f"  {topic_info.name} -> {topic_info.type}")
+            mark = "  [skipped] " if topic_info.name in self._skip_topics else "  "
+            self.get_logger().info(f"{mark}{topic_info.name} -> {topic_info.type}")
+        if skipped:
+            self.get_logger().info(f"not replaying {len(skipped)} topic(s): {', '.join(skipped)}")
 
         # /clock publisher (for use_sim_time)
         self._clock_pub = self.create_publisher(Clock, "/clock", 10)
@@ -605,8 +636,29 @@ class BagPlayer(Node):
         self.get_logger().info(f"BagPlayer opened bag: {bag_uri}")
 
     def _scan_bag_time_range(self, bag_uri: str, storage_id: str, serialization_format: str) -> tuple[int, int]:
-        # We have not found a rosbag2_py API that exposes the bag time range directly,
-        # so for now we scan the bag once to get the first and last message timestamps.
+        # metadata.yaml already carries both numbers, and rosbag2_py exposes it -- the
+        # previous comment here said no such API had been found, but tool/benchmark/
+        # benchmark_mapping.py has been using Info().read_metadata all along. The
+        # fallback below is a full extra sequential pass over the whole bag (2.0 GB on
+        # this dataset, off the board's eMMC) to recover two integers, so it is worth
+        # trying the cheap path first.
+        try:
+            # read_metadata wants the bag *directory*; callers pass either that or the
+            # bag_0.db3 file inside it (node_manager does the latter).
+            meta_dir = bag_uri if os.path.isdir(bag_uri) else os.path.dirname(bag_uri)
+            metadata = Info().read_metadata(meta_dir, storage_id)
+            first_ns = int(metadata.starting_time.nanoseconds)
+            last_ns = first_ns + int(metadata.duration.nanoseconds)
+            if metadata.message_count > 0 and last_ns > first_ns:
+                self.get_logger().info(
+                    f"bag time range from metadata: {metadata.message_count} messages, "
+                    f"{(last_ns - first_ns) / 1e9:.1f}s (skipped a full scan pass)"
+                )
+                return first_ns, last_ns
+            self.get_logger().warn("bag metadata has no usable time range; scanning instead")
+        except Exception as e:
+            self.get_logger().warn(f"could not read bag metadata ({e}); scanning instead")
+
         scan_reader = SequentialReader()
         scan_reader.open(
             StorageOptions(uri=bag_uri, storage_id=storage_id),
@@ -646,7 +698,16 @@ class BagPlayer(Node):
             self.get_logger().info(f"MAPPING_PERCENT:{percent:.1f}")
             self._last_percent_log_time = now
 
+    # Progress is a UI signal at human resolution, but this ran on every bag message --
+    # 61847 Float32 publishes and as many get_clock().now() calls on a 108 s bag, to move
+    # a percentage that nobody can read faster than a few times a second. The forced 100%
+    # at the end of the build does not go through here, so throttling cannot lose it.
+    _PERCENT_PUBLISH_EVERY_N = 50
+
     def _publish_percent_from_timestamp(self, timestamp_ns: int) -> None:
+        self._percent_msg_counter = getattr(self, '_percent_msg_counter', 0) + 1
+        if self._percent_msg_counter % self._PERCENT_PUBLISH_EVERY_N != 1:
+            return
         percent = 100.0 * (timestamp_ns - self.start_timestamp_ns) / (self.end_timestamp_ns - self.start_timestamp_ns)
         self._publish_percent(percent)
 
@@ -677,6 +738,13 @@ class BagPlayer(Node):
             return False
 
         topic, serialized_msg, timestamp_ns = self._reader.read_next()
+
+        # Before pacing and before deserializing: a skipped topic should cost nothing
+        # beyond the read. This is also the fallback path when the reader-level filter
+        # was unavailable, in which case these rows still arrive here.
+        if topic in self._skip_topics:
+            return True
+
         self._pace_to_timestamp(int(timestamp_ns))
         self._publish_percent_from_timestamp(int(timestamp_ns))
 
@@ -1238,6 +1306,15 @@ def main(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--bag_file", type=str, default="tinynav_db")
     parser.add_argument("--map_save_path", type=str, default="tinynav_db")
+    parser.add_argument(
+        "--skip-topics", type=str, default="",
+        help=(
+            "Comma-separated bag topics not to replay. Empty (the default) replays "
+            "everything, as before. Whether a topic is dead depends on which sensor "
+            "pipeline the build runs -- perception_node needs infra2, looper mode never "
+            "launches it -- so the caller decides, not this script."
+        ),
+    )
     # Default off, same reason as map_node: print() per keyframe onto the board's eMMC.
     parser.add_argument("--verbose_timer", action="store_true", default=False, help="Enable verbose timer output")
     parser.add_argument("--no_verbose_timer", dest="verbose_timer", action="store_false", help="Disable verbose timer output")
@@ -1295,7 +1372,10 @@ def main(args=None):
         embedding_extractor = Dinov2TRT()
 
     exec_ = SingleThreadedExecutor()
-    player_node = BagPlayer(parsed_args.bag_file, play_rate=parsed_args.play_rate)
+    skip_topics = {t.strip() for t in parsed_args.skip_topics.split(",") if t.strip()}
+    player_node = BagPlayer(
+        parsed_args.bag_file, play_rate=parsed_args.play_rate, skip_topics=skip_topics
+    )
     map_node = BuildMapNode(
         parsed_args.map_save_path,
         extractor=extractor,

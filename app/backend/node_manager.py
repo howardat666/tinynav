@@ -147,7 +147,28 @@ _MAP_SYNC_QUEUE = os.environ.get('TINYNAV_MAP_SYNC_QUEUE', '')
 _MAP_VISUALIZATION = os.environ.get('TINYNAV_MAP_VISUALIZATION', '0') == '1'
 
 
-def _build_map_argv(map_save_path: str, bag_file: str) -> list[str]:
+# Bag topics with no consumer in a *looper* offline build, and only there.
+#
+# The looper build launches exactly two processes -- looper_bridge_node and
+# build_map_node -- so the full set of consumed topics is known. imu goes to nobody
+# (perception_node is what integrates IMU, and it is the realsense branch); infra2's
+# image stream goes to nobody because Looper supplies hardware depth and no stereo runs;
+# vio_100hz is the controller's pose source and there is no controller in a map build.
+# Measured on a 61847-message bag: imu alone is 69.8% of messages and infra2's images are
+# 27% of the bytes, and every one of them costs a deserialize plus three publishes.
+#
+# Deliberately *not* applied to realsense builds: perception_node runs stereo and needs
+# infra2. And deliberately an exclude list -- an allow list derived from build_map_node's
+# own subscriptions would omit the raw camera topics the bridge needs in its separate
+# process, and the build would finish with an empty map and no error.
+_MAP_SKIP_TOPICS_LOOPER = (
+    '/camera/camera/imu',
+    '/camera/camera/infra2/image_rect_raw',
+    '/camera/camera/vio_100hz',
+)
+
+
+def _build_map_argv(map_save_path: str, bag_file: str, skip_topics: tuple = ()) -> list[str]:
     """build_map_node argv, with the board's resource limits applied if set."""
     argv = [
         'python3', os.path.join(_TINYNAV_ROOT, 'tinynav/core/build_map_node.py'),
@@ -163,6 +184,8 @@ def _build_map_argv(map_save_path: str, bag_file: str) -> list[str]:
         argv += ['--sync-queue-size', _MAP_SYNC_QUEUE]
     if not _MAP_VISUALIZATION:
         argv.append('--no-visualization')
+    if skip_topics:
+        argv += ['--skip-topics', ','.join(skip_topics)]
     return argv
 
 
@@ -1540,7 +1563,10 @@ class BackendNode(Ros2NodeManager):
             source_node_cmd,
             env=_env,
         )
-        build_argv = _build_map_argv(self.map_path, bag_file)
+        build_argv = _build_map_argv(
+            self.map_path, bag_file,
+            skip_topics=_MAP_SKIP_TOPICS_LOOPER if self._sensor_mode == 'looper' else (),
+        )
         self.get_logger().info(f'map build: {" ".join(build_argv[2:])}')
         self.processes['build_map'] = self._launch_proc_tee(
             'build_map_node',

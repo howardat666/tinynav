@@ -574,6 +574,9 @@ class MapNode(Node):
         self.relocalization_pose_weights = {}
         self.failed_relocalizations = []
         self.last_relocalization_failure_reason = ""
+        # Successes carry the same candidate detail failures already carried, so the two
+        # distributions are comparable from one grep over the log.
+        self.last_relocalization_detail = ""
         self.last_relocalization_timing = {}
 
         self.T_from_map_to_odom = None
@@ -968,6 +971,7 @@ class MapNode(Node):
         if timings is None:
             timings = {}
         self.last_relocalization_failure_reason = ""
+        self.last_relocalization_detail = ""
         if K is None:
             return self._relocalization_failed("camera intrinsics unavailable")
         t0 = time.perf_counter()
@@ -1064,8 +1068,20 @@ class MapNode(Node):
                             f"inliers={len(inliers)}/{len(point_2d_in_keyframe_list)}, "
                             f"candidates=[{'; '.join(candidate_summaries)}]"
                         )
-                    print(f"relocalization pose : {T}")
                     self.get_logger().info(f"Relocalization candidate timing ms: {'; '.join(candidate_timing_summaries)}")
+                    # Successes carried only pose_weight, so there was no way to compare
+                    # them against failures: the candidate similarities and the inlier
+                    # margin appeared in the failure reason and nowhere else. That made
+                    # the obvious question -- is the DBoW3 similarity discriminative
+                    # enough to reject bad candidates before paying for the match --
+                    # unanswerable from the logs, because only one side of the
+                    # distribution was recorded. Failures show sim 0.003-0.051; without
+                    # the same numbers on successes, any threshold is a guess.
+                    self.last_relocalization_detail = (
+                        f"inliers={len(inliers)}/{len(point_2d_in_keyframe_list)}, "
+                        f"landmarks={len(point_3d_in_world_list)}, "
+                        f"candidates=[{'; '.join(candidate_summaries)}]"
+                    )
                     return True, T, len(inliers) / len(point_2d_in_keyframe_list)
                 inlier_count = 0 if inliers is None else len(inliers)
                 self.get_logger().info(f"Relocalization candidate timing ms: {'; '.join(candidate_timing_summaries)}")
@@ -1200,7 +1216,7 @@ class MapNode(Node):
                 timestamp_ns,
                 True,
                 timings,
-                extra=f"pose_weight={pose_cov_weight:.3f}",
+                extra=f"pose_weight={pose_cov_weight:.3f}, {self.last_relocalization_detail}",
             )
             return True, pose_in_world
         else:
