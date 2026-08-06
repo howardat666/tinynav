@@ -57,7 +57,11 @@ _TIMER_LOGGER = print if os.environ.get('TINYNAV_VERBOSE_TIMER', '0') == '1' els
 # /planning/occupied_voxels stays unconditional: node_manager subscribes to that one for
 # the web UI.
 _PUBLISH_ESDF_CLOUD = os.environ.get('TINYNAV_PUBLISH_ESDF_CLOUD', '0') == '1'
-_PUBLISH_OBSTACLE_MASK = os.environ.get('TINYNAV_PUBLISH_OBSTACLE_MASK', '0') == '1'
+# The app's local-view layers: obstacle mask, height map (ESDF heatmap) and footprint.
+# One switch because they are one feature -- see the publish site for why grid_info ties
+# them together. ON by default: the previous default of off left the UI blank, which read
+# as "the frontend is broken" rather than "the publishes are disabled".
+_PUBLISH_PLANNING_OVERLAYS = os.environ.get('TINYNAV_PUBLISH_PLANNING_OVERLAYS', '1') == '1'
 
 # === Helper functions ===
 @njit(cache=True)
@@ -716,17 +720,25 @@ class PlanningNode(Node):
         with Timer(name='vis', text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=_TIMER_LOGGER):
             if _PUBLISH_ESDF_CLOUD:
                 self.publish_3d_occupancy_cloud_with_esdf(self.occupancy_grid, ESDF_map, self.resolution, self.origin)
-            # The obstacle mask is the only direct evidence of *why* every trajectory is
-            # rejected -- "All trajectories in collision" says the footprint is inside a
-            # dilated obstacle cell but not what put it there. The publish was commented
-            # out while node_manager kept subscribing, so the question was unanswerable
-            # and the app's overlay was silently blank. Off by default (it is an
-            # OccupancyGrid per cycle), on for diagnosis.
-            if _PUBLISH_OBSTACLE_MASK:
+            # These three are the app's local-view layers, and they are one group, not
+            # three independent switches: node_manager derives grid_info -- the
+            # world-to-canvas transform every other layer is drawn through -- from the
+            # obstacle mask's OccupancyGrid metadata. Publish the mask without the height
+            # map and the ESDF heatmap is blank; publish neither and grid_info is null, so
+            # the trajectory has thousands of points and nowhere to put them.
+            #
+            # All three had been commented out for cost while node_manager kept
+            # subscribing, which made the overlay silently blank and, for the mask
+            # specifically, made "All trajectories in collision" unanswerable -- it says
+            # the footprint is inside a dilated obstacle cell, not what put it there.
+            # On by default because the UI is unusable without them; the escape hatch is
+            # for when the board is starved.
+            if _PUBLISH_PLANNING_OVERLAYS:
                 self.publish_obstacle_mask(obstacle_mask, depth_msg.header.stamp)
-            #self.publish_height_map(T[:3,3], ESDF_map, depth_msg.header)
+                self.publish_height_map(T[:3, 3], ESDF_map, depth_msg.header)
+                self.publish_footprint(T, depth_msg.header.stamp)
+            # Left off deliberately: nothing subscribes to /planning/project_3d_to_2d.
             #self.publish_2d_occupancy_grid(ESDF_map, self.origin, self.resolution, depth_msg.header.stamp, z_offset=self.grid_shape[2]*self.resolution/2)
-            #self.publish_footprint(T, depth_msg.header.stamp)
 
         with Timer(name='traj gen', text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=_TIMER_LOGGER):
             query_stamp = stamp + self.planning_latency_s

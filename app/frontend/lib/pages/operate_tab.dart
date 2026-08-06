@@ -1531,7 +1531,11 @@ class _CameraPanelState extends ConsumerState<_CameraPanel> {
           if (selectedTopic != null && _latestFrame != null)
             GestureDetector(
               onTap: () => _showFullscreen(context),
-              child: Image.memory(_latestFrame!, fit: BoxFit.cover, gaplessPlayback: true),
+              // contain, not cover: this panel is much wider than the 640x544 frame it
+              // shows, and cover fills that width by cropping the top and bottom away.
+              // Letterboxing against the black background costs nothing and keeps the
+              // whole field of view visible, which is the point of a camera preview.
+              child: Image.memory(_latestFrame!, fit: BoxFit.contain, gaplessPlayback: true),
             )
           else
             Center(

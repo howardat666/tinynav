@@ -135,9 +135,11 @@ do_start() {
     #                 eMMC. 50 risks losing up to 50 keyframes if the build is killed.
     export TINYNAV_MAP_SAVE_VIDEOS="${TINYNAV_MAP_SAVE_VIDEOS:-0}"
     export TINYNAV_DB_SYNC_EVERY="${TINYNAV_DB_SYNC_EVERY:-50}"
-    # Diagnostics, off unless asked for. obstacle-mask answers "why is every trajectory
-    # in collision" -- node_manager already subscribes, the publish was commented out.
-    export TINYNAV_PUBLISH_OBSTACLE_MASK="${TINYNAV_PUBLISH_OBSTACLE_MASK:-0}"
+    # The app's local-view layers (obstacle mask + ESDF heatmap + footprint). ON: pinning
+    # these off is what made the web UI's middle panel blank -- and it also nulls
+    # grid_info, the transform every other layer is drawn through, because node_manager
+    # derives it from the mask's OccupancyGrid metadata. Set to 0 only to buy CPU back.
+    export TINYNAV_PUBLISH_PLANNING_OVERLAYS="${TINYNAV_PUBLISH_PLANNING_OVERLAYS:-1}"
     export TINYNAV_VERBOSE_TIMER="${TINYNAV_VERBOSE_TIMER:-0}"
 
     if [[ ! -f "${TINYNAV_DBOW3_VOCAB}" ]]; then
@@ -154,7 +156,7 @@ do_start() {
         echo "node logs     : ${TINYNAV_LOG_DIR}"
         echo "map vocab     : ${TINYNAV_DBOW3_VOCAB}"
         echo "map build     : rate=${TINYNAV_MAP_PLAY_RATE} queue=${TINYNAV_MAP_SYNC_QUEUE} vis=${TINYNAV_MAP_VISUALIZATION} videos=${TINYNAV_MAP_SAVE_VIDEOS} db_sync=${TINYNAV_DB_SYNC_EVERY}"
-        echo "diagnostics   : obstacle_mask=${TINYNAV_PUBLISH_OBSTACLE_MASK} verbose_timer=${TINYNAV_VERBOSE_TIMER}"
+        echo "diagnostics   : planning_overlays=${TINYNAV_PUBLISH_PLANNING_OVERLAYS} verbose_timer=${TINYNAV_VERBOSE_TIMER}"
         echo "=============================================================="
     } >> "${LOGFILE}"
 

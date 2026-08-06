@@ -75,34 +75,12 @@ class TinyNavApp extends ConsumerWidget {
           ),
         ),
       ),
-      builder: (context, child) {
-        if (!kIsWeb || child == null) return child ?? const SizedBox.shrink();
-
-        return LayoutBuilder(
-          builder: (context, constraints) {
-            final viewportAspect = constraints.maxWidth / constraints.maxHeight;
-
-            // Portrait (< 1:1): keep default stretch/fill behavior.
-            if (viewportAspect < 1.0) {
-              return child;
-            }
-
-            // Landscape (>= 1:1): lock app content to 1:1, top-aligned.
-            final side = constraints.maxHeight;
-            return ColoredBox(
-              color: const Color(0xFF11161C),
-              child: Align(
-                alignment: Alignment.topCenter,
-                child: SizedBox(
-                  width: side,
-                  height: side,
-                  child: ClipRect(child: child),
-                ),
-              ),
-            );
-          },
-        );
-      },
+      // No 1:1 landscape lock. Upstream clamps web content to a square when the
+      // viewport is wider than tall, which suits a tablet held sideways but not the
+      // laptop browser this is actually driven from: on a 16:9 window the whole app
+      // collapses into a centre square, the camera panel becomes that square's top
+      // 2/7 -- roughly 3.5:1 -- and BoxFit.cover then crops about two thirds off a
+      // 640x544 frame. Let the layout use the window it was given.
       // Switches automatically when deviceIpProvider changes.
       home: ip == null ? const SetupPage() : const HomePage(),
     );
