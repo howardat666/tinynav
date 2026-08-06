@@ -334,6 +334,7 @@ class BackendNode(Ros2NodeManager):
         self._voxel_points: list = []
         self._grid_info: dict | None = None
         self._nav_target_pose: dict | None = None
+        self._relocalization_stats: dict | None = None
 
         self._tf_buffer = None
         self._tf_listener = None
@@ -347,6 +348,16 @@ class BackendNode(Ros2NodeManager):
             # by map_node, unlike current_pose_in_map which requires POIs to be set).
             self.create_subscription(
                 Odometry, '/map/relocalization', self._on_relocalization, 10
+            )
+            # Rolling relocalization counters: how often it runs, how often it succeeds,
+            # and which layer the failures stop at. /map/relocalization only fires on
+            # success, so on its own it cannot distinguish "not trying" from "trying and
+            # failing" -- which is the question that matters when the robot has stopped.
+            # Latched, so a browser connecting mid-run sees the current numbers rather
+            # than waiting up to 10 s for the next window.
+            self.create_subscription(
+                String, '/map/relocalization_stats', self._on_relocalization_stats,
+                QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
             )
             self.create_subscription(Image, '/planning/height_map', self._on_height_map, 1)
             self.create_subscription(
@@ -474,6 +485,17 @@ class BackendNode(Ros2NodeManager):
     def _on_relocalization(self, msg: Odometry):
         with self._lock:
             self._localized = True
+
+    def _on_relocalization_stats(self, msg: String):
+        try:
+            stats = json.loads(msg.data)
+        except (ValueError, TypeError) as e:
+            # Logged rather than passed: silence here would make a malformed payload
+            # indistinguishable from map_node not publishing at all.
+            self.get_logger().warn(f'bad /map/relocalization_stats payload: {e}')
+            return
+        with self._lock:
+            self._relocalization_stats = stats
 
     def _on_nav_target_pose(self, msg: Odometry):
         with self._lock:
@@ -1064,6 +1086,7 @@ class BackendNode(Ros2NodeManager):
             battery = self._battery
             nav_nodes = self._nav_nodes_running
             nav_paused = self._nav_paused
+            reloc_stats = self._relocalization_stats
         if nav_nodes and self._report_dead_nav_procs():
             nav_nodes = False
         bag_recording = self.is_bag_recording()
@@ -1079,6 +1102,12 @@ class BackendNode(Ros2NodeManager):
             'rawState': raw,
             'navNodesRunning': nav_nodes,
             'navPaused': nav_paused,
+            # None until map_node's first 10 s window closes. Shape is
+            # {window, total, lastFailureCode, secondsSinceLastSuccess}, each of window
+            # and total carrying keyframes/attempts/success/failure, attemptHz,
+            # successHz, successRate and byCode. 'localized' alone cannot tell you
+            # whether relocalization is failing or simply not being attempted.
+            'relocalization': reloc_stats,
         }
 
     @staticmethod

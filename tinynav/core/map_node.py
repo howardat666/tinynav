@@ -457,6 +457,32 @@ class MapNode(Node):
         # faster or slower than real time throttles the same way.
         self._dropped_stale_keyframes = 0
         self._last_relocalization_stamp_ns = 0
+
+        # Runtime relocalization accounting.
+        #
+        # "Is relocalization working, and if not which layer is failing" was not
+        # answerable while the robot was running. The information existed only as
+        # individual log lines, so answering it meant grepping afterwards -- and the
+        # obvious grep is wrong, because failure lines carry solvePnPRansac's own
+        # `success=` as well as the relocalization result, which over-counts successes
+        # by roughly 2x. Counting here removes both problems: the rate and the failing
+        # layer are available live, in the log and over the backend's status API.
+        #
+        # Two windows. Cumulative answers "how has this run gone", the rolling window
+        # answers "what is happening now" -- which is the one that matters when you are
+        # standing next to a robot that has stopped, since a good first minute hides a
+        # bad current minute in the cumulative figure.
+        self._reloc_totals = self._new_reloc_bucket()
+        self._reloc_window = self._new_reloc_bucket()
+        # monotonic throughout: this board has no RTC, so a wall-clock span would jump.
+        self._reloc_start_monotonic = time.monotonic()
+        self._reloc_window_t0 = self._reloc_start_monotonic
+        self._reloc_last_success_monotonic = None
+        self._reloc_last_failure_code = ""
+        self._reloc_stats_pub = self.create_publisher(
+            String, '/map/relocalization_stats',
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+        )
         self._nav_warmup_lock = threading.Lock()
         self._nav_warmup_thread = None
         self.logger = logging.getLogger(__name__)
@@ -766,7 +792,10 @@ class MapNode(Node):
         now_ns = self.get_clock().now().nanoseconds
         stamp_ns = int(keyframe_image_msg.header.stamp.sec * 1e9) + int(keyframe_image_msg.header.stamp.nanosec)
         age_s = (now_ns - stamp_ns) / 1e9
+        self._reloc_tally('keyframes')
+        self._maybe_report_reloc_stats()
         if self.max_keyframe_age_s > 0.0 and age_s > self.max_keyframe_age_s:
+            self._reloc_tally('dropped_stale')
             # Logged as a running count rather than per drop: a message per
             # discarded keyframe would itself cost time in the loop that is
             # already behind, and the useful signal is the rate, not the events.
@@ -800,10 +829,17 @@ class MapNode(Node):
         since_last_s = (stamp_ns - self._last_relocalization_stamp_ns) / 1e9
         if self._last_relocalization_stamp_ns == 0 or since_last_s >= self.min_relocalization_interval_s:
             self._last_relocalization_stamp_ns = stamp_ns
+            self._reloc_tally('attempts')
             success, pose_in_world = self.keyframe_relocalization(keyframe_image_msg.header.stamp, image)
+            if success:
+                self._reloc_tally('success')
+                self._reloc_last_success_monotonic = time.monotonic()
         else:
             # Skipped, not failed. The keyframe still goes into the pose graph
-            # below; only the expensive relocalization is rate-limited.
+            # below; only the expensive relocalization is rate-limited. Counted
+            # separately because a skip landing in the same success=False bucket as a
+            # real failure is exactly what made the measured rate wrong.
+            self._reloc_tally('skipped_rate_limit')
             success, pose_in_world = False, np.eye(4)
         t_stage = mark_stage("relocalization", t_stage)
 
@@ -959,8 +995,89 @@ class MapNode(Node):
             path_msg.poses.append(pose)
         self.pose_graph_trajectory_pub.publish(path_msg)
 
-    def _relocalization_failed(self, reason: str) -> tuple[bool, np.ndarray, float]:
+    # Rolling-window length for the runtime stats. Long enough that a 1 Hz attempt rate
+    # gives a meaningful denominator, short enough to reflect where the robot is now.
+    _RELOC_STATS_INTERVAL_S = 10.0
+
+    @staticmethod
+    def _new_reloc_bucket() -> dict:
+        return {
+            'keyframes': 0,          # keyframe sets that arrived
+            'dropped_stale': 0,      # too old to be worth relocalizing against
+            'skipped_rate_limit': 0, # inside min_relocalization_interval_s
+            'attempts': 0,           # relocalization actually run
+            'success': 0,
+            'failure': 0,
+            'by_code': {},           # failure layer -> count
+        }
+
+    def _reloc_tally(self, key: str, code: str | None = None) -> None:
+        for bucket in (self._reloc_totals, self._reloc_window):
+            bucket[key] += 1
+            if code is not None:
+                bucket['by_code'][code] = bucket['by_code'].get(code, 0) + 1
+
+    def _reloc_stats_snapshot(self) -> dict:
+        """Both windows plus the derived rates, as the backend and the log both want."""
+        now = time.monotonic()
+        window_s = max(1e-6, now - self._reloc_window_t0)
+
+        def rates(bucket: dict, span_s: float) -> dict:
+            attempts = bucket['attempts']
+            return {
+                **{k: v for k, v in bucket.items() if k != 'by_code'},
+                'byCode': dict(bucket['by_code']),
+                # Two different frequencies, and conflating them is how a healthy stack
+                # looks broken: attemptHz is how often relocalization runs at all (capped
+                # by min_relocalization_interval_s), successHz is how often it produces a
+                # pose. successRate relates the two.
+                'attemptHz': round(attempts / span_s, 3),
+                'successHz': round(bucket['success'] / span_s, 3),
+                'successRate': round(bucket['success'] / attempts, 3) if attempts else None,
+                'spanS': round(span_s, 1),
+            }
+
+        uptime_s = max(1e-6, now - self._reloc_start_monotonic)
+        return {
+            'window': rates(self._reloc_window, window_s),
+            'total': rates(self._reloc_totals, uptime_s),
+            'lastFailureCode': self._reloc_last_failure_code or None,
+            'secondsSinceLastSuccess': (
+                round(now - self._reloc_last_success_monotonic, 1)
+                if self._reloc_last_success_monotonic is not None else None
+            ),
+        }
+
+    def _maybe_report_reloc_stats(self) -> None:
+        now = time.monotonic()
+        if now - self._reloc_window_t0 < self._RELOC_STATS_INTERVAL_S:
+            return
+        snap = self._reloc_stats_snapshot()
+        w = snap['window']
+        codes = ', '.join(f'{k}={v}' for k, v in sorted(w['byCode'].items())) or 'none'
+        rate = 'n/a' if w['successRate'] is None else f"{100.0 * w['successRate']:.0f}%"
+        self.get_logger().info(
+            f"relocalization {w['spanS']:.0f}s window: "
+            f"{w['keyframes']} keyframes -> {w['attempts']} attempts "
+            f"({w['attemptHz']:.2f} Hz) -> {w['success']} ok ({rate}, {w['successHz']:.2f} Hz); "
+            f"skipped_rate_limit={w['skipped_rate_limit']}, dropped_stale={w['dropped_stale']}; "
+            f"failures: {codes}"
+        )
+        try:
+            msg = String()
+            msg.data = json.dumps(snap, separators=(',', ':'))
+            self._reloc_stats_pub.publish(msg)
+        except Exception as e:
+            self.get_logger().warn(f"could not publish relocalization stats: {e}")
+        self._reloc_window = self._new_reloc_bucket()
+        self._reloc_window_t0 = now
+
+    def _relocalization_failed(self, reason: str, code: str = "unknown") -> tuple[bool, np.ndarray, float]:
+        # code is a short stable slug for the failing layer, so the counts stay
+        # aggregatable while `reason` keeps the numbers that explain the individual case.
         self.last_relocalization_failure_reason = reason
+        self._reloc_last_failure_code = code
+        self._reloc_tally('failure', code=code)
         return False, np.eye(4), -np.inf
 
     def _log_relocalization_timing(self, timestamp_ns: int, success: bool, timings: dict[str, float], extra: str = ""):
@@ -980,7 +1097,7 @@ class MapNode(Node):
         self.last_relocalization_failure_reason = ""
         self.last_relocalization_detail = ""
         if K is None:
-            return self._relocalization_failed("camera intrinsics unavailable")
+            return self._relocalization_failed("camera intrinsics unavailable", "no_intrinsics")
         t0 = time.perf_counter()
         query_embedding = self.get_embeddings(keyframe)
         query_embedding_norm = np.linalg.norm(query_embedding)
@@ -1053,7 +1170,8 @@ class MapNode(Node):
                     return self._relocalization_failed(
                         f"degenerate 2D observations: {spread_detail}, "
                         f"landmarks={len(point_3d_in_world_list)}, "
-                        f"candidates=[{'; '.join(candidate_summaries)}]"
+                        f"candidates=[{'; '.join(candidate_summaries)}]",
+                        "degenerate_2d",
                     )
 
                 t_pnp = time.perf_counter()
@@ -1073,7 +1191,8 @@ class MapNode(Node):
                         return self._relocalization_failed(
                             f"relocalized pose outside the map: {pose_detail}, "
                             f"inliers={len(inliers)}/{len(point_2d_in_keyframe_list)}, "
-                            f"candidates=[{'; '.join(candidate_summaries)}]"
+                            f"candidates=[{'; '.join(candidate_summaries)}]",
+                            "outside_map",
                         )
                     self.get_logger().info(f"Relocalization candidate timing ms: {'; '.join(candidate_timing_summaries)}")
                     # Successes carried only pose_weight, so there was no way to compare
@@ -1095,17 +1214,20 @@ class MapNode(Node):
                 return self._relocalization_failed(
                     f"solvePnPRansac failed or insufficient inliers: success={success}, "
                     f"inliers={inlier_count}<20, landmarks={len(point_3d_in_world_list)}, "
-                    f"candidates=[{'; '.join(candidate_summaries)}]"
+                    f"candidates=[{'; '.join(candidate_summaries)}]",
+                    "pnp_inliers",
                 )
             else:
                 self.get_logger().info(f"Relocalization candidate timing ms: {'; '.join(candidate_timing_summaries)}")
                 return self._relocalization_failed(
                     f"not enough valid depth landmarks: {landmark_count}<=40, "
-                    f"candidates=[{'; '.join(candidate_summaries)}]"
+                    f"candidates=[{'; '.join(candidate_summaries)}]",
+                    "few_landmarks",
                 )
         else:
             return self._relocalization_failed(
-                f"no loop candidates above threshold: candidates={len(candidates)}, max_similarity={max_similarity:.3f}"
+                f"no loop candidates above threshold: candidates={len(candidates)}, max_similarity={max_similarity:.3f}",
+                "no_candidates",
             )
         return self._relocalization_failed("unknown relocalization failure")
 
