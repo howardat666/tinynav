@@ -150,6 +150,48 @@ async def ws_pose(ws: WebSocket):
 
 
 # --------------------------------------------------------------------------- #
+# /ws/nav-progress  — pushed on every /mapping/nav_progress message           #
+# --------------------------------------------------------------------------- #
+
+@router.websocket('/ws/nav-progress')
+async def ws_nav_progress(ws: WebSocket):
+    await ws.accept()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=10)
+
+    loop = asyncio.get_event_loop()
+
+    def _on_progress(data: dict):
+        # Called from the rclpy spin thread — schedule onto the event loop.
+        loop.call_soon_threadsafe(lambda: _safe_put(queue, data))
+
+    node = runner.node
+    if node is None:
+        await ws.close(code=1013)
+        return
+
+    node.nav_progress_callbacks.append(_on_progress)
+    try:
+        while True:
+            # Bounded wait, not a bare queue.get(): progress only flows while a POI is
+            # active, so an idle robot would leave this coroutine parked forever and
+            # the callback registered long after the browser tab went away.
+            try:
+                data = await asyncio.wait_for(queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                if not _connected(ws):
+                    break
+                continue
+            await ws.send_text(json.dumps(data))
+    except WebSocketDisconnect:
+        pass
+    finally:
+        try:
+            node.nav_progress_callbacks.remove(_on_progress)
+        except ValueError:
+            pass
+
+
+# --------------------------------------------------------------------------- #
 # /ws/map-update  — polls for occupancy_grid.npy mtime changes               #
 # --------------------------------------------------------------------------- #
 

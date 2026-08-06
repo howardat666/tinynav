@@ -25,8 +25,7 @@ class LocalVoxelPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    canvas.drawRect(
-        Offset.zero & size, Paint()..color = const Color(0xFF0F1621));
+    canvas.drawRect(Offset.zero & size, Paint()..color = const Color(0xFF0F1621));
 
     final pose = odomPose;
     if (pose == null) {
@@ -39,31 +38,24 @@ class LocalVoxelPainter extends CustomPainter {
 
     _drawGroundGrid(canvas, center, scale);
 
-    final zBase = pose.z ?? 0.0;
-    final zRange = _zRange(points, zBase);
+    final zRange = _zRange(points);
     final sorted = [...points]
       ..sort((a, b) => _depth(a, pose).compareTo(_depth(b, pose)));
     for (final p in sorted) {
-      final rz = p.z - zBase;
-      final c = _project3d(center, scale, p.x - pose.x, p.y - pose.y, rz);
-      if (c.dx < -10 ||
-          c.dx > size.width + 10 ||
-          c.dy < -10 ||
-          c.dy > size.height + 10) continue;
-      final color = _heightColor(_zNorm(rz, zRange.$1, zRange.$2));
+      final c = _project3d(center, scale, p.x - pose.x, p.y - pose.y, p.z);
+      if (c.dx < -10 || c.dx > size.width + 10 || c.dy < -10 || c.dy > size.height + 10) continue;
+      final color = _heightColor(_zNorm(p.z, zRange.$1, zRange.$2));
       canvas.drawCircle(c, 2.25, Paint()..color = color.withOpacity(0.92));
     }
 
     _drawPath(canvas, center, scale, globalPath, const Color(0xFF69F0AE), 2.6);
     _drawPath(canvas, center, scale, trajectory, Colors.cyanAccent, 2.6);
     _drawFootprint(canvas, center, scale);
-    if (navTargetPose != null)
-      _drawNavTarget(canvas, center, scale, navTargetPose!);
+    if (navTargetPose != null) _drawNavTarget(canvas, center, scale, navTargetPose!);
     _drawRobotArrow(canvas, center, scale, pose.yaw);
   }
 
-  Offset _project3d(
-      Offset center, double scale, double dx, double dy, double z) {
+  Offset _project3d(Offset center, double scale, double dx, double dy, double z) {
     // Isometric-ish projection. viewYaw rotates the world around +Z before
     // projection so users can inspect the local voxel map from any side.
     final cosYaw = math.cos(viewYaw);
@@ -85,9 +77,9 @@ class LocalVoxelPainter extends CustomPainter {
     return rx + ry + p.z;
   }
 
-  (double, double) _zRange(List<VoxelPoint> pts, double zBase) {
+  (double, double) _zRange(List<VoxelPoint> pts) {
     if (pts.isEmpty) return (-0.4, 0.8);
-    final zs = pts.map((p) => p.z - zBase).toList()..sort();
+    final zs = pts.map((p) => p.z).toList()..sort();
     final loIdx = (zs.length * 0.05).floor().clamp(0, zs.length - 1).toInt();
     final hiIdx = (zs.length * 0.95).floor().clamp(0, zs.length - 1).toInt();
     final lo = zs[loIdx];
@@ -114,8 +106,7 @@ class LocalVoxelPainter extends CustomPainter {
     return Color.lerp(stops[i], stops[i + 1], localT)!;
   }
 
-  TrajPoint _rel(TrajPoint p, Pose pose) =>
-      TrajPoint(p.x - pose.x, p.y - pose.y);
+  TrajPoint _rel(TrajPoint p, Pose pose) => TrajPoint(p.x - pose.x, p.y - pose.y);
 
   void _drawGroundGrid(Canvas canvas, Offset center, double scale) {
     final paint = Paint()
@@ -131,8 +122,7 @@ class LocalVoxelPainter extends CustomPainter {
     }
   }
 
-  void _drawPath(Canvas canvas, Offset center, double scale,
-      List<TrajPoint> pts, Color color, double strokeWidth) {
+  void _drawPath(Canvas canvas, Offset center, double scale, List<TrajPoint> pts, Color color, double strokeWidth) {
     final pose = odomPose;
     if (pose == null || pts.length < 2) return;
     final path = Path();
@@ -168,8 +158,7 @@ class LocalVoxelPainter extends CustomPainter {
       path.lineTo(p.dx, p.dy);
     }
     path.close();
-    canvas.drawPath(
-        path, Paint()..color = const Color(0xFF64B5F6).withOpacity(0.22));
+    canvas.drawPath(path, Paint()..color = const Color(0xFF64B5F6).withOpacity(0.22));
     canvas.drawPath(
       path,
       Paint()
@@ -179,8 +168,7 @@ class LocalVoxelPainter extends CustomPainter {
     );
   }
 
-  void _drawNavTarget(
-      Canvas canvas, Offset center, double scale, TrajPoint target) {
+  void _drawNavTarget(Canvas canvas, Offset center, double scale, TrajPoint target) {
     final pose = odomPose;
     if (pose == null) return;
     final rp = _rel(target, pose);
@@ -210,12 +198,7 @@ class LocalVoxelPainter extends CustomPainter {
       ..lineTo(right.dx, right.dy)
       ..close();
     canvas.drawPath(path, Paint()..color = Colors.white);
-    canvas.drawPath(
-        path,
-        Paint()
-          ..color = Colors.black45
-          ..style = PaintingStyle.stroke
-          ..strokeWidth = 0.8);
+    canvas.drawPath(path, Paint()..color = Colors.black45..style = PaintingStyle.stroke..strokeWidth = 0.8);
   }
 
   void _drawEmpty(Canvas canvas, Size size) {
@@ -226,8 +209,7 @@ class LocalVoxelPainter extends CustomPainter {
       ),
       textDirection: TextDirection.ltr,
     )..layout(maxWidth: size.width);
-    tp.paint(canvas,
-        Offset((size.width - tp.width) / 2, (size.height - tp.height) / 2));
+    tp.paint(canvas, Offset((size.width - tp.width) / 2, (size.height - tp.height) / 2));
   }
 
   @override

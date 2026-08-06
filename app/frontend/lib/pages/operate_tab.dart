@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
@@ -5,6 +6,7 @@ import 'dart:typed_data';
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/gestures.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
@@ -14,8 +16,9 @@ import 'local_voxel_painter.dart';
 import 'map_painter.dart';
 import 'planning_painter.dart';
 
-const double _maxLinear = 0.5; // m/s
-const double _maxAngular = 1.0; // rad/s
+const double _maxLinear = 0.5;   // m/s
+const double _maxAngular = 1.0;  // rad/s
+const Duration _teleopSendInterval = Duration(milliseconds: 100); // 10 Hz
 
 // ── Main widget ───────────────────────────────────────────────────────────────
 
@@ -29,11 +32,17 @@ class OperateTab extends ConsumerStatefulWidget {
 class _OperateTabState extends ConsumerState<OperateTab> {
   WebSocketChannel? _teleopChannel;
   double _linearX = 0, _linearY = 0, _angularZ = 0;
+  DateTime _lastTeleopSend = DateTime.fromMillisecondsSinceEpoch(0);
+  Timer? _teleopTimer;
 
   bool _showObstacle = true;
   bool _showEsdf = true;
   bool _showTrajectory = true;
   bool _showGlobalPath = true;
+  bool _showGlobalMap = false;
+  bool _navArrived = false;
+  bool _showFootprint = true;
+  bool _localMapFill = false;
   bool _showLocal3d = false;
 
   @override
@@ -52,7 +61,20 @@ class _OperateTabState extends ConsumerState<OperateTab> {
     } catch (_) {}
   }
 
-  void _sendVelocity() {
+  void _sendVelocity({bool force = false}) {
+    final now = DateTime.now();
+    final elapsed = now.difference(_lastTeleopSend);
+    if (!force && elapsed < _teleopSendInterval) {
+      _teleopTimer ??= Timer(_teleopSendInterval - elapsed, () {
+        _teleopTimer = null;
+        _sendVelocity(force: true);
+      });
+      return;
+    }
+
+    _teleopTimer?.cancel();
+    _teleopTimer = null;
+    _lastTeleopSend = now;
     try {
       _teleopChannel?.sink.add(jsonEncode({
         'linear_x': _linearX,
@@ -65,26 +87,23 @@ class _OperateTabState extends ConsumerState<OperateTab> {
   void _onLeftJoystick(double x, double y) {
     _linearX = -y * _maxLinear;
     _linearY = -x * _maxLinear;
-    _sendVelocity();
+    _sendVelocity(force: x == 0 && y == 0);
   }
 
   void _onRightJoystick(double x, double y) {
     _angularZ = -x * _maxAngular;
-    _sendVelocity();
+    _sendVelocity(force: x == 0 && y == 0);
   }
 
   Future<void> _emergencyStop() async {
-    _linearX = 0;
-    _linearY = 0;
-    _angularZ = 0;
-    _sendVelocity();
-    try {
-      await ref.read(dioProvider).post('/nav/nodes/disable');
-    } catch (_) {}
+    _linearX = 0; _linearY = 0; _angularZ = 0;
+    _sendVelocity(force: true);
+    try { await ref.read(dioProvider).post('/nav/nodes/disable'); } catch (_) {}
   }
 
   @override
   void dispose() {
+    _teleopTimer?.cancel();
     _teleopChannel?.sink.close();
     super.dispose();
   }
@@ -92,9 +111,28 @@ class _OperateTabState extends ConsumerState<OperateTab> {
   @override
   Widget build(BuildContext context) {
     final poisAsync = ref.watch(poisProvider);
-    final poseAsync = ref.watch(poseStreamProvider);
     final planningAsync = ref.watch(planningStreamProvider);
     final planning = planningAsync.valueOrNull;
+    final localized = planning?.localized ?? false;
+    final activeNavPois = ref.watch(activeNavPoisProvider);
+    final mapInfo = ref.watch(mapInfoProvider).valueOrNull;
+    final baseUrl = ref.watch(baseUrlProvider);
+
+    ref.listen<AsyncValue<DeviceStatus>>(deviceStatusProvider, (prev, next) {
+      final prevState = prev?.valueOrNull?.rawState;
+      final nextState = next.valueOrNull?.rawState;
+      if (prevState == 'navigation' && nextState != 'navigation') {
+        ref.read(activeNavPoisProvider.notifier).state = const [];
+        setState(() => _navArrived = true);
+        Future.delayed(const Duration(milliseconds: 1200), () {
+          if (mounted) setState(() => _navArrived = false);
+        });
+      }
+    });
+
+    final status = ref.watch(deviceStatusProvider).valueOrNull;
+    final isNavigating = status?.rawState == 'navigation';
+    final np = isNavigating ? ref.watch(navProgressStreamProvider).valueOrNull : null;
 
     return Column(
       children: [
@@ -107,55 +145,95 @@ class _OperateTabState extends ConsumerState<OperateTab> {
           child: Stack(
             children: [
               Positioned.fill(
-                child: _LocalPlanningView(
-                  planning: planning,
-                  showObstacle: _showObstacle,
-                  showEsdf: _showEsdf,
-                  showTrajectory: _showTrajectory,
-                  showGlobalPath: _showGlobalPath,
-                  show3d: _showLocal3d,
-                ),
+                child: (_showGlobalMap && localized && mapInfo != null && baseUrl != null)
+                    ? _GlobalMapView(
+                        mapInfo: mapInfo,
+                        baseUrl: baseUrl,
+                        planning: planning,
+                        pois: activeNavPois,
+                      )
+                    : _LocalPlanningView(
+                        planning: planning,
+                        showObstacle: _showObstacle,
+                        showEsdf: _showEsdf,
+                        showTrajectory: _showTrajectory,
+                        showGlobalPath: _showGlobalPath,
+                        showFootprint: _showFootprint,
+                        fillViewport: _localMapFill,
+                        show3d: _showLocal3d,
+                      ),
               ),
               if (planning != null)
                 Positioned(
                   top: 8,
                   left: 8,
-                  child: _LocalizationChip(localized: planning.localized),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      _LocalizationChip(localized: localized),
+                      if (localized) ...[
+                        const SizedBox(width: 6),
+                        _MapToggleButton(
+                          showGlobalMap: _showGlobalMap,
+                          onTap: () => setState(() => _showGlobalMap = !_showGlobalMap),
+                        ),
+                      ],
+                    ],
+                  ),
                 ),
-              Positioned(
-                top: 8,
-                right: 8,
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.end,
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    _LocalViewModeButton(
-                      show3d: _showLocal3d,
-                      onTap: () => setState(() => _showLocal3d = !_showLocal3d),
-                    ),
-                    const SizedBox(height: 6),
-                    _LayerTogglePanel(
-                      showObstacle: _showObstacle,
-                      showEsdf: _showEsdf,
-                      showTrajectory: _showTrajectory,
-                      showGlobalPath: _showGlobalPath,
-                      onChanged: (obs, esdf, traj, gp) => setState(() {
-                        _showObstacle = obs;
-                        _showEsdf = esdf;
-                        _showTrajectory = traj;
-                        _showGlobalPath = gp;
-                      }),
-                    ),
-                  ],
+              if (!_showGlobalMap)
+                Positioned(
+                  top: 8,
+                  right: 8,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          _LocalViewModeButton(
+                            show3d: _showLocal3d,
+                            onTap: () => setState(() => _showLocal3d = !_showLocal3d),
+                          ),
+                          const SizedBox(width: 6),
+                          _LocalMapScaleButton(
+                            fillViewport: _localMapFill,
+                            onTap: () => setState(() => _localMapFill = !_localMapFill),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 6),
+                      _LayerTogglePanel(
+                        showObstacle: _showObstacle,
+                        showEsdf: _showEsdf,
+                        showTrajectory: _showTrajectory,
+                        showGlobalPath: _showGlobalPath,
+                        showFootprint: _showFootprint,
+                        onChanged: (obs, esdf, traj, gp, fp) => setState(() {
+                          _showObstacle = obs;
+                          _showEsdf = esdf;
+                          _showTrajectory = traj;
+                          _showGlobalPath = gp;
+                          _showFootprint = fp;
+                        }),
+                      ),
+                    ],
+                  ),
                 ),
-              ),
+              if (isNavigating || _navArrived)
+                Positioned(
+                  bottom: 52,
+                  left: 10,
+                  right: 10,
+                  child: _NavProgressOverlay(np: np, arrived: _navArrived, pois: activeNavPois),
+                ),
               Positioned(
                 bottom: 10,
                 left: 10,
                 child: _PoiButton(
                   poisAsync: poisAsync,
                   statusAsync: ref.watch(deviceStatusProvider),
-                  pose: poseAsync.valueOrNull,
                 ),
               ),
               Positioned(
@@ -163,15 +241,13 @@ class _OperateTabState extends ConsumerState<OperateTab> {
                 left: 0,
                 right: 0,
                 child: Center(
-                  child: _PauseButton(
-                      statusAsync: ref.watch(deviceStatusProvider)),
+                  child: _PauseButton(statusAsync: ref.watch(deviceStatusProvider)),
                 ),
               ),
               Positioned(
                 bottom: 10,
                 right: 10,
-                child: _NavNodesButton(
-                    statusAsync: ref.watch(deviceStatusProvider)),
+                child: _NavNodesButton(statusAsync: ref.watch(deviceStatusProvider)),
               ),
             ],
           ),
@@ -227,8 +303,7 @@ class _GlobalMapView extends StatelessWidget {
                     '$baseUrl${mapInfo.imageUrl}',
                     fit: BoxFit.fill,
                     gaplessPlayback: true,
-                    errorBuilder: (_, __, ___) =>
-                        const ColoredBox(color: Color(0xFF1A1A2E)),
+                    errorBuilder: (_, __, ___) => const ColoredBox(color: Color(0xFF1A1A2E)),
                   ),
                   if (p != null)
                     CustomPaint(
@@ -236,7 +311,7 @@ class _GlobalMapView extends StatelessWidget {
                         mapInfo: mapInfo,
                         pose: p.mapPose,
                         pois: pois,
-                        globalPath: p.globalPath,
+                        globalPath: p.mapGlobalPath,
                         showGlobalPath: true,
                       ),
                     ),
@@ -252,12 +327,14 @@ class _GlobalMapView extends StatelessWidget {
 
 // ── Local planning view ───────────────────────────────────────────────────────
 
-class _LocalPlanningView extends StatelessWidget {
+class _LocalPlanningView extends ConsumerStatefulWidget {
   final PlanningState? planning;
   final bool showObstacle;
   final bool showEsdf;
   final bool showTrajectory;
   final bool showGlobalPath;
+  final bool showFootprint;
+  final bool fillViewport;
   final bool show3d;
 
   const _LocalPlanningView({
@@ -266,76 +343,335 @@ class _LocalPlanningView extends StatelessWidget {
     this.showEsdf = false,
     this.showTrajectory = false,
     this.showGlobalPath = true,
+    this.showFootprint = true,
+    this.fillViewport = false,
     this.show3d = false,
   });
 
   @override
+  ConsumerState<_LocalPlanningView> createState() => _LocalPlanningViewState();
+}
+
+class _ManualTarget {
+  final double x;
+  final double y;
+  final double z;
+  final bool usedVoxelZ;
+
+  const _ManualTarget({
+    required this.x,
+    required this.y,
+    required this.z,
+    required this.usedVoxelZ,
+  });
+}
+
+class _LocalPlanningViewState extends ConsumerState<_LocalPlanningView> {
+  final TransformationController _txCtrl = TransformationController();
+  _ManualTarget? _pendingTarget;
+  Timer? _manualTargetTimer;
+  Offset? _manualTargetStart;
+
+  @override
+  void dispose() {
+    _manualTargetTimer?.cancel();
+    _txCtrl.dispose();
+    super.dispose();
+  }
+
+  _ManualTarget? _targetFromLocalPosition(Offset viewportPos, Size viewportSize) {
+    final p = widget.planning;
+    final pose = p?.odomPose;
+    if (p == null || pose == null || viewportSize.width <= 0 || viewportSize.height <= 0) {
+      return null;
+    }
+
+    final childPos = MatrixUtils.transformPoint(
+      Matrix4.inverted(_txCtrl.value),
+      viewportPos,
+    );
+    final gi = p.gridInfo;
+    final worldW = gi != null ? gi.width * gi.resolution : 10.0;
+    final worldH = gi != null ? gi.height * gi.resolution : 10.0;
+    final dx = (childPos.dx - viewportSize.width / 2) * worldW / viewportSize.width;
+    final dy = (viewportSize.height / 2 - childPos.dy) * worldH / viewportSize.height;
+    final x = pose.x + dx;
+    final y = pose.y + dy;
+    final zHit = _nearbyVoxelMedianZ(p.voxelPoints, x, y);
+    return _ManualTarget(
+      x: x,
+      y: y,
+      z: zHit ?? pose.z ?? 0.0,
+      usedVoxelZ: zHit != null,
+    );
+  }
+
+  double? _nearbyVoxelMedianZ(List<VoxelPoint> voxels, double x, double y) {
+    const radius = 0.35;
+    final zs = <double>[];
+    for (final v in voxels) {
+      final dx = v.x - x;
+      final dy = v.y - y;
+      if (dx * dx + dy * dy <= radius * radius) zs.add(v.z);
+    }
+    if (zs.isEmpty) return null;
+    zs.sort();
+    return zs[zs.length ~/ 2];
+  }
+
+  void _startManualTargetTimer(PointerDownEvent event, Size viewportSize) {
+    _manualTargetTimer?.cancel();
+    _manualTargetStart = event.localPosition;
+    _manualTargetTimer = Timer(const Duration(seconds: 2), () {
+      _manualTargetTimer = null;
+      final start = _manualTargetStart;
+      if (start != null) _handleLongPress(start, viewportSize);
+    });
+  }
+
+  void _maybeCancelManualTargetTimer(PointerMoveEvent event) {
+    final start = _manualTargetStart;
+    if (start == null) return;
+    if ((event.localPosition - start).distance > 10) {
+      _cancelManualTargetTimer();
+    }
+  }
+
+  void _cancelManualTargetTimer() {
+    _manualTargetTimer?.cancel();
+    _manualTargetTimer = null;
+    _manualTargetStart = null;
+  }
+
+  Future<void> _handleLongPress(Offset localPos, Size viewportSize) async {
+    final target = _targetFromLocalPosition(localPos, viewportSize);
+    if (target == null || !mounted) return;
+    setState(() => _pendingTarget = target);
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Set manual target?'),
+        content: Text(
+          'Publish /control/target_pose to:\n'
+          'x=${target.x.toStringAsFixed(2)}, '
+          'y=${target.y.toStringAsFixed(2)}, '
+          'z=${target.z.toStringAsFixed(2)}\n\n'
+          '${target.usedVoxelZ ? 'z from nearby occupied voxels.' : 'No nearby voxel height; z uses current robot height.'}',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Publish'),
+          ),
+        ],
+      ),
+    );
+
+    if (!mounted) return;
+    if (confirmed == true) {
+      try {
+        await ref.read(dioProvider).post('/nav/manual-target', data: {
+          'x': target.x,
+          'y': target.y,
+          'z': target.z,
+        });
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Manual target published')),
+          );
+        }
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Failed to publish target: $e')),
+          );
+        }
+      }
+    }
+    if (mounted) setState(() => _pendingTarget = null);
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final p = planning;
+    final p = widget.planning;
+    final gi = p?.gridInfo;
+    final localAspectRatio =
+        (gi != null && gi.height > 0) ? gi.width / gi.height : 1.0;
+
     return Stack(
       fit: StackFit.expand,
       children: [
         Container(color: const Color(0xFF0D1117)),
-        Center(
-          child: AspectRatio(
-            aspectRatio: 1.0,
-            child: show3d
-                ? _Local3dPlanningView(planning: p)
-                : InteractiveViewer(
-                    minScale: 0.5,
-                    maxScale: 8.0,
-                    boundaryMargin: const EdgeInsets.all(double.infinity),
-                    child: Stack(
-                      fit: StackFit.expand,
-                      children: [
-                        if (showEsdf && p?.esdfImage != null)
-                          Opacity(
-                            opacity: 0.85,
-                            child: Image.memory(p!.esdfImage!,
-                                fit: BoxFit.fill, gaplessPlayback: true),
-                          ),
-                        if (showObstacle && p?.obstacleImage != null)
-                          Opacity(
-                            opacity: 0.45,
-                            child: Image.memory(p!.obstacleImage!,
-                                fit: BoxFit.fill, gaplessPlayback: true),
-                          ),
-                        if (p != null)
-                          CustomPaint(
-                            painter: LocalPlanningPainter(
-                              trajectory: p.trajectory,
-                              globalPath: p.globalPath,
-                              gridInfo: p.gridInfo,
-                              odomPose: p.odomPose,
-                              showTrajectory: showTrajectory,
-                              showGlobalPath: showGlobalPath,
-                              navTargetPose: p.navTargetPose,
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          child: Center(
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                final maxW = constraints.maxWidth;
+                final maxH = constraints.maxHeight;
+                final aspect = localAspectRatio.isFinite && localAspectRatio > 0
+                    ? localAspectRatio
+                    : 1.0;
+                final containW = maxW / maxH > aspect ? maxH * aspect : maxW;
+                final containH = containW / aspect;
+                final viewportSize = widget.fillViewport
+                    ? Size(maxW, maxH)
+                    : Size(containW, containH);
+                final targetPose = _pendingTarget != null
+                    ? TrajPoint(_pendingTarget!.x, _pendingTarget!.y)
+                    : p?.navTargetPose;
+
+                final content = widget.show3d
+                    ? _Local3dPlanningView(planning: p)
+                    : InteractiveViewer(
+                        transformationController: _txCtrl,
+                        minScale: 0.5,
+                        maxScale: 8.0,
+                        boundaryMargin: const EdgeInsets.all(double.infinity),
+                        child: Stack(
+                          fit: StackFit.expand,
+                          children: [
+                            const ColoredBox(color: Color(0xFF0F1621)),
+                            if (widget.showEsdf && p?.esdfImage != null)
+                              Opacity(
+                                opacity: 0.85,
+                                child: Image.memory(
+                                  p!.esdfImage!,
+                                  fit: BoxFit.fill,
+                                  gaplessPlayback: true,
+                                ),
+                              ),
+                            if (widget.showObstacle && p?.obstacleImage != null)
+                              Opacity(
+                                opacity: 0.45,
+                                child: Image.memory(
+                                  p!.obstacleImage!,
+                                  fit: BoxFit.fill,
+                                  gaplessPlayback: true,
+                                ),
+                              ),
+                            if (p != null)
+                              CustomPaint(
+                                painter: LocalPlanningPainter(
+                                  trajectory: p.trajectory,
+                                  globalPath: p.globalPath,
+                                  footprint: p.footprint,
+                                  gridInfo: p.gridInfo,
+                                  odomPose: p.odomPose,
+                                  showTrajectory: widget.showTrajectory,
+                                  showGlobalPath: widget.showGlobalPath,
+                                  showFootprint: widget.showFootprint,
+                                  navTargetPose: targetPose,
+                                ),
+                              )
+                            else
+                              Center(
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 14,
+                                    vertical: 10,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: Colors.black.withOpacity(0.45),
+                                    borderRadius: BorderRadius.circular(12),
+                                    border: Border.all(
+                                      color: Colors.white.withOpacity(0.12),
+                                    ),
+                                  ),
+                                  child: const Column(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Icon(
+                                        Icons.map_outlined,
+                                        size: 40,
+                                        color: Colors.white38,
+                                      ),
+                                      SizedBox(height: 8),
+                                      Text(
+                                        'Waiting for planning data…',
+                                        style: TextStyle(
+                                          color: Colors.white70,
+                                          fontSize: 13,
+                                          fontWeight: FontWeight.w500,
+                                        ),
+                                      ),
+                                      SizedBox(height: 2),
+                                      Text(
+                                        'Connect device and start local planning',
+                                        style: TextStyle(
+                                          color: Colors.white38,
+                                          fontSize: 11,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            IgnorePointer(
+                              child: DecoratedBox(
+                                decoration: BoxDecoration(
+                                  gradient: LinearGradient(
+                                    begin: Alignment.topCenter,
+                                    end: Alignment.bottomCenter,
+                                    colors: [
+                                      Colors.white.withOpacity(0.04),
+                                      Colors.transparent,
+                                      Colors.black.withOpacity(0.08),
+                                    ],
+                                    stops: const [0.0, 0.35, 1.0],
+                                  ),
+                                ),
+                              ),
                             ),
-                          )
-                        else
-                          const Center(
-                            child: Column(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Icon(Icons.map_outlined,
-                                    size: 48, color: Colors.white24),
-                                SizedBox(height: 8),
-                                Text('Waiting for planning data…',
-                                    style: TextStyle(
-                                        color: Colors.white38, fontSize: 13)),
-                              ],
-                            ),
-                          ),
+                          ],
+                        ),
+                      );
+
+                return SizedBox(
+                  width: viewportSize.width,
+                  height: viewportSize.height,
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(16),
+                      border: Border.all(
+                        color: Colors.white.withOpacity(0.12),
+                        width: 1,
+                      ),
+                      boxShadow: const [
+                        BoxShadow(
+                          color: Color(0x55000000),
+                          blurRadius: 14,
+                          offset: Offset(0, 6),
+                        ),
                       ],
                     ),
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(16),
+                      child: Listener(
+                        behavior: HitTestBehavior.translucent,
+                        onPointerDown: (event) =>
+                            _startManualTargetTimer(event, viewportSize),
+                        onPointerMove: _maybeCancelManualTargetTimer,
+                        onPointerUp: (_) => _cancelManualTargetTimer(),
+                        onPointerCancel: (_) => _cancelManualTargetTimer(),
+                        child: content,
+                      ),
+                    ),
                   ),
+                );
+              },
+            ),
           ),
         ),
       ],
     );
   }
 }
-
 class _Local3dPlanningView extends StatefulWidget {
   final PlanningState? planning;
 
@@ -365,18 +701,24 @@ class _Local3dPlanningViewState extends State<_Local3dPlanningView> {
     _startFocalPoint = details.focalPoint;
   }
 
+  bool get _isControlPressed {
+    final keys = HardwareKeyboard.instance.logicalKeysPressed;
+    return keys.contains(LogicalKeyboardKey.controlLeft) ||
+        keys.contains(LogicalKeyboardKey.controlRight);
+  }
+
   void _onScaleUpdate(ScaleUpdateDetails details) {
+    final ctrlRotate = _isControlPressed && details.pointerCount <= 1;
     setState(() {
-      if (details.pointerCount <= 1) {
-        _viewYaw = _normalizeYaw(
-            _startYaw + (details.focalPoint.dx - _startFocalPoint.dx) * 0.012);
+      if (ctrlRotate) {
+        _viewYaw = _startYaw + (details.focalPoint.dx - _startFocalPoint.dx) * 0.012;
         return;
       }
-      _scale =
-          (_startScale * details.scale).clamp(_minScale, _maxScale).toDouble();
+
+      _scale = (_startScale * details.scale).clamp(_minScale, _maxScale).toDouble();
       _pan = _startPan + details.focalPoint - _startFocalPoint;
       if (details.pointerCount >= 2) {
-        _viewYaw = _normalizeYaw(_startYaw + details.rotation);
+        _viewYaw = _startYaw + details.rotation;
       }
     });
   }
@@ -384,8 +726,7 @@ class _Local3dPlanningViewState extends State<_Local3dPlanningView> {
   void _onPointerSignal(PointerSignalEvent event) {
     if (event is! PointerScrollEvent) return;
     final zoom = event.scrollDelta.dy < 0 ? 1.10 : 0.90;
-    setState(
-        () => _scale = (_scale * zoom).clamp(_minScale, _maxScale).toDouble());
+    setState(() => _scale = (_scale * zoom).clamp(_minScale, _maxScale).toDouble());
   }
 
   void _resetView() {
@@ -394,15 +735,6 @@ class _Local3dPlanningViewState extends State<_Local3dPlanningView> {
       _viewYaw = 0.0;
       _pan = Offset.zero;
     });
-  }
-
-  void _rotateBy(double delta) {
-    setState(() => _viewYaw = _normalizeYaw(_viewYaw + delta));
-  }
-
-  double _normalizeYaw(double yaw) {
-    const fullTurn = pi * 2.0;
-    return (yaw + pi) % fullTurn - pi;
   }
 
   @override
@@ -449,79 +781,16 @@ class _Local3dPlanningViewState extends State<_Local3dPlanningView> {
                   child: const Padding(
                     padding: EdgeInsets.symmetric(horizontal: 8, vertical: 5),
                     child: Text(
-                      'Drag rotate · pinch pan/zoom · scroll zoom',
+                      'Pinch rotate · Ctrl+drag rotate · double tap reset',
                       style: TextStyle(color: Colors.white54, fontSize: 10),
                     ),
                   ),
                 ),
               ),
             ),
-            Positioned(
-              right: 8,
-              bottom: 8,
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  _ViewControlButton(
-                    icon: Icons.rotate_left_rounded,
-                    tooltip: 'Rotate left',
-                    onTap: () => _rotateBy(-pi / 12.0),
-                  ),
-                  const SizedBox(width: 6),
-                  _ViewControlButton(
-                    icon: Icons.center_focus_strong_rounded,
-                    tooltip: 'Reset view',
-                    onTap: _resetView,
-                  ),
-                  const SizedBox(width: 6),
-                  _ViewControlButton(
-                    icon: Icons.rotate_right_rounded,
-                    tooltip: 'Rotate right',
-                    onTap: () => _rotateBy(pi / 12.0),
-                  ),
-                ],
-              ),
-            ),
           ],
         ),
-      ),
-    );
-  }
-}
-
-class _ViewControlButton extends StatelessWidget {
-  final IconData icon;
-  final String tooltip;
-  final VoidCallback onTap;
-
-  const _ViewControlButton({
-    required this.icon,
-    required this.tooltip,
-    required this.onTap,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Tooltip(
-      message: tooltip,
-      child: Material(
-        color: Colors.black54,
-        borderRadius: BorderRadius.circular(10),
-        child: InkWell(
-          borderRadius: BorderRadius.circular(10),
-          onTap: onTap,
-          child: Container(
-            width: 32,
-            height: 32,
-            alignment: Alignment.center,
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(10),
-              border: Border.all(color: Colors.white12),
-            ),
-            child: Icon(icon, color: Colors.white70, size: 18),
-          ),
-        ),
-      ),
+      )
     );
   }
 }
@@ -551,6 +820,47 @@ class _LocalViewModeButton extends StatelessWidget {
             fontWeight: FontWeight.w700,
           ),
         ),
+      )
+    );
+  }
+}
+
+class _LocalMapScaleButton extends StatelessWidget {
+  final bool fillViewport;
+  final VoidCallback onTap;
+
+  const _LocalMapScaleButton({required this.fillViewport, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        decoration: BoxDecoration(
+          color: Colors.black54,
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: Colors.white12),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              fillViewport ? Icons.fullscreen_exit_rounded : Icons.fullscreen_rounded,
+              size: 15,
+              color: Colors.white70,
+            ),
+            const SizedBox(width: 5),
+            Text(
+              fillViewport ? 'Fill' : 'Fit',
+              style: const TextStyle(
+                color: Colors.white70,
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -561,13 +871,15 @@ class _LayerTogglePanel extends StatefulWidget {
   final bool showEsdf;
   final bool showTrajectory;
   final bool showGlobalPath;
-  final void Function(bool obs, bool esdf, bool traj, bool gp) onChanged;
+  final bool showFootprint;
+  final void Function(bool obs, bool esdf, bool traj, bool gp, bool fp) onChanged;
 
   const _LayerTogglePanel({
     required this.showObstacle,
     required this.showEsdf,
     required this.showTrajectory,
     required this.showGlobalPath,
+    required this.showFootprint,
     required this.onChanged,
   });
 
@@ -595,11 +907,9 @@ class _LayerTogglePanelState extends State<_LayerTogglePanel> {
             child: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
-                const Icon(Icons.layers_outlined,
-                    color: Colors.white70, size: 14),
+                const Icon(Icons.layers_outlined, color: Colors.white70, size: 14),
                 const SizedBox(width: 4),
-                const Text('Layers',
-                    style: TextStyle(color: Colors.white70, fontSize: 12)),
+                const Text('Layers', style: TextStyle(color: Colors.white70, fontSize: 12)),
                 const SizedBox(width: 4),
                 Icon(_expanded ? Icons.expand_less : Icons.expand_more,
                     color: Colors.white54, size: 14),
@@ -619,26 +929,16 @@ class _LayerTogglePanelState extends State<_LayerTogglePanel> {
               crossAxisAlignment: CrossAxisAlignment.start,
               mainAxisSize: MainAxisSize.min,
               children: [
-                _LayerRow(
-                    'Obstacle',
-                    widget.showObstacle,
-                    (v) => widget.onChanged(v, widget.showEsdf,
-                        widget.showTrajectory, widget.showGlobalPath)),
-                _LayerRow(
-                    'ESDF',
-                    widget.showEsdf,
-                    (v) => widget.onChanged(widget.showObstacle, v,
-                        widget.showTrajectory, widget.showGlobalPath)),
-                _LayerRow(
-                    'Trajectory',
-                    widget.showTrajectory,
-                    (v) => widget.onChanged(widget.showObstacle,
-                        widget.showEsdf, v, widget.showGlobalPath)),
-                _LayerRow(
-                    'Global Path',
-                    widget.showGlobalPath,
-                    (v) => widget.onChanged(widget.showObstacle,
-                        widget.showEsdf, widget.showTrajectory, v)),
+                _LayerRow('Obstacle', widget.showObstacle,
+                    (v) => widget.onChanged(v, widget.showEsdf, widget.showTrajectory, widget.showGlobalPath, widget.showFootprint)),
+                _LayerRow('ESDF', widget.showEsdf,
+                    (v) => widget.onChanged(widget.showObstacle, v, widget.showTrajectory, widget.showGlobalPath, widget.showFootprint)),
+                _LayerRow('Trajectory', widget.showTrajectory,
+                    (v) => widget.onChanged(widget.showObstacle, widget.showEsdf, v, widget.showGlobalPath, widget.showFootprint)),
+                _LayerRow('Global Path', widget.showGlobalPath,
+                    (v) => widget.onChanged(widget.showObstacle, widget.showEsdf, widget.showTrajectory, v, widget.showFootprint)),
+                _LayerRow('Footprint', widget.showFootprint,
+                    (v) => widget.onChanged(widget.showObstacle, widget.showEsdf, widget.showTrajectory, widget.showGlobalPath, v)),
               ],
             ),
           ),
@@ -672,9 +972,48 @@ class _LayerRow extends StatelessWidget {
           ),
         ),
         const SizedBox(width: 4),
-        Text(label,
-            style: const TextStyle(color: Colors.white70, fontSize: 12)),
+        Text(label, style: const TextStyle(color: Colors.white70, fontSize: 12)),
       ],
+    );
+  }
+}
+
+// ── Map toggle button ─────────────────────────────────────────────────────────
+
+class _MapToggleButton extends StatelessWidget {
+  final bool showGlobalMap;
+  final VoidCallback onTap;
+
+  const _MapToggleButton({required this.showGlobalMap, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        decoration: BoxDecoration(
+          color: showGlobalMap
+              ? Colors.blueAccent.withOpacity(0.85)
+              : Colors.black54,
+          borderRadius: BorderRadius.circular(20),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              showGlobalMap ? Icons.map_rounded : Icons.grid_view_rounded,
+              color: Colors.white,
+              size: 14,
+            ),
+            const SizedBox(width: 4),
+            Text(
+              showGlobalMap ? 'Global' : 'Local',
+              style: const TextStyle(color: Colors.white, fontSize: 12),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }
@@ -698,15 +1037,13 @@ class _LocalizationChip extends StatelessWidget {
         mainAxisSize: MainAxisSize.min,
         children: [
           Container(
-            width: 7,
-            height: 7,
+            width: 7, height: 7,
             decoration: BoxDecoration(shape: BoxShape.circle, color: dotColor),
           ),
           const SizedBox(width: 6),
           Text(
             localized ? 'Localized' : 'Not Localized',
-            style: const TextStyle(
-                color: Colors.white, fontSize: 12, fontWeight: FontWeight.w500),
+            style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w500),
           ),
         ],
       ),
@@ -719,12 +1056,10 @@ class _LocalizationChip extends StatelessWidget {
 class _PoiButton extends ConsumerStatefulWidget {
   final AsyncValue<List<Poi>> poisAsync;
   final AsyncValue<DeviceStatus> statusAsync;
-  final Pose? pose;
 
   const _PoiButton({
     required this.poisAsync,
     required this.statusAsync,
-    this.pose,
   });
 
   @override
@@ -753,18 +1088,10 @@ class _PoiButtonState extends ConsumerState<_PoiButton> {
   @override
   Widget build(BuildContext context) {
     final count = widget.poisAsync.valueOrNull?.length ?? 0;
-    final isNavigating =
-        widget.statusAsync.valueOrNull?.rawState == 'navigation';
-    // rawState stays 'navigation' until the nav nodes are disabled, so it cannot
-    // express arrival. navStatus can -- the backend turns it into 'arrived' once
-    // map_node reports every POI visited -- but nothing in the live UI read it, so a
-    // robot that reached its goal looked identical to one still driving. Observed:
-    // map_node logged "All POIs have been visited" and the screen never changed.
-    final hasArrived =
-        widget.statusAsync.valueOrNull?.navStatus == 'arrived';
+    final isNavigating = widget.statusAsync.valueOrNull?.rawState == 'navigation';
 
     if (isNavigating) {
-      final cancelButton = FilledButton.icon(
+      return FilledButton.icon(
         onPressed: _canceling ? null : _cancelNav,
         style: FilledButton.styleFrom(
           backgroundColor: Colors.red.withOpacity(0.85),
@@ -772,37 +1099,10 @@ class _PoiButtonState extends ConsumerState<_PoiButton> {
           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
         ),
         icon: _canceling
-            ? const SizedBox(
-                width: 14,
-                height: 14,
-                child: CircularProgressIndicator(
-                    strokeWidth: 2, color: Colors.white))
+            ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
             : const Icon(Icons.cancel_outlined, size: 16),
         label: const Text('Cancel'),
       );
-      if (!hasArrived) return cancelButton;
-      // Cancel stays available: arriving does not stop the nav nodes, and the operator
-      // still has to end the run.
-      return Row(mainAxisSize: MainAxisSize.min, children: [
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-          decoration: BoxDecoration(
-            color: Colors.green.withOpacity(0.85),
-            borderRadius: BorderRadius.circular(8),
-          ),
-          child: const Row(mainAxisSize: MainAxisSize.min, children: [
-            Icon(Icons.check_circle, size: 15, color: Colors.white),
-            SizedBox(width: 5),
-            Text('Arrived',
-                style: TextStyle(
-                    color: Colors.white,
-                    fontSize: 13,
-                    fontWeight: FontWeight.w600)),
-          ]),
-        ),
-        const SizedBox(width: 8),
-        cancelButton,
-      ]);
     }
 
     return FilledButton.icon(
@@ -812,7 +1112,7 @@ class _PoiButtonState extends ConsumerState<_PoiButton> {
         shape: const RoundedRectangleBorder(
           borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
         ),
-        builder: (_) => _PoiSheet(pose: widget.pose),
+        builder: (_) => const _PoiSheet(),
       ),
       style: FilledButton.styleFrom(
         backgroundColor: Colors.black87,
@@ -826,15 +1126,16 @@ class _PoiButtonState extends ConsumerState<_PoiButton> {
 }
 
 class _PoiSheet extends ConsumerStatefulWidget {
-  final Pose? pose;
-  const _PoiSheet({this.pose});
+  const _PoiSheet();
 
   @override
   ConsumerState<_PoiSheet> createState() => _PoiSheetState();
 }
 
 class _PoiSheetState extends ConsumerState<_PoiSheet> {
-  final Set<int> _checkedIds = {};
+  /// POI ids in the exact order they were checked.
+  final List<int> _checkedIds = [];
+  final ScrollController _poiScrollController = ScrollController();
 
   Future<void> _deletePoi(Poi poi) async {
     final ok = await showDialog<bool>(
@@ -843,9 +1144,7 @@ class _PoiSheetState extends ConsumerState<_PoiSheet> {
         title: const Text('Delete POI'),
         content: Text('Delete "${poi.name}"?'),
         actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(ctx, false),
-              child: const Text('Cancel')),
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
           TextButton(
             onPressed: () => Navigator.pop(ctx, true),
             style: TextButton.styleFrom(foregroundColor: Colors.red),
@@ -870,13 +1169,15 @@ class _PoiSheetState extends ConsumerState<_PoiSheet> {
   }
 
   Future<void> _startNav(List<Poi> pois) async {
-    final ids =
-        pois.where((p) => _checkedIds.contains(p.id)).map((p) => p.id).toList();
-    if (ids.isEmpty) return;
+    final poiById = {for (final poi in pois) poi.id: poi};
+    final selectedPois = _checkedIds.map((id) => poiById[id]).whereType<Poi>().toList();
+    if (selectedPois.isEmpty) return;
     try {
-      await ref
-          .read(dioProvider)
-          .post('/nav/send-pois', data: {'poi_ids': ids});
+      await ref.read(dioProvider).post(
+        '/nav/send-pois',
+        data: {'poi_ids': selectedPois.map((p) => p.id).toList()},
+      );
+      ref.read(activeNavPoisProvider.notifier).state = selectedPois;
     } on DioException catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
@@ -888,82 +1189,128 @@ class _PoiSheetState extends ConsumerState<_PoiSheet> {
   }
 
   @override
+  void dispose() {
+    _poiScrollController.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     final poisAsync = ref.watch(poisProvider);
     final status = ref.watch(deviceStatusProvider).valueOrNull;
-    final localized =
-        ref.watch(planningStreamProvider).valueOrNull?.localized ?? false;
+    final localized = ref.watch(planningStreamProvider).valueOrNull?.localized ?? false;
     final canGo = status != null && status.online && localized;
 
-    return Padding(
-      padding: EdgeInsets.fromLTRB(
-          16, 12, 16, 24 + MediaQuery.of(context).viewInsets.bottom),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Center(
-            child: Container(
-              width: 36,
-              height: 4,
-              margin: const EdgeInsets.only(bottom: 14),
-              decoration: BoxDecoration(
-                color: Colors.grey.shade300,
-                borderRadius: BorderRadius.circular(2),
-              ),
-            ),
+    return SafeArea(
+      top: false,
+      child: FractionallySizedBox(
+        heightFactor: 0.9,
+        child: Padding(
+          padding: EdgeInsets.fromLTRB(
+            16,
+            12,
+            16,
+            24 + MediaQuery.of(context).viewInsets.bottom,
           ),
-          // ── Header ──────────────────────────────────────────────────
-          Row(children: [
-            const Icon(Icons.place_outlined, size: 20),
-            const SizedBox(width: 8),
-            const Text('POIs',
-                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-            const Spacer(),
-            FilledButton.icon(
-              onPressed: (canGo && _checkedIds.isNotEmpty)
-                  ? () => poisAsync.whenData((pois) => _startNav(pois))
-                  : null,
-              icon: const Icon(Icons.navigation_rounded, size: 16),
-              label: const Text('Go'),
-              style: FilledButton.styleFrom(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                minimumSize: Size.zero,
-              ),
-            ),
-          ]),
-          const Divider(height: 20),
-          // ── POI list ────────────────────────────────────────────────
-          poisAsync.when(
-            data: (pois) => pois.isEmpty
-                ? const Padding(
-                    padding: EdgeInsets.symmetric(vertical: 20),
-                    child: Center(
-                      child: Text('No POIs yet',
-                          style: TextStyle(color: Colors.grey)),
-                    ),
-                  )
-                : Column(
-                    children: pois
-                        .map((poi) => _PoiTile(
-                              poi: poi,
-                              checked: _checkedIds.contains(poi.id),
-                              onChecked: (v) => setState(() {
-                                if (v)
-                                  _checkedIds.add(poi.id);
-                                else
-                                  _checkedIds.remove(poi.id);
-                              }),
-                              onDelete: () => _deletePoi(poi),
-                            ))
-                        .toList(),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Center(
+                child: Container(
+                  width: 36,
+                  height: 4,
+                  margin: const EdgeInsets.only(bottom: 14),
+                  decoration: BoxDecoration(
+                    color: Colors.grey.shade300,
+                    borderRadius: BorderRadius.circular(2),
                   ),
-            loading: () => const Center(child: CircularProgressIndicator()),
-            error: (e, _) =>
-                Text('$e', style: const TextStyle(color: Colors.red)),
+                ),
+              ),
+              Row(children: [
+                const Icon(Icons.place_outlined, size: 20),
+                const SizedBox(width: 8),
+                const Text('POIs', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                const Spacer(),
+                FilledButton.icon(
+                  onPressed: (canGo && _checkedIds.isNotEmpty)
+                      ? () => _startNav(poisAsync.valueOrNull ?? [])
+                      : null,
+                  icon: const Icon(Icons.navigation_rounded, size: 16),
+                  label: const Text('Go'),
+                  style: FilledButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                    minimumSize: Size.zero,
+                  ),
+                ),
+              ]),
+              const Divider(height: 20),
+              Expanded(
+                child: poisAsync.when(
+                  data: (pois) => pois.isEmpty
+                      ? const Center(
+                          child: Text('No POIs yet', style: TextStyle(color: Colors.grey)),
+                        )
+                      : ScrollConfiguration(
+                          behavior: ScrollConfiguration.of(context).copyWith(
+                            dragDevices: {
+                              PointerDeviceKind.touch,
+                              PointerDeviceKind.mouse,
+                              PointerDeviceKind.trackpad,
+                              PointerDeviceKind.stylus,
+                              PointerDeviceKind.unknown,
+                            },
+                          ),
+                          child: Scrollbar(
+                            thumbVisibility: pois.length > 8,
+                            controller: _poiScrollController,
+                            child: ListView.builder(
+                              controller: _poiScrollController,
+                              primary: false,
+                              physics: const AlwaysScrollableScrollPhysics(),
+                              padding: EdgeInsets.zero,
+                              itemCount: pois.length,
+                              itemBuilder: (context, index) {
+                                final poi = pois[index];
+                                final orderIndex = _checkedIds.indexOf(poi.id);
+                                return _PoiTile(
+                                  poi: poi,
+                                  checked: orderIndex != -1,
+                                  orderNumber: orderIndex == -1 ? null : orderIndex + 1,
+                                  onChecked: (v) => setState(() {
+                                    if (v) {
+                                      if (!_checkedIds.contains(poi.id)) {
+                                        _checkedIds.add(poi.id);
+                                      }
+                                    } else {
+                                      _checkedIds.remove(poi.id);
+                                    }
+                                  }),
+                                  onDelete: () => _deletePoi(poi),
+                                );
+                              },
+                            ),
+                          ),
+                        ),
+                  loading: () => ListView(
+                    controller: _poiScrollController,
+                    children: const [
+                      SizedBox(
+                        height: 180,
+                        child: Center(child: CircularProgressIndicator()),
+                      ),
+                    ],
+                  ),
+                  error: (e, _) => ListView(
+                    controller: _poiScrollController,
+                    children: [
+                      Text('$e', style: const TextStyle(color: Colors.red)),
+                    ],
+                  ),
+                ),
+              ),
+            ],
           ),
-        ],
+        ),
       ),
     );
   }
@@ -972,12 +1319,14 @@ class _PoiSheetState extends ConsumerState<_PoiSheet> {
 class _PoiTile extends StatelessWidget {
   final Poi poi;
   final bool checked;
+  final int? orderNumber;
   final ValueChanged<bool> onChecked;
   final VoidCallback onDelete;
 
   const _PoiTile({
     required this.poi,
     required this.checked,
+    required this.orderNumber,
     required this.onChecked,
     required this.onDelete,
   });
@@ -989,7 +1338,7 @@ class _PoiTile extends StatelessWidget {
         value: checked,
         onChanged: (v) => onChecked(v ?? false),
       ),
-      title: Text(poi.name),
+      title: Text(orderNumber == null ? poi.name : '${poi.name} #$orderNumber'),
       subtitle: Text(
         '(${poi.x.toStringAsFixed(2)}, ${poi.y.toStringAsFixed(2)})',
         style: const TextStyle(fontSize: 12),
@@ -1023,8 +1372,8 @@ class _NavNodesButtonState extends ConsumerState<_NavNodesButton> {
     setState(() => _loading = true);
     try {
       await ref.read(dioProvider).post(
-            running ? '/nav/nodes/disable' : '/nav/nodes/enable',
-          );
+        running ? '/nav/nodes/disable' : '/nav/nodes/enable',
+      );
     } on DioException catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
@@ -1045,8 +1394,9 @@ class _NavNodesButtonState extends ConsumerState<_NavNodesButton> {
     return FilledButton.icon(
       onPressed: _loading ? null : () => _toggle(running),
       style: FilledButton.styleFrom(
-        backgroundColor:
-            running ? const Color(0xFF45C95A).withOpacity(0.9) : Colors.black87,
+        backgroundColor: running
+            ? const Color(0xFF45C95A).withOpacity(0.9)
+            : Colors.black87,
         foregroundColor: Colors.white,
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
       ),
@@ -1054,8 +1404,7 @@ class _NavNodesButtonState extends ConsumerState<_NavNodesButton> {
           ? const SizedBox(
               width: 14,
               height: 14,
-              child: CircularProgressIndicator(
-                  strokeWidth: 2, color: Colors.white),
+              child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
             )
           : Icon(
               running ? Icons.sensors_rounded : Icons.sensors_off_rounded,
@@ -1105,19 +1454,15 @@ class _PauseButtonState extends ConsumerState<_PauseButton> {
     return FilledButton.icon(
       onPressed: _loading ? null : () => _toggle(paused),
       style: FilledButton.styleFrom(
-        backgroundColor:
-            paused ? const Color(0xFFFF9800).withOpacity(0.9) : Colors.black54,
+        backgroundColor: paused
+            ? const Color(0xFFFF9800).withOpacity(0.9)
+            : Colors.black54,
         foregroundColor: Colors.white,
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
       ),
       icon: _loading
-          ? const SizedBox(
-              width: 14,
-              height: 14,
-              child: CircularProgressIndicator(
-                  strokeWidth: 2, color: Colors.white))
-          : Icon(paused ? Icons.play_arrow_rounded : Icons.pause_rounded,
-              size: 16),
+          ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+          : Icon(paused ? Icons.play_arrow_rounded : Icons.pause_rounded, size: 16),
       label: Text(paused ? 'Continue' : 'Pause'),
     );
   }
@@ -1153,50 +1498,29 @@ class _CameraPanelState extends ConsumerState<_CameraPanel> {
     final mapInfo = ref.watch(mapInfoProvider).valueOrNull;
     final planning = ref.watch(planningStreamProvider).valueOrNull;
 
-    final selectedTopicIsValid =
-        selectedTopic != null && topics.contains(selectedTopic);
-    if (topics.isNotEmpty && !selectedTopicIsValid) {
-      final nextTopic = topics.firstWhere(
-        (t) => t.contains('color'),
-        orElse: () => topics.first,
-      );
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted) return;
-        final latestTopics =
-            ref.read(imageTopicsProvider).valueOrNull ?? const <String>[];
-        final currentTopic = ref.read(selectedPreviewTopicProvider);
-        final currentIsValid =
-            currentTopic != null && latestTopics.contains(currentTopic);
-        if (latestTopics.contains(nextTopic) && !currentIsValid) {
-          ref.read(selectedPreviewTopicProvider.notifier).state = nextTopic;
-          setState(() => _latestFrame = null);
-        }
-      });
-    }
-
-    // Keep the current preview topic valid after backend/sensor restarts.
+    // Auto-select color topic on first load
     ref.listen<AsyncValue<List<String>>>(imageTopicsProvider, (_, next) {
       final topics = next.valueOrNull;
-      final currentTopic = ref.read(selectedPreviewTopicProvider);
-      final currentIsValid =
-          currentTopic != null && (topics?.contains(currentTopic) ?? false);
-      if (topics != null && topics.isNotEmpty && !currentIsValid) {
+      if (topics != null && ref.read(selectedPreviewTopicProvider) == null) {
         final colorTopic = topics.firstWhere(
           (t) => t.contains('color'),
-          orElse: () => topics.first,
+          orElse: () => '',
         );
-        ref.read(selectedPreviewTopicProvider.notifier).state = colorTopic;
-        if (mounted) setState(() => _latestFrame = null);
+        if (colorTopic.isNotEmpty) {
+          ref.read(selectedPreviewTopicProvider.notifier).state = colorTopic;
+        }
       }
     });
 
-    final activeTopic = selectedTopicIsValid ? selectedTopic : null;
-    final previewFrame = activeTopic == null
-        ? null
-        : ref.watch(previewStreamProvider(activeTopic)).valueOrNull;
-    final frameToShow = previewFrame ?? _latestFrame;
-    if (previewFrame != null && !identical(previewFrame, _latestFrame)) {
-      _latestFrame = previewFrame;
+    if (selectedTopic != null) {
+      ref.listen<AsyncValue<Uint8List>>(
+        previewStreamProvider(selectedTopic),
+        (_, next) {
+          if (next case AsyncData(:final value)) {
+            if (mounted) setState(() => _latestFrame = value);
+          }
+        },
+      );
     }
 
     return Container(
@@ -1204,44 +1528,39 @@ class _CameraPanelState extends ConsumerState<_CameraPanel> {
       child: Stack(
         fit: StackFit.expand,
         children: [
-          if (activeTopic != null && frameToShow != null)
+          if (selectedTopic != null && _latestFrame != null)
             GestureDetector(
               onTap: () => _showFullscreen(context),
-              child: Image.memory(frameToShow,
-                  fit: BoxFit.contain, gaplessPlayback: true),
+              child: Image.memory(_latestFrame!, fit: BoxFit.cover, gaplessPlayback: true),
             )
           else
             Center(
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  const Icon(Icons.videocam_off_outlined,
-                      color: Colors.white24, size: 32),
+                  const Icon(Icons.videocam_off_outlined, color: Colors.white24, size: 32),
                   const SizedBox(height: 6),
                   Text(
-                    activeTopic == null
-                        ? 'Select a camera topic'
-                        : 'Waiting for stream…',
+                    selectedTopic == null ? 'Select a camera topic' : 'Waiting for stream…',
                     style: const TextStyle(color: Colors.white38, fontSize: 12),
                   ),
                 ],
               ),
             ),
           // ── Map PiP ──────────────────────────────────────────────────
-          if (mapInfo != null &&
-              planning != null &&
-              planning.localized &&
-              baseUrl != null)
+          if (mapInfo != null && planning != null &&
+              planning.localized && baseUrl != null)
             Positioned(
-              top: 8,
-              left: 8,
+              top: 8, left: 8,
               child: _MapPip(
-                  mapInfo: mapInfo, planning: planning, baseUrl: baseUrl),
+                mapInfo: mapInfo,
+                planning: planning,
+                baseUrl: baseUrl,
+              ),
             ),
           // ── Topic selector ───────────────────────────────────────────
           Positioned(
-            top: 8,
-            right: 8,
+            top: 8, right: 8,
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
               decoration: BoxDecoration(
@@ -1251,13 +1570,11 @@ class _CameraPanelState extends ConsumerState<_CameraPanel> {
               child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  const Icon(Icons.videocam_outlined,
-                      color: Colors.white70, size: 14),
+                  const Icon(Icons.videocam_outlined, color: Colors.white70, size: 14),
                   const SizedBox(width: 6),
                   DropdownButton<String?>(
-                    value: activeTopic,
-                    hint: const Text('Off',
-                        style: TextStyle(color: Colors.white54, fontSize: 12)),
+                    value: selectedTopic,
+                    hint: const Text('Off', style: TextStyle(color: Colors.white54, fontSize: 12)),
                     style: const TextStyle(color: Colors.white, fontSize: 12),
                     dropdownColor: Colors.black87,
                     underline: const SizedBox(),
@@ -1265,14 +1582,10 @@ class _CameraPanelState extends ConsumerState<_CameraPanel> {
                     items: [
                       const DropdownMenuItem<String?>(
                         value: null,
-                        child: Text('Off',
-                            style:
-                                TextStyle(color: Colors.white54, fontSize: 12)),
+                        child: Text('Off', style: TextStyle(color: Colors.white54, fontSize: 12)),
                       ),
                       ...topics.map((t) {
                         const labels = {
-                          '/camera/camera/color/image_rect_raw/compressed':
-                              'color',
                           '/camera/camera/color/image_raw': 'color',
                           '/camera/camera/infra1/image_rect_raw': 'left',
                           '/camera/camera/infra2/image_rect_raw': 'right',
@@ -1294,10 +1607,9 @@ class _CameraPanelState extends ConsumerState<_CameraPanel> {
               ),
             ),
           ),
-          if (activeTopic != null && frameToShow != null)
+          if (selectedTopic != null && _latestFrame != null)
             Positioned(
-              bottom: 8,
-              right: 8,
+              bottom: 8, right: 8,
               child: GestureDetector(
                 onTap: () => _showFullscreen(context),
                 child: Container(
@@ -1306,8 +1618,7 @@ class _CameraPanelState extends ConsumerState<_CameraPanel> {
                     color: Colors.black54,
                     borderRadius: BorderRadius.circular(6),
                   ),
-                  child: const Icon(Icons.fullscreen,
-                      color: Colors.white, size: 20),
+                  child: const Icon(Icons.fullscreen, color: Colors.white, size: 20),
                 ),
               ),
             ),
@@ -1346,13 +1657,11 @@ class _FullscreenPreviewState extends ConsumerState<_FullscreenPreview> {
         children: [
           Center(
             child: _frame != null
-                ? Image.memory(_frame!,
-                    fit: BoxFit.contain, gaplessPlayback: true)
+                ? Image.memory(_frame!, fit: BoxFit.contain, gaplessPlayback: true)
                 : const CircularProgressIndicator(color: Colors.white54),
           ),
           Positioned(
-            top: 8,
-            right: 8,
+            top: 8, right: 8,
             child: IconButton(
               icon: const Icon(Icons.close, color: Colors.white),
               onPressed: () => Navigator.pop(context),
@@ -1369,8 +1678,11 @@ class _MapPip extends StatelessWidget {
   final PlanningState planning;
   final String baseUrl;
 
-  const _MapPip(
-      {required this.mapInfo, required this.planning, required this.baseUrl});
+  const _MapPip({
+    required this.mapInfo,
+    required this.planning,
+    required this.baseUrl,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -1416,15 +1728,11 @@ class _JoystickPanel extends ConsumerWidget {
   final void Function(double x, double y) onRight;
   final Future<void> Function() onStop;
 
-  const _JoystickPanel(
-      {required this.onLeft, required this.onRight, required this.onStop});
+  const _JoystickPanel({required this.onLeft, required this.onRight, required this.onStop});
 
-  Future<void> _sendAction(
-      WidgetRef ref, BuildContext context, String command) async {
+  Future<void> _sendAction(WidgetRef ref, BuildContext context, String command) async {
     try {
-      await ref
-          .read(dioProvider)
-          .post('/action/command', data: {'command': command});
+      await ref.read(dioProvider).post('/action/command', data: {'command': command});
     } on DioException catch (e) {
       if (context.mounted) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
@@ -1446,11 +1754,7 @@ class _JoystickPanel extends ConsumerWidget {
           Expanded(
             child: Column(
               children: [
-                const Text('Move',
-                    style: TextStyle(
-                        fontSize: 10,
-                        color: Colors.grey,
-                        fontWeight: FontWeight.w600)),
+                const Text('Move', style: TextStyle(fontSize: 10, color: Colors.grey, fontWeight: FontWeight.w600)),
                 const SizedBox(height: 4),
                 Expanded(child: _JoystickPad(onChange: onLeft)),
               ],
@@ -1481,15 +1785,9 @@ class _JoystickPanel extends ConsumerWidget {
           Expanded(
             child: Column(
               children: [
-                const Text('Rotate',
-                    style: TextStyle(
-                        fontSize: 10,
-                        color: Colors.grey,
-                        fontWeight: FontWeight.w600)),
+                const Text('Rotate', style: TextStyle(fontSize: 10, color: Colors.grey, fontWeight: FontWeight.w600)),
                 const SizedBox(height: 4),
-                Expanded(
-                    child: _JoystickPad(
-                        onChange: onRight, axisOnly: Axis.horizontal)),
+                Expanded(child: _JoystickPad(onChange: onRight, axisOnly: Axis.horizontal)),
               ],
             ),
           ),
@@ -1504,8 +1802,7 @@ class _ActionButton extends StatelessWidget {
   final String label;
   final VoidCallback onTap;
 
-  const _ActionButton(
-      {required this.icon, required this.label, required this.onTap});
+  const _ActionButton({required this.icon, required this.label, required this.onTap});
 
   @override
   Widget build(BuildContext context) {
@@ -1518,21 +1815,14 @@ class _ActionButton extends StatelessWidget {
           color: Colors.white,
           borderRadius: BorderRadius.circular(12),
           border: Border.all(color: const Color(0xFFE0E0E0)),
-          boxShadow: const [
-            BoxShadow(
-                color: Colors.black12, blurRadius: 3, offset: Offset(0, 1))
-          ],
+          boxShadow: const [BoxShadow(color: Colors.black12, blurRadius: 3, offset: Offset(0, 1))],
         ),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
             Icon(icon, size: 20, color: const Color(0xFF2B3A42)),
             const SizedBox(height: 3),
-            Text(label,
-                style: const TextStyle(
-                    fontSize: 10,
-                    fontWeight: FontWeight.w600,
-                    color: Color(0xFF2B3A42))),
+            Text(label, style: const TextStyle(fontSize: 10, fontWeight: FontWeight.w600, color: Color(0xFF2B3A42))),
           ],
         ),
       ),
@@ -1580,12 +1870,7 @@ class _EStopButtonState extends State<_EStopButton> {
           children: [
             Icon(Icons.pan_tool_rounded, color: Colors.white, size: 18),
             SizedBox(height: 2),
-            Text('STOP',
-                style: TextStyle(
-                    color: Colors.white,
-                    fontSize: 9,
-                    fontWeight: FontWeight.w800,
-                    letterSpacing: 0.5)),
+            Text('STOP', style: TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.w800, letterSpacing: 0.5)),
           ],
         ),
       ),
@@ -1703,4 +1988,61 @@ class _JoystickPainter extends CustomPainter {
   @override
   bool shouldRepaint(_JoystickPainter old) =>
       old.thumbOffset != thumbOffset || old.padRadius != padRadius;
+}
+
+// ── Nav progress overlay ──────────────────────────────────────────────────────
+
+class _NavProgressOverlay extends StatelessWidget {
+  final NavProgress? np;
+  final bool arrived;
+  final List<Poi> pois;
+
+  const _NavProgressOverlay({this.np, required this.arrived, this.pois = const []});
+
+  @override
+  Widget build(BuildContext context) {
+    final color = arrived ? Colors.green : Colors.blue;
+    final double value;
+    final String label;
+
+    if (arrived) {
+      value = 1.0;
+      label = 'Arrived';
+    } else if (np != null) {
+      value = (np!.percent / 100.0).clamp(0.0, 1.0);
+      final name = (np!.poiIndex < pois.length) ? pois[np!.poiIndex].name : 'POI ${np!.poiIndex + 1}';
+      final dist = '${np!.pathRemainingM.toStringAsFixed(1)}m';
+      final eta = np!.estimatedRemainingS >= 0 ? '~${np!.estimatedRemainingS.toStringAsFixed(0)}s' : '--';
+      final pct = '${np!.percent.toStringAsFixed(0)}%';
+      label = '→ $name  $pct · $dist · $eta';
+    } else {
+      value = 0.0;
+      label = 'Navigating...';
+    }
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: Colors.black.withOpacity(0.65),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(label, style: TextStyle(color: color, fontSize: 12, fontWeight: FontWeight.w500)),
+          const SizedBox(height: 6),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(3),
+            child: LinearProgressIndicator(
+              value: value,
+              color: color,
+              backgroundColor: color.withOpacity(0.25),
+              minHeight: 5,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }

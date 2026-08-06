@@ -1,6 +1,30 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+class NavProgress {
+  final int poiIndex;
+  final double percent;
+  final double pathRemainingM;
+  final double pathTotalM;
+  final double estimatedRemainingS;
+
+  const NavProgress({
+    required this.poiIndex,
+    required this.percent,
+    required this.pathRemainingM,
+    required this.pathTotalM,
+    required this.estimatedRemainingS,
+  });
+
+  factory NavProgress.fromJson(Map<String, dynamic> json) => NavProgress(
+        poiIndex: json['poi_index'] as int? ?? 0,
+        percent: (json['percent'] as num?)?.toDouble() ?? 0.0,
+        pathRemainingM: (json['path_remaining_m'] as num?)?.toDouble() ?? 0.0,
+        pathTotalM: (json['path_total_m'] as num?)?.toDouble() ?? 0.0,
+        estimatedRemainingS: (json['estimated_remaining_s'] as num?)?.toDouble() ?? -1.0,
+      );
+}
+
 class DeviceStatus {
   final bool online;
   final double? battery;
@@ -43,22 +67,17 @@ class DeviceStatus {
 class Pose {
   final double x;
   final double y;
-  final double? z;
   final double yaw;
+  final double? z;
   final double? timestamp;
 
-  const Pose(
-      {required this.x,
-      required this.y,
-      this.z,
-      required this.yaw,
-      this.timestamp});
+  const Pose({required this.x, required this.y, required this.yaw, this.z, this.timestamp});
 
   factory Pose.fromJson(Map<String, dynamic> json) => Pose(
         x: (json['x'] as num).toDouble(),
         y: (json['y'] as num).toDouble(),
-        z: (json['z'] as num?)?.toDouble(),
         yaw: (json['yaw'] as num).toDouble(),
+        z: (json['z'] as num?)?.toDouble(),
         timestamp: (json['timestamp'] as num?)?.toDouble(),
       );
 }
@@ -201,10 +220,10 @@ class PlanningState {
       return Pose.fromJson(raw as Map<String, dynamic>);
     }
 
-    List<TrajPoint> parsePath(String key) => (j[key] as List? ?? []).map((p) {
+    List<TrajPoint> parsePath(String key) =>
+        (j[key] as List? ?? []).map((p) {
           final m = p as Map<String, dynamic>;
-          return TrajPoint(
-              (m['x'] as num).toDouble(), (m['y'] as num).toDouble());
+          return TrajPoint((m['x'] as num).toDouble(), (m['y'] as num).toDouble());
         }).toList();
 
     return PlanningState(
@@ -228,8 +247,7 @@ class PlanningState {
           : null,
       footprint: (j['footprint'] as List? ?? []).map((p) {
         final m = p as Map<String, dynamic>;
-        return TrajPoint(
-            (m['x'] as num).toDouble(), (m['y'] as num).toDouble());
+        return TrajPoint((m['x'] as num).toDouble(), (m['y'] as num).toDouble());
       }).toList(),
       voxelPoints: (j['voxel_points'] as List? ?? []).map((p) {
         final m = p as Map<String, dynamic>;
@@ -281,14 +299,12 @@ class FileEntry {
   final int size;
   final double mtime;
   final bool isDir;
-  final String descriptor;
 
   const FileEntry({
     required this.name,
     required this.size,
     required this.mtime,
     required this.isDir,
-    this.descriptor = '',
   });
 
   factory FileEntry.fromJson(Map<String, dynamic> j) => FileEntry(
@@ -296,7 +312,6 @@ class FileEntry {
         size: (j['size'] as num).toInt(),
         mtime: (j['mtime'] as num).toDouble(),
         isDir: j['is_dir'] as bool? ?? false,
-        descriptor: j['descriptor'] as String? ?? '',
       );
 
   String get sizeLabel {

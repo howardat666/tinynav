@@ -42,6 +42,19 @@ final deviceStatusProvider = StreamProvider<DeviceStatus>((ref) {
   );
 });
 
+/// Streams NavProgress from WS /ws/nav-progress (pushed on every ROS message).
+final navProgressStreamProvider = StreamProvider<NavProgress>((ref) {
+  final ip = ref.watch(deviceIpProvider);
+  if (ip == null) return const Stream.empty();
+
+  final channel = WebSocketChannel.connect(Uri.parse('ws://$ip:8000/ws/nav-progress'));
+  ref.onDispose(() => channel.sink.close());
+
+  return channel.stream.map(
+    (data) => NavProgress.fromJson(jsonDecode(data as String) as Map<String, dynamic>),
+  );
+});
+
 /// Streams robot Pose from WS /ws/pose (pushed on every odometry message).
 final poseStreamProvider = StreamProvider<Pose>((ref) {
   final ip = ref.watch(deviceIpProvider);
@@ -99,6 +112,9 @@ final imageTopicsProvider = FutureProvider.autoDispose<List<String>>((ref) async
 /// Currently selected bag name for map building (null = use last verified).
 final selectedBagProvider = StateProvider<String?>((ref) => null);
 
+/// POIs currently being navigated (set when Go is pressed, cleared when nav done).
+final activeNavPoisProvider = StateProvider<List<Poi>>((ref) => const []);
+
 /// Currently selected preview topic (null = preview closed).
 final selectedPreviewTopicProvider = StateProvider<String?>((ref) => null);
 
@@ -115,6 +131,10 @@ final previewStreamProvider =
     channel?.sink.close();
   });
 
+  // The board's backend sends each frame as base64 *text*, not a binary frame
+  // (app/backend/ws.py). A bytes-only decoder turns every frame into an empty
+  // Uint8List that the isNotEmpty filter then drops, so the panel sits on
+  // "Waiting for stream..." forever with nothing logged anywhere.
   Uint8List decodeFrame(dynamic data) {
     if (data is String) return base64Decode(data);
     if (data is Uint8List) return data;
@@ -123,6 +143,9 @@ final previewStreamProvider =
     return Uint8List(0);
   }
 
+  // Reconnect rather than freeze: enabling nav restarts the backend's ROS node,
+  // which drops this socket. A one-shot connect leaves the preview dead until
+  // the user navigates away and back.
   Stream<Uint8List> connectLoop() async* {
     final encoded = Uri.encodeQueryComponent(topic);
     final uri = Uri.parse('ws://$ip:8000/ws/preview?topic=$encoded');
@@ -135,7 +158,7 @@ final previewStreamProvider =
           if (frame.isNotEmpty) yield frame;
         }
       } catch (_) {
-        // The backend may restart its ROS node; reconnect instead of freezing.
+        // Backend restarted its ROS node; fall through to the retry delay.
       } finally {
         channel?.sink.close();
         channel = null;

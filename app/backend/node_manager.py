@@ -344,6 +344,8 @@ class BackendNode(Ros2NodeManager):
         self._nav_target_pose: dict | None = None
         self._relocalization_stats: dict | None = None
         self._poi_status: dict | None = None
+        self._nav_progress: dict | None = None
+        self.nav_progress_callbacks: list = []
 
         self._tf_buffer = None
         self._tf_listener = None
@@ -377,6 +379,11 @@ class BackendNode(Ros2NodeManager):
                 String, '/mapping/poi_status', self._on_poi_status,
                 QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
             )
+            # Per-POI progress and the end-of-run signal. The frontend's progress
+            # overlay reads these; nav_done is also what returns rawState to 'idle',
+            # which is how the UI knows to stop showing "Navigating".
+            self.create_subscription(Bool, '/mapping/nav_done', self._on_nav_done, 10)
+            self.create_subscription(String, '/mapping/nav_progress', self._on_nav_progress, 10)
             self.create_subscription(Image, '/planning/height_map', self._on_height_map, 1)
             self.create_subscription(
                 OccupancyGrid, '/planning/obstacle_mask', self._on_obstacle_mask, 1
@@ -420,6 +427,15 @@ class BackendNode(Ros2NodeManager):
         _latched_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self._pause_pub = self.create_publisher(Bool, '/nav/paused', _latched_qos)
         self._nav_paused = False
+
+        # Manually placed local-planner target (frontend long-press on the local map).
+        # TRANSIENT_LOCAL is mandatory, not a nicety: planning_node's subscription and
+        # map_node's publisher for this topic are both TRANSIENT_LOCAL, and DDS requires
+        # offered >= requested durability -- a volatile publisher here would simply never
+        # match, so the target would be published to nobody with nothing logged.
+        self._target_pose_pub = self.create_publisher(
+            Odometry, '/control/target_pose', _latched_qos
+        )
 
         # Publisher for robot action commands (sit / stand)
         self._action_pub = self.create_publisher(String, '/service/command', 10)
@@ -545,6 +561,27 @@ class BackendNode(Ros2NodeManager):
             self.get_logger().info(
                 f"arrived: all {status.get('total')} POI(s) visited"
             )
+
+    def _on_nav_done(self, msg: Bool):
+        # This is what makes the UI stop saying "Navigating": the frontend watches
+        # rawState leaving 'navigation'. Without it the state stays 'navigation'
+        # until the user disables the nav nodes by hand.
+        if msg.data and self.state == 'navigation':
+            self.state = 'idle'
+            self._pub_state()
+
+    def _on_nav_progress(self, msg: String):
+        try:
+            data = json.loads(msg.data)
+        except (ValueError, TypeError) as e:
+            self.get_logger().warn(f'bad /mapping/nav_progress payload: {e}')
+            return
+        with self._lock:
+            self._nav_progress = data
+        # Snapshot before iterating: /ws/nav-progress sockets register and drop from
+        # the asyncio thread while this runs on the spin thread.
+        for cb in list(self.nav_progress_callbacks):
+            cb(data)
 
     def _on_nav_target_pose(self, msg: Odometry):
         with self._lock:
@@ -954,6 +991,9 @@ class BackendNode(Ros2NodeManager):
         # Latched on the wire, so without this a cancelled or restarted run would keep
         # reporting the previous run's arrival.
         self._poi_status = None
+        # Not latched, but a cancelled run leaves the last frame sitting here and the
+        # next run's overlay would open on the old POI's percentage.
+        self._nav_progress = None
 
     def _publish_nav_target_clear(self):
         """Clear map_node POIs and directly notify planning_node to drop its target."""
@@ -964,6 +1004,24 @@ class BackendNode(Ros2NodeManager):
         msg.child_frame_id = 'map'
         self._poi_change_pub.publish(msg)
         self.get_logger().info('Published nav target clear on /mapping/cmd_pois and /mapping/poi_change')
+
+    def cmd_manual_target_pose(self, x: float, y: float, z: float):
+        """Publish a manually selected local-planner target pose.
+
+        planning_node subscribes to /control/target_pose and only reads the position
+        vector, so Odometry is used here to match that existing API.
+        """
+        msg = Odometry()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'odom'
+        msg.pose.pose.position.x = float(x)
+        msg.pose.pose.position.y = float(y)
+        msg.pose.pose.position.z = float(z)
+        msg.pose.pose.orientation.w = 1.0
+        self._target_pose_pub.publish(msg)
+        with self._lock:
+            self._nav_target_pose = {'x': float(x), 'y': float(y)}
+        self.get_logger().info(f'manual target published: ({x:.2f}, {y:.2f}, {z:.2f})')
 
     def _start_unitree_if_configured(self):
         # "if configured" used to mean "always". On a wheel base unitree_control

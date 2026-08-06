@@ -622,9 +622,20 @@ class MapNode(Node):
 
         self.pois = {}
         self.poi_index = -1
+        # Per-leg progress accounting for /mapping/nav_progress. A "leg" is one POI:
+        # the initial path length is captured the first time a path to it is planned,
+        # and percent/ETA are derived from how much of that has been consumed. The
+        # speed estimate deliberately survives POI transitions so the ETA keeps
+        # improving instead of restarting from "unknown" at every waypoint.
+        self._nav_completed = False
+        self._leg_initial_length: float | None = None
+        self._leg_start_time: float | None = None
+        self._speed_estimate: float | None = None
 
         self.poi_pub = self.create_publisher(Odometry, "/mapping/poi", 10)
         self.poi_change_pub = self.create_publisher(Odometry, "/mapping/poi_change", 10)
+        self.nav_done_pub = self.create_publisher(Bool, '/mapping/nav_done', 10)
+        self.nav_progress_pub = self.create_publisher(String, '/mapping/nav_progress', 10)
 
         self.current_pose_pub = self.create_publisher(Odometry, "/mapping/current_pose", 10)
         self.global_plan_pub = self.create_publisher(Path, '/mapping/global_plan', 10)
@@ -732,6 +743,10 @@ class MapNode(Node):
                 return
 
             self.poi_index = min(0, len(self.pois) - 1)
+            self._nav_completed = False
+            self._leg_initial_length = None
+            self._leg_start_time = None
+            self._speed_estimate = None
             self.get_logger().info(f"Parsed POIs: {self.pois}")
         except json.JSONDecodeError as e:
             self.get_logger().error(f"Failed to parse POIs JSON: {e}")
@@ -1518,8 +1533,23 @@ class MapNode(Node):
             diff_position_norm_z = np.linalg.norm(poi[2] - pose_in_map_position[2])
             if (diff_position_norm_xy < self.POI_ARRIVAL_RADIUS_XY_M
                     and diff_position_norm_z < self.POI_ARRIVAL_RADIUS_Z_M):
+                # Emit the 100% frame *before* advancing the index, otherwise the UI's
+                # last observed progress for this POI is whatever partial value the
+                # previous keyframe happened to publish, and the bar never fills.
+                if self._leg_initial_length is not None:
+                    arrived_msg = String()
+                    arrived_msg.data = json.dumps({
+                        "poi_index": self.poi_index,
+                        "percent": 100.0,
+                        "path_remaining_m": 0.0,
+                        "path_total_m": round(self._leg_initial_length, 2),
+                        "estimated_remaining_s": 0.0,
+                    })
+                    self.nav_progress_pub.publish(arrived_msg)
                 self.poi_index += 1
                 advanced_poi_count += 1
+                self._leg_initial_length = None
+                self._leg_start_time = None
                 dummy_pose = np.eye(4)
 
                 stamp_msg = self.get_clock().now().to_msg()
@@ -1533,6 +1563,12 @@ class MapNode(Node):
         self._publish_poi_status(pose_in_map_position, advanced_poi_count)
 
         if self.poi_index >= len(self.pois):
+            # One-shot, guarded by the flag: this branch runs on every keyframe once
+            # the last POI is reached, and the backend turns each Bool into a state
+            # transition back to idle.
+            if not self._nav_completed:
+                self._nav_completed = True
+                self.nav_done_pub.publish(Bool(data=True))
             self.get_logger().info("All POIs have been visited, skip publishing nav path")
             log_nav_timing(f"skip_all_pois_visited_after_advance:{advanced_poi_count}")
             return
@@ -1543,6 +1579,38 @@ class MapNode(Node):
         t_stage = mark_stage("generate_path", t_stage)
 
         if paths_in_map is not None:
+            remaining_length = sum(
+                np.linalg.norm(paths_in_map[i + 1] - paths_in_map[i])
+                for i in range(len(paths_in_map) - 1)
+            ) if len(paths_in_map) > 1 else 0.0
+
+            # monotonic, NOT time.time(): the X5 has no battery-backed RTC, so the wall
+            # clock jumps ~344 days the moment sync_board_time.sh runs. A wall-clock
+            # elapsed would go negative or enormous and the speed estimate with it.
+            now = time.monotonic()
+            if self._leg_initial_length is None:
+                self._leg_initial_length = remaining_length
+                self._leg_start_time = now
+
+            covered = self._leg_initial_length - remaining_length
+            elapsed = now - self._leg_start_time
+            if covered > 0.1 and elapsed > 1.0:
+                self._speed_estimate = covered / elapsed
+
+            initial = self._leg_initial_length
+            percent = max(0.0, min(100.0, covered / initial * 100.0)) if initial > 0 else 0.0
+            estimated_remaining_s = remaining_length / self._speed_estimate if self._speed_estimate else -1.0
+
+            progress_msg = String()
+            progress_msg.data = json.dumps({
+                "poi_index": self.poi_index,
+                "percent": round(percent, 1),
+                "path_remaining_m": round(remaining_length, 2),
+                "path_total_m": round(initial, 2),
+                "estimated_remaining_s": round(estimated_remaining_s, 1),
+            })
+            self.nav_progress_pub.publish(progress_msg)
+
             # use the max_speed to publish the position the robot should be after 10 seconds
             with Timer(name = "Find target position", text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=self.timer_logger):
                 max_speed = 0.5
