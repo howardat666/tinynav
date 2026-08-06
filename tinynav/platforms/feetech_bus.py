@@ -124,6 +124,12 @@ STS_CONTROL_TABLE: dict[str, tuple[int, int]] = {
 # ``Torque_Enable``, the first SRAM register on the STS/SMS series.
 FIRST_SRAM_ADDRESS = 40
 
+# Retries for the one-shot startup configuration sequence, which has no next tick to
+# recover on. Deliberately much larger than the steady-state default: see
+# configure_velocity_mode's docstring for why this is safe rather than papering over
+# a fault.
+_CONFIG_RETRIES = 12
+
 # data_name: index of the sign bit (sign-magnitude encoded registers).
 STS_SIGN_MAGNITUDE_BITS: dict[str, int] = {
     "Present_Load": 10,
@@ -204,22 +210,32 @@ def configure_velocity_mode(bus, motor_ids) -> None:
     comparison -- and a safety-relevant sequence that must not be got wrong is a
     bad thing to have three copies of.
 
+    Every write here is retried far harder than the default, because this sequence
+    is fifteen one-shot packets on a bus that drops roughly one in ten and drops
+    them in bursts (docs/x5/servo_bus.md). With the default three attempts, one
+    unlucky packet aborts the whole sequence and wheel_odometry_node exits at
+    startup -- so the chassis has no driver at all, observed three times on
+    2026-08-06 and once misattributed to a flat battery. Retrying costs nothing when
+    the bus is healthy and does not weaken any guarantee: a retried write is
+    idempotent, and the read-back below is still what decides success, so a servo
+    that genuinely did not take the mode is still caught.
+
     Raises:
         FeetechBusError: if any servo does not read back mode 1 afterwards. An
             unreadable mode counts as failure too: commanding a wheel whose mode
             could not be confirmed is how a runaway starts.
     """
     for motor_id in motor_ids:
-        bus.write("Torque_Enable", motor_id, 0)  # EEPROM needs torque off
-        bus.write("Lock", motor_id, 0)  # ...and the lock cleared
-        bus.write("Operating_Mode", motor_id, 1)
-        bus.write("Lock", motor_id, 1)
-        bus.write("Torque_Enable", motor_id, 1)
+        bus.write("Torque_Enable", motor_id, 0, num_retry=_CONFIG_RETRIES)  # EEPROM needs torque off
+        bus.write("Lock", motor_id, 0, num_retry=_CONFIG_RETRIES)  # ...and the lock cleared
+        bus.write("Operating_Mode", motor_id, 1, num_retry=_CONFIG_RETRIES)
+        bus.write("Lock", motor_id, 1, num_retry=_CONFIG_RETRIES)
+        bus.write("Torque_Enable", motor_id, 1, num_retry=_CONFIG_RETRIES)
 
     wrong = {}
     for motor_id in motor_ids:
         try:
-            mode = bus.read("Operating_Mode", motor_id)
+            mode = bus.read("Operating_Mode", motor_id, num_retry=_CONFIG_RETRIES)
         except FeetechBusError as exc:
             wrong[motor_id] = f"read failed: {exc}"
             continue

@@ -349,6 +349,23 @@ class WheelOdometryNode(Node):
         if not rclpy.ok():
             return
 
+        # Commands go out BEFORE the read, not after it. This used to sit at the end
+        # of the tick, which had two consequences on a bus that loses packets (see
+        # docs/x5/servo_bus.md for the measurements):
+        #
+        # * Roughly 17-28% of ticks fail their read and return early, and every one
+        #   of those sent no command at all. That includes the watchdog's zero, so a
+        #   stale /cmd_vel could go unbraked for many consecutive ticks inside one of
+        #   the bad windows -- where the single-attempt failure rate reaches 56%.
+        # * A failed read burns a full 20 ms timeout, which is the entire tick
+        #   period. Writing first keeps the command at a fixed phase instead of
+        #   jittering by however long the read took.
+        #
+        # Ordering is safe: _drive_wheels only needs last_cmd/last_cmd_t from the
+        # /cmd_vel callback, never anything the read produces.
+        if self.enable_wheel_command:
+            self._drive_wheels()
+
         register = "Present_Position" if self.velocity_source == "position" else "Present_Velocity"
         try:
             result = self.bus.sync_read(register, self.motor_ids, num_retry=self.num_read_retries)
@@ -386,8 +403,6 @@ class WheelOdometryNode(Node):
 
         twist = np.array([dx, dy, dtheta]) / dt
         self._publish(stamp, twist, twist_cov)
-        if self.enable_wheel_command:
-            self._drive_wheels()
 
     def _body_delta_from_positions(self, result):
         """Tick differencing path: returns (body_delta, dt) or (None, None)."""
@@ -652,9 +667,48 @@ class WheelOdometryNode(Node):
 
     # -- teardown ----------------------------------------------------------- #
 
+    def _stop_wheels_confirmed(self, attempts: int = 8) -> bool:
+        """Write zero velocity until every wheel reads back zero.
+
+        Goal_Velocity is an absolute setpoint the servo holds until it is given a new
+        one, and sync_write is fire-and-forget. Every other command on this node
+        survives a lost packet by being resent on the next tick; this one cannot,
+        because it is the last thing the node ever does. On this bus roughly one
+        packet in ten does not arrive (docs/x5/servo_bus.md), so a single
+        unacknowledged write leaves the wheels turning at the previous setpoint with
+        no controller left to correct them.
+
+        Goal_Velocity reads back, so the stop can be confirmed rather than assumed.
+        Repeating the write is harmless: it is idempotent.
+        """
+        remaining = list(self.motor_ids)
+        for _ in range(attempts):
+            self.bus.sync_write("Goal_Velocity", dict.fromkeys(remaining, 0))
+            unconfirmed = []
+            for motor_id in remaining:
+                try:
+                    if self.bus.read("Goal_Velocity", motor_id, num_retry=3) != 0:
+                        unconfirmed.append(motor_id)
+                except FeetechBusError:
+                    # A read that did not complete proves nothing. Treat the wheel as
+                    # still driving and write again -- the wrong assumption here is
+                    # the one that leaves the chassis moving.
+                    unconfirmed.append(motor_id)
+            remaining = unconfirmed
+            if not remaining:
+                return True
+        return False
+
     def destroy_node(self) -> bool:
         if self.enable_wheel_command and self.bus is not None:
-            self.bus.sync_write("Goal_Velocity", dict.fromkeys(self.motor_ids, 0))
+            if self._stop_wheels_confirmed():
+                self.get_logger().info("wheels confirmed stopped: Goal_Velocity reads 0 on all")
+            else:
+                self.get_logger().error(
+                    "COULD NOT CONFIRM THE WHEELS STOPPED: Goal_Velocity did not read back "
+                    "0 on every wheel after repeated attempts. The chassis may still be "
+                    "driving -- kill power if it is."
+                )
         self.get_logger().info(
             f"wheel odometry down after {self.samples} samples, {self.read_failures} read failures; "
             f"final pose x={self.x:.3f} y={self.y:.3f} yaw={np.degrees(self.theta):.2f}deg"
