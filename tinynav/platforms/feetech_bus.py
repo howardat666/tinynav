@@ -164,6 +164,26 @@ class FeetechStatusError(FeetechBusError):
     """A motor answered with a non-zero error byte."""
 
 
+class FeetechIOError(FeetechBusError):
+    """The serial layer itself failed, as opposed to the exchange timing out.
+
+    pyserial raises SerialException out of read() when poll() reports the fd
+    readable but the following read() returns zero bytes -- "device reports
+    readiness to read but returned no data". On this bus that is simply another
+    way for one transaction to fail, so it has to live *inside* FeetechBusError
+    for the retry loops in read/write/sync_read to absorb it like any other bad
+    attempt.
+
+    It did not, and the consequence was severe: the exception escaped every
+    retry, escaped wheel_odometry_node._tick's `except FeetechBusError`, and
+    rclpy re-raised it out of the timer callback, so rclpy.spin() returned and
+    the whole odometry node exited. Observed 2026-08-07 after 9 samples, which
+    took /wheel/camera_pose down with it and left planning_node with no pose
+    source at all. On a bus that loses ~19% of single attempts, a serial-layer
+    hiccup must cost one sample, not the node.
+    """
+
+
 # --------------------------------------------------------------------------- #
 # Sign-magnitude helpers
 # --------------------------------------------------------------------------- #
@@ -440,6 +460,14 @@ class FeetechBus:
                 return
             except (termios.error, OSError) as exc:
                 if (exc.args[0] if exc.args else None) != errno.EINTR:
+                    # SerialException subclasses OSError, and its args[0] is a
+                    # message rather than an errno, so it lands here. Re-raise it
+                    # as a bus error for the same reason the read path does:
+                    # otherwise it escapes every retry and kills the node.
+                    if isinstance(exc, serial.SerialException):
+                        raise FeetechIOError(
+                            f"serial drain failed on '{self.port}': {exc}"
+                        ) from exc
                     raise
         logger.debug("tcdrain interrupted %d times in a row; proceeding without the barrier",
                      _DRAIN_EINTR_RETRIES)
@@ -449,8 +477,11 @@ class FeetechBus:
         length = len(params) + 2
         body = [motor_id & 0xFF, length, instruction, *params]
         packet = bytes([0xFF, 0xFF, *body, checksum(body)])
-        ser.reset_input_buffer()
-        ser.write(packet)
+        try:
+            ser.reset_input_buffer()
+            ser.write(packet)
+        except serial.SerialException as exc:
+            raise FeetechIOError(f"serial write failed on '{self.port}': {exc}") from exc
         self._drain(ser)
 
     def _read_exactly(self, n: int) -> bytes:
@@ -459,7 +490,10 @@ class FeetechBus:
         buf = bytearray()
         deadline = time.monotonic() + self.timeout
         while len(buf) < n:
-            chunk = ser.read(n - len(buf))
+            try:
+                chunk = ser.read(n - len(buf))
+            except serial.SerialException as exc:
+                raise FeetechIOError(f"serial read failed on '{self.port}': {exc}") from exc
             if chunk:
                 buf.extend(chunk)
                 continue
@@ -494,7 +528,10 @@ class FeetechBus:
         while True:
             if time.monotonic() >= deadline:
                 raise FeetechTimeoutError(f"no status packet header on '{self.port}'")
-            byte = ser.read(1)
+            try:
+                byte = ser.read(1)
+            except serial.SerialException as exc:
+                raise FeetechIOError(f"serial read failed on '{self.port}': {exc}") from exc
             if not byte:
                 continue
             window.extend(byte)
