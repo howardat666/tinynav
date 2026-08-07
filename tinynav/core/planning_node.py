@@ -768,6 +768,18 @@ class PlanningNode(Node):
             self._last_static_log_ns[key] = now_ns
             self.get_logger().info(f"{reason}, publishing static path.")
 
+    def _depth_meters(self, depth_msg: Image) -> np.ndarray:
+        """Metres from /slam/depth, whichever encoding the publisher chose.
+
+        looper_bridge_node forwards the camera's mono16 millimetres unchanged rather
+        than doubling the topic to 32FC1; perception_node still publishes 32FC1 in
+        RealSense mode. Same branch as planning_bag_viser._decode_depth.
+        """
+        if depth_msg.encoding in ("mono16", "16UC1"):
+            raw = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding="passthrough")
+            return np.asarray(raw).astype(np.float32) / 1000.0
+        return self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='32FC1')
+
     @Timer(name="Planning Loop", text="\n\n[{name}] Elapsed time: {milliseconds:.0f} ms", logger=_TIMER_LOGGER)
     def sync_callback(self, depth_msg, pose_msg):
         if self.K is None:
@@ -783,7 +795,7 @@ class PlanningNode(Node):
                 )
             return
         with Timer(name='preprocess', text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=_TIMER_LOGGER):
-            depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='32FC1')
+            depth = self._depth_meters(depth_msg)
             stamp = Time.from_msg(pose_msg.header.stamp).nanoseconds / 1e9
             T = pose_msg2np(pose_msg)
             if self.last_T is None:

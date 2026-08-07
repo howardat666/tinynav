@@ -920,9 +920,18 @@ class BackendNode(Ros2NodeManager):
         self._last_frame_time[topic] = now
 
         try:
-            if msg.encoding == '32FC1':
-                arr = np.frombuffer(msg.data, dtype=np.float32).reshape(msg.height, msg.width)
-                arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+            if msg.encoding in ('32FC1', 'mono16', '16UC1'):
+                if msg.encoding == '32FC1':
+                    arr = np.frombuffer(msg.data, dtype=np.float32).reshape(msg.height, msg.width)
+                    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+                else:
+                    # mono16 millimetres. looper_bridge_node forwards the camera's depth
+                    # on /slam/depth unchanged now instead of doubling it to 32FC1;
+                    # perception_node still sends 32FC1 in RealSense mode, so both
+                    # encodings reach this preview. Integers cannot carry NaN or inf,
+                    # so the nan_to_num above has nothing to do here.
+                    arr = np.frombuffer(msg.data, dtype=np.uint16).reshape(msg.height, msg.width)
+                    arr = arr.astype(np.float32) / 1000.0
                 # The 95th percentile is a normalisation constant for a 5 fps preview,
                 # so it does not need every pixel. Taken over the full 544x640 it was
                 # a compacting copy of up to 348k floats followed by a full sort --

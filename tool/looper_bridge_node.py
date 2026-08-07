@@ -265,8 +265,40 @@ class LooperBridgeNode(Node):
         self.odom_visual_pub.publish(self.build_odom(T_world_camera, pose_msg.header.stamp))
 
     def depth_callback(self, depth_msg: Image):
-        depth_m = self.decode_depth_meters(depth_msg)
-        self.depth_pub.publish(self.build_depth_msg(depth_m, depth_msg.header.stamp))
+        # Forwarded in the camera's own mono16 millimetres, not converted to 32FC1
+        # metres. The conversion doubled the message -- 696 kB becomes 1.39 MB -- and
+        # `ros2 topic bw` measured /slam/depth at 4.2 MB/s against 3.0 MB/s for the
+        # camera's own topic, for 5 Hz of the entire navigation session. It also cost
+        # a decode plus a rebuild per frame (2.6 + 2.6 ms measured on the X5).
+        #
+        # Nobody wanted the float32: planning_node immediately divides to metres
+        # itself, which is one line there instead of a doubled topic here. DDR
+        # bandwidth is not free on this board either -- it is one of the remaining
+        # suspects for the servo bus loss (see docs/x5/servo_bus.md), which app load
+        # modulates by ~3x while pure CPU load does not.
+        #
+        # Consumers handle both encodings: planning_node and planning_bag_viser
+        # branch on msg.encoding, and perception_node still publishes 32FC1 here in
+        # RealSense mode, so this topic was never single-encoding to begin with.
+        self.depth_pub.publish(self.relabel_depth(depth_msg))
+
+    def relabel_depth(self, depth_msg: Image) -> Image:
+        """Re-header the camera depth for /slam/depth, sharing the payload.
+
+        A new message rather than mutating the input, which message_filters also
+        holds. `.data` is shared, not copied: rebuilding this way measured 0.13 ms
+        against 0.70 ms for copy.deepcopy.
+        """
+        out = Image()
+        out.header.stamp = depth_msg.header.stamp
+        out.header.frame_id = "camera"
+        out.height = depth_msg.height
+        out.width = depth_msg.width
+        out.encoding = depth_msg.encoding
+        out.is_bigendian = depth_msg.is_bigendian
+        out.step = depth_msg.step
+        out.data = depth_msg.data
+        return out
 
     def decode_depth_meters(self, depth_msg: Image) -> np.ndarray:
         depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding="passthrough")
