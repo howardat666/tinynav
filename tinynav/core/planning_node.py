@@ -69,6 +69,12 @@ _FOOTPRINT_OUTLINE = os.environ.get('TINYNAV_FOOTPRINT_OUTLINE', '0') == '1'
 # as "the frontend is broken" rather than "the publishes are disabled".
 _PUBLISH_PLANNING_OVERLAYS = os.environ.get('TINYNAV_PUBLISH_PLANNING_OVERLAYS', '1') == '1'
 
+# Pose topics whose stamps are byte-identical to the image stamps, so exact-stamp
+# synchronisation against /slam/depth works. Kept in the same shape as
+# looper_bridge_node._exact_pose_prefixes; the two must agree, because a pose source
+# that is approximate for one of them is approximate for the other.
+_EXACT_POSE_PREFIXES = ("/camera/camera/vio",)
+
 # === Helper functions ===
 @njit(cache=True)
 def run_raycasting_loopy(depth_image, T_cam_to_world, grid_shape, fx, fy, cx, cy, origin, step, resolution, filter_ground = False):
@@ -413,13 +419,40 @@ class PlanningNode(Node):
         # Looper firmware (it is /camera/camera/vio_image, measured 19.99 Hz), and
         # pointing this at a wheel-odometry topic is exactly how a VIO-mapped but
         # odometry-navigated run gets configured, with no code change.
-        # Caveat for any replacement source: this is time-synchronised against
-        # /slam/depth by *exact* stamp equality, so the substitute must carry the
-        # camera's original stamps rather than restamping with its own clock.
         self.declare_parameter('pose_topic', '/camera/camera/vio_image')
         pose_topic = str(self.get_parameter('pose_topic').value)
         self.get_logger().info(f"planning pose source: {pose_topic}")
         self.pose_sub = message_filters.Subscriber(self, PoseStamped, pose_topic)
+
+        # Exact vs approximate matching, and why it cannot be a constant.
+        #
+        # The firmware stamps /camera/camera/vio_image with the *image's* timestamp,
+        # so depth and that pose carry byte-identical (sec, nanosec) pairs and exact
+        # matching works. A wheel-odometry pose has no such relationship:
+        # wheel_odometry_node stamps with its own clock minus the measured bus read
+        # latency, so its nanoseconds never coincide with an image's.
+        #
+        # Measured 2026-08-07 on one boot, same code, only the scheme changed:
+        # scheme a (/camera/camera/vio_image) ran 746 planning loops, scheme b
+        # (/wheel/camera_pose) ran ZERO -- and reported nothing at all. Both streams
+        # published normally the whole time (pose 22.7 Hz, /slam/depth 3.3 Hz) and
+        # `ros2 topic hz` was green on both, so from outside the node looked healthy
+        # while it silently produced no trajectory. That is the same silent-failure
+        # shape looper_bridge_node already guards against with the same rule; this
+        # node was the one place that still hard-coded TimeSynchronizer.
+        self.declare_parameter('pose_sync', 'auto')
+        # Sized from the pose rate actually observed rather than the configured one:
+        # the LeKiwi's servo bus loses reads, so /wheel/camera_pose arrives in bursts
+        # well below its nominal 50 Hz. Same default as the bridge's --pose-sync-slop.
+        self.declare_parameter('pose_sync_slop', 0.06)
+        pose_sync_mode = str(self.get_parameter('pose_sync').value)
+        pose_sync_slop = float(self.get_parameter('pose_sync_slop').value)
+        if pose_sync_mode == 'exact':
+            use_exact_pose_sync = True
+        elif pose_sync_mode == 'approx':
+            use_exact_pose_sync = False
+        else:
+            use_exact_pose_sync = pose_topic.startswith(_EXACT_POSE_PREFIXES)
 
         # Deep on purpose, and NOT a latency setting. This is an exact-stamp
         # TimeSynchronizer over two streams at different rates -- /slam/depth at ~5 Hz
@@ -440,8 +473,19 @@ class PlanningNode(Node):
         # stale data, and it does it by measuring age rather than by hoping a shallow
         # queue implies freshness. The age check is also cheap and runs before any work,
         # so a backlog is walked through quickly instead of being planned on.
-        self.ts = message_filters.TimeSynchronizer([self.depth_sub, self.pose_sub], queue_size=30)
+        if use_exact_pose_sync:
+            self.ts = message_filters.TimeSynchronizer(
+                [self.depth_sub, self.pose_sub], queue_size=30
+            )
+        else:
+            self.ts = message_filters.ApproximateTimeSynchronizer(
+                [self.depth_sub, self.pose_sub], queue_size=30, slop=pose_sync_slop
+            )
         self.ts.registerCallback(self.sync_callback)
+        self.get_logger().info(
+            "planning pose sync: "
+            + ("exact" if use_exact_pose_sync else f"approximate slop={pose_sync_slop}s")
+        )
         # Planning on old geometry is worse than not planning: the robot reacts to
         # obstacles that have moved and misses ones that have not. map_node guards its
         # keyframes the same way (max_keyframe_age_s); planning had no age check at all.
