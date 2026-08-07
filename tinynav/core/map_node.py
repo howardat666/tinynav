@@ -504,7 +504,12 @@ class MapNode(Node):
         self.bridge = CvBridge()
 
         # subs
-        self.depth_sub = Subscriber(self, Image, '/slam/keyframe_depth')
+        # /slam/keyframe_depth is deliberately NOT subscribed here. keyframe_callback
+        # never read the pixels, only header.stamp, and only to compute a sync skew
+        # that is identically zero: TimeSynchronizer matches stamps exactly, so the
+        # three headers are equal by construction. Subscribing cost a 1.39 MB
+        # deserialization per keyframe to learn nothing. The topic itself must keep
+        # being published -- build_map_node consumes it offline.
         self.keyframe_image_sub = Subscriber(self, Image, '/slam/keyframe_image')
         self.keyframe_odom_sub = Subscriber(self, Odometry, '/slam/keyframe_odom')
         self.continuous_odom_sub = self.create_subscription(Odometry, '/slam/odometry', self.continuous_odom_callback, 100)
@@ -527,7 +532,7 @@ class MapNode(Node):
         # Add stop signal subscription and data saved publisher
         self.localization_stop_sub = self.create_subscription(Bool, '/benchmark/stop', self.localization_stop_callback, 10)
         self.localization_data_saved_pub = self.create_publisher(Bool, '/benchmark/data_saved', 10)
-        self.ts = TimeSynchronizer([self.keyframe_image_sub, self.keyframe_odom_sub, self.depth_sub], 10)
+        self.ts = TimeSynchronizer([self.keyframe_image_sub, self.keyframe_odom_sub], 10)
         self.ts.registerCallback(self.keyframe_callback)
 
         self.camera_info_sub = self.create_subscription(CameraInfo, '/camera/camera/infra2/camera_info', self.info_callback, 10)
@@ -809,7 +814,7 @@ class MapNode(Node):
     max_keyframe_age_s = 0.5
     min_relocalization_interval_s = 1.0
 
-    def keyframe_callback(self, keyframe_image_msg:Image, keyframe_odom_msg:Odometry, depth_msg:Image):
+    def keyframe_callback(self, keyframe_image_msg:Image, keyframe_odom_msg:Odometry):
         now_ns = self.get_clock().now().nanoseconds
         stamp_ns = int(keyframe_image_msg.header.stamp.sec * 1e9) + int(keyframe_image_msg.header.stamp.nanosec)
         age_s = (now_ns - stamp_ns) / 1e9
@@ -837,14 +842,14 @@ class MapNode(Node):
             stage_timings[name] = (now - previous_t) * 1000.0
             return now
 
-        self.get_logger().info("keyframe_mapping is temporarily disabled.")
+        # NOTE: keyframe_mapping / keyframe_mapping_with_timer below are not called
+        # from anywhere -- mapping is done offline by build_map_node. That used to be
+        # announced with an INFO line here, once per keyframe, which is a fact about
+        # the source that a running log has no reason to repeat. Left as a comment.
         image = self.bridge.imgmsg_to_cv2(keyframe_image_msg, desired_encoding="mono8")
         t_stage = mark_stage("image_decode", t_start)
 
         keyframe_image_timestamp_ns = int(keyframe_image_msg.header.stamp.sec * 1e9) + int(keyframe_image_msg.header.stamp.nanosec)
-        keyframe_odom_timestamp_ns = int(keyframe_odom_msg.header.stamp.sec * 1e9) + int(keyframe_odom_msg.header.stamp.nanosec)
-        depth_timestamp_ns = int(depth_msg.header.stamp.sec * 1e9) + int(depth_msg.header.stamp.nanosec)
-        sync_skew_ms = (max(keyframe_image_timestamp_ns, keyframe_odom_timestamp_ns, depth_timestamp_ns) - min(keyframe_image_timestamp_ns, keyframe_odom_timestamp_ns, depth_timestamp_ns)) / 1e6
         t_stage = mark_stage("timestamp_parse", t_stage)
 
         since_last_s = (stamp_ns - self._last_relocalization_stamp_ns) / 1e9
@@ -888,7 +893,7 @@ class MapNode(Node):
         relocal_parts = ", ".join(f"relocal_{name}={ms:.1f}" for name, ms in self.last_relocalization_timing.items())
         msg = (
             f"Keyframe callback benchmark ms: timestamp={keyframe_image_timestamp_ns}, "
-            f"total={total_ms:.1f}, sync_skew={sync_skew_ms:.1f}, {stage_parts}, success={success}"
+            f"total={total_ms:.1f}, {stage_parts}, success={success}"
         )
         if relocal_parts:
             msg += f", {relocal_parts}"
