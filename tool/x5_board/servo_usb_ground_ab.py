@@ -127,6 +127,11 @@ def read_irqs() -> dict[str, int]:
 class Snapshot:
     def __init__(self) -> None:
         self.t = time.monotonic()
+        # Wall clock too, so a round can be joined against a condition log kept
+        # somewhere else -- the laptop's AC-adapter state, for instance, which the
+        # board cannot observe. Board and PC clocks must be checked to agree first;
+        # the board has no RTC and boots at 2025-08-26 until sync_board_time.sh runs.
+        self.wall = time.time()
         self.label = usb_label()
         self.cpu = read_cpu()
         self.irq = read_irqs()
@@ -155,7 +160,8 @@ def main() -> int:
     bus.connect()
 
     header = ("round\telapsed_s\tlabel\tfails\tcycles\tfail_pct\t"
-              "cpu_pct\ttemp_c\tusb_rx_Bps\tusb_tx_Bps\tdwc3_irq_s\tttyS3_irq_s\n")
+              "cpu_pct\ttemp_c\tusb_rx_Bps\tusb_tx_Bps\tdwc3_irq_s\tttyS3_irq_s\t"
+              "t0_epoch\tt1_epoch\n")
     out = open(args.out, "w")
     out.write(header)
     out.flush()
@@ -199,12 +205,15 @@ def main() -> int:
                 "tx": (after.tx - before.tx) / dt,
                 "dwc3": (after.irq["dwc3"] - before.irq["dwc3"]) / dt,
                 "ttys3": (after.irq["ttyS3"] - before.irq["ttyS3"]) / dt,
+                "t0": before.wall,
+                "t1": after.wall,
             }
             rows.append(row)
             line = (f"{row['round']}\t{row['elapsed']:.1f}\t{row['label']}\t"
                     f"{row['fails']}\t{row['cycles']}\t{row['pct']:.2f}\t"
                     f"{row['cpu']:.1f}\t{row['temp']:.1f}\t{row['rx']:.0f}\t"
-                    f"{row['tx']:.0f}\t{row['dwc3']:.0f}\t{row['ttys3']:.0f}\n")
+                    f"{row['tx']:.0f}\t{row['dwc3']:.0f}\t{row['ttys3']:.0f}\t"
+                    f"{row['t0']:.1f}\t{row['t1']:.1f}\n")
             out.write(line)
             out.flush()
             os.fsync(out.fileno())
