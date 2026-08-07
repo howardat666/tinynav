@@ -207,28 +207,54 @@ def generate_trajectory_library_3d(
     trajectories = np.empty((num_samples, num_steps, 13))
     params = np.empty((num_samples, 2))
 
+    # Loop invariants, hoisted. dq depends only on omega_y, never on the step index,
+    # yet it was rebuilt on every one of the 31 steps of all 105 trajectories -- 3255
+    # rotvec_to_matrix calls per planning cycle to produce 15 distinct matrices. The
+    # body velocity and angular velocity rows were likewise reallocated per step.
+    #
+    # numba does not hoist these on its own: rotvec_to_matrix is a separate njit
+    # function, and the compiler will not assume it is pure and move it out of the
+    # loop. Measured on the X5 with both versions compiled and interleaved in one
+    # process, output bit-identical: 23.55 ms -> 13.31 ms p50, a 1.77x cut of a stage
+    # that runs on every planning cycle that has a navigation target.
+    #
+    # Plain arrays rather than lists: reflected lists are deprecated in numba.
+    dq_by_omega = np.empty((len(omega_y_samples), 3, 3))
+    ang_vel_by_omega = np.empty((len(omega_y_samples), 3))
+    for i_omega in range(len(omega_y_samples)):
+        w = omega_y_samples[i_omega]
+        dq_by_omega[i_omega] = rotvec_to_matrix(np.array([0.0, w * dt, 0.0]))
+        ang_vel_by_omega[i_omega] = np.array([0.0, w, 0.0])
+    v_body_by_vx = np.zeros((len(vx_samples), 3))
+    for i_vx in range(len(vx_samples)):
+        v_body_by_vx[i_vx, 2] = vx_samples[i_vx]
+    # Never written below: `q = q @ dq` rebinds to a fresh array on the first step.
+    R_init = quat_to_matrix(init_q)
+
     k = -1
     for i_vx in range(len(vx_samples)):
+        vx = vx_samples[i_vx]
+        v_body = v_body_by_vx[i_vx]
         for i_omega in range(len(omega_y_samples)):
             k += 1
-            vx = vx_samples[i_vx]
             omega_y = omega_y_samples[i_omega]
+            dq = dq_by_omega[i_omega]
+            ang_vel = ang_vel_by_omega[i_omega]
             p = init_p.copy()
-            q = quat_to_matrix(init_q)
-            traj = np.empty((num_steps, 13))
+            q = R_init
+            # Write straight into the output block instead of filling a scratch
+            # array and copying it in.
+            traj = trajectories[k]
             for i in range(num_steps):
-                dq = rotvec_to_matrix(np.array([0.0, omega_y * dt, 0.0]))
                 q = q @ dq
-                v_world = q @ np.array([0.0, 0.0, vx])
+                v_world = q @ v_body
                 p += v_world * dt
                 traj[i, :3] = p
                 traj[i, 3:7] = matrix_to_quat(q)
                 traj[i, 7:10] = v_world
-                traj[i, 10:13] = np.array([0.0, omega_y, 0.0])
+                traj[i, 10:13] = ang_vel
             #hack
-            for i in range(num_steps):
-                traj[i, 2] = traj[0, 2]
-            trajectories[k] = traj
+            traj[:, 2] = traj[0, 2]
             params[k, 0] = vx
             params[k, 1] = omega_y
     return trajectories, params
@@ -250,14 +276,17 @@ def generate_predefined_trajectory_vocabularies(
     reverse_speed = 0.2
     p = init_p.copy()
     q = quat_to_matrix(init_q)
+    # omega is zero for this vocabulary, so the orientation never changes: the
+    # quaternion and the world velocity are loop invariants. They used to be
+    # recomputed on every step to produce the same value 31 times.
+    quat = matrix_to_quat(q)
+    step = (q @ np.array([0.0, 0.0, -reverse_speed])) * dt
     traj = np.empty((num_steps, 7), dtype=np.float64)
     for i in range(num_steps):
-        v_world = q @ np.array([0.0, 0.0, -reverse_speed])
-        p += v_world * dt
+        p += step
         traj[i, :3] = p
-        traj[i, 3:] = matrix_to_quat(q)
-    for i in range(num_steps):
-        traj[i, 2] = traj[0, 2]
+        traj[i, 3:] = quat
+    traj[:, 2] = traj[0, 2]
     trajectories.append(traj)
     params.append(np.array([-reverse_speed, 0.0], dtype=np.float64))
 
@@ -734,7 +763,11 @@ class PlanningNode(Node):
             new_occ = run_raycasting_loopy(depth, T, self.grid_shape, fx, fy, cx, cy, self.origin, self.step, self.resolution)
             self.occupancy_grid *= 0.99
             self.occupancy_grid += new_occ
-            self.occupancy_grid = np.clip(self.occupancy_grid, -0.2, 0.2)
+            # In place: np.clip without out= allocated a fresh grid every cycle and
+            # dropped the old one. On this board that is pure DDR traffic in the loop
+            # that is already the latency bottleneck, and the bus loss measurements
+            # (docs/x5/servo_bus.md) make memory bandwidth a suspect in its own right.
+            np.clip(self.occupancy_grid, -0.2, 0.2, out=self.occupancy_grid)
 
             self.publish_3d_occupancy_cloud(self.occupancy_grid, self.resolution, self.origin)
 
