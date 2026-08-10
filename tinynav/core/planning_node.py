@@ -12,7 +12,6 @@ from cv_bridge import CvBridge
 import numpy as np
 from scipy.ndimage import distance_transform_edt, binary_dilation
 from dataclasses import dataclass
-from numba import njit
 import message_filters
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from rclpy.time import Time
@@ -23,7 +22,12 @@ import sensor_msgs_py.point_cloud2 as pc2
 from std_msgs.msg import Header
 from codetiming import Timer
 import cv2
-from tinynav.core.math_utils import rotvec_to_matrix, quat_to_matrix, matrix_to_quat, pose_msg2np
+from tinynav.core.math_utils import quat_to_matrix, matrix_to_quat, pose_msg2np
+from tinynav.core.planning_kernels import (
+    generate_trajectory_library_3d,
+    run_raycasting_loopy,
+    score_trajectories_by_ESDF,
+)
 # Re-exported so `from planning_node import GO2_CONFIG` keeps working
 # (tool/planning_bag_viser.py does exactly that).
 from tinynav.core.robot_config import (
@@ -78,88 +82,6 @@ _PUBLISH_PLANNING_OVERLAYS = os.environ.get('TINYNAV_PUBLISH_PLANNING_OVERLAYS',
 _EXACT_POSE_PREFIXES = ("/camera/camera/vio",)
 
 # === Helper functions ===
-@njit(cache=True)
-def run_raycasting_loopy(depth_image, T_cam_to_world, grid_shape, fx, fy, cx, cy, origin, step, resolution, filter_ground = False):
-    """
-    A "C-style" version of run_raycasting that uses explicit loops instead of
-    NumPy vector operations, designed for optimal Numba performance.
-    Reference: https://numba.readthedocs.io/en/stable/user/performance-tips.html#loops
-    """
-    occupancy_grid = np.zeros(grid_shape)
-    depth_height, depth_width = depth_image.shape
-
-    grid_shape_x, grid_shape_y, grid_shape_z = grid_shape
-    origin_x, origin_y, origin_z = origin
-
-    cam_orig_x = T_cam_to_world[0, 3]
-    cam_orig_y = T_cam_to_world[1, 3]
-    cam_orig_z = T_cam_to_world[2, 3]
-
-    start_voxel_x = int(np.floor((cam_orig_x - origin_x) / resolution))
-    start_voxel_y = int(np.floor((cam_orig_y - origin_y) / resolution))
-    start_voxel_z = int(np.floor((cam_orig_z - origin_z) / resolution))
-
-    for v in range(0, depth_height, step):
-        for u in range(0, depth_width, step):
-            d = depth_image[v, u]
-            if (not np.isfinite(d)) or d <= 0:
-                continue
-
-            # Project to camera coordinates
-            px = (u - cx) * d / fx
-            py = (v - cy) * d / fy
-            pz = d
-            is_ground = py > 0
-
-            # Transform to world coordinates (manual matrix multiplication)
-            pw_x = T_cam_to_world[0, 0] * px + T_cam_to_world[0, 1] * py + T_cam_to_world[0, 2] * pz + T_cam_to_world[0, 3]
-            pw_y = T_cam_to_world[1, 0] * px + T_cam_to_world[1, 1] * py + T_cam_to_world[1, 2] * pz + T_cam_to_world[1, 3]
-            pw_z = T_cam_to_world[2, 0] * px + T_cam_to_world[2, 1] * py + T_cam_to_world[2, 2] * pz + T_cam_to_world[2, 3]
-
-            # Calculate end voxel
-            end_voxel_x = int(np.floor((pw_x - origin_x) / resolution))
-            end_voxel_y = int(np.floor((pw_y - origin_y) / resolution))
-            end_voxel_z = int(np.floor((pw_z - origin_z) / resolution))
-
-            # Bresenham's line algorithm (simplified)
-            diff_x = end_voxel_x - start_voxel_x
-            diff_y = end_voxel_y - start_voxel_y
-            diff_z = end_voxel_z - start_voxel_z
-
-            steps = max(abs(diff_x), abs(diff_y), abs(diff_z))
-            if steps == 0:
-                continue
-
-            for i in range(steps + 1):
-                t = i / steps
-                interp_x = int(round(start_voxel_x + t * diff_x))
-                interp_y = int(round(start_voxel_y + t * diff_y))
-                interp_z = int(round(start_voxel_z + t * diff_z))
-
-                if (0 <= interp_x < grid_shape_x and
-                    0 <= interp_y < grid_shape_y and
-                    0 <= interp_z < grid_shape_z):
-                    occupancy_grid[interp_x, interp_y, interp_z] -= 0.05
-
-            if (0 <= end_voxel_x < grid_shape_x and
-                0 <= end_voxel_y < grid_shape_y and
-                0 <= end_voxel_z < grid_shape_z):
-                if filter_ground and is_ground:
-                    pass
-                else:
-                    occupancy_grid[end_voxel_x, end_voxel_y, end_voxel_z] += 0.2
-
-    # Explicit clipping loop
-    for i in range(grid_shape_x):
-        for j in range(grid_shape_y):
-            for k in range(grid_shape_z):
-                if occupancy_grid[i, j, k] < -0.1:
-                    occupancy_grid[i, j, k] = -0.1
-                elif occupancy_grid[i, j, k] > 0.1:
-                    occupancy_grid[i, j, k] = 0.1
-
-    return occupancy_grid
-
 
 @dataclass
 class ObstacleConfig:
@@ -193,79 +115,6 @@ def build_obstacle_map(occupancy_grid, origin, resolution, robot_z, config=None)
     if config.dilation_cells > 0 and np.any(obstacle):
         obstacle = binary_dilation(obstacle, iterations=config.dilation_cells)
     return obstacle
-
-@njit(cache=True)
-def generate_trajectory_library_3d(
-    num_samples=15, duration=3.0, dt=0.1,
-    init_p=np.zeros(3), init_q=np.array([0, 0, 0, 1])
-):
-    """Regular sampled lattice (forward-only)."""
-    num_steps = int(duration / dt) + 1
-
-    vx_max = 0.5
-    n_vx = max(3, int(num_samples / 2))
-    vx_samples = np.linspace(0.0, vx_max, n_vx)
-    omega_y_samples = np.linspace(-np.pi / 3, np.pi / 3, num_samples)
-
-    num_samples = len(vx_samples) * len(omega_y_samples)
-
-    # Per step state layout:
-    # [0:3]=position(x,y,z), [3:7]=quaternion(x,y,z,w),
-    # [7:10]=linear velocity(vx,vy,vz), [10:13]=angular velocity(wx,wy,wz) in world frame.
-    trajectories = np.empty((num_samples, num_steps, 13))
-    params = np.empty((num_samples, 2))
-
-    # Loop invariants, hoisted. dq depends only on omega_y, never on the step index,
-    # yet it was rebuilt on every one of the 31 steps of all 105 trajectories -- 3255
-    # rotvec_to_matrix calls per planning cycle to produce 15 distinct matrices. The
-    # body velocity and angular velocity rows were likewise reallocated per step.
-    #
-    # numba does not hoist these on its own: rotvec_to_matrix is a separate njit
-    # function, and the compiler will not assume it is pure and move it out of the
-    # loop. Measured on the X5 with both versions compiled and interleaved in one
-    # process, output bit-identical: 23.55 ms -> 13.31 ms p50, a 1.77x cut of a stage
-    # that runs on every planning cycle that has a navigation target.
-    #
-    # Plain arrays rather than lists: reflected lists are deprecated in numba.
-    dq_by_omega = np.empty((len(omega_y_samples), 3, 3))
-    ang_vel_by_omega = np.empty((len(omega_y_samples), 3))
-    for i_omega in range(len(omega_y_samples)):
-        w = omega_y_samples[i_omega]
-        dq_by_omega[i_omega] = rotvec_to_matrix(np.array([0.0, w * dt, 0.0]))
-        ang_vel_by_omega[i_omega] = np.array([0.0, w, 0.0])
-    v_body_by_vx = np.zeros((len(vx_samples), 3))
-    for i_vx in range(len(vx_samples)):
-        v_body_by_vx[i_vx, 2] = vx_samples[i_vx]
-    # Never written below: `q = q @ dq` rebinds to a fresh array on the first step.
-    R_init = quat_to_matrix(init_q)
-
-    k = -1
-    for i_vx in range(len(vx_samples)):
-        vx = vx_samples[i_vx]
-        v_body = v_body_by_vx[i_vx]
-        for i_omega in range(len(omega_y_samples)):
-            k += 1
-            omega_y = omega_y_samples[i_omega]
-            dq = dq_by_omega[i_omega]
-            ang_vel = ang_vel_by_omega[i_omega]
-            p = init_p.copy()
-            q = R_init
-            # Write straight into the output block instead of filling a scratch
-            # array and copying it in.
-            traj = trajectories[k]
-            for i in range(num_steps):
-                q = q @ dq
-                v_world = q @ v_body
-                p += v_world * dt
-                traj[i, :3] = p
-                traj[i, 3:7] = matrix_to_quat(q)
-                traj[i, 7:10] = v_world
-                traj[i, 10:13] = ang_vel
-            #hack
-            traj[:, 2] = traj[0, 2]
-            params[k, 0] = vx
-            params[k, 1] = omega_y
-    return trajectories, params
 
 
 def generate_predefined_trajectory_vocabularies(
@@ -308,74 +157,6 @@ def normalize_pose_trajectories(trajectories):
         return trajectories[:, :, :7].astype(np.float64)
     return np.zeros((0, 0, 7), dtype=np.float64)
 
-@njit(cache=True)
-def score_trajectories_by_ESDF(trajectories, ESDF_map, origin, resolution, safety_radius=0.1,
-                                front_len=0.35, rear_len=0.35, half_w=0.15):
-    """Score trajectories by minimum ESDF clearance across the robot footprint (center + 4 corners)."""
-    scores = []
-    occ_points = []
-    ESDF_rows, ESDF_cols = ESDF_map.shape
-
-    for t in range(len(trajectories)):
-        traj = trajectories[t]
-        min_dist_for_traj = float('inf')
-        closest_step_for_traj = -1
-
-        for i in range(len(traj)):
-            x_world, y_world = traj[i, 0], traj[i, 1]
-            qx, qy, qz, qw = traj[i, 3], traj[i, 4], traj[i, 5], traj[i, 6]
-
-            # world XY forward from quaternion (body +Z forward)
-            fwd_x = 2.0 * (qx * qz + qw * qy)
-            fwd_y = 2.0 * (qy * qz - qw * qx)
-            n = (fwd_x * fwd_x + fwd_y * fwd_y) ** 0.5
-            if n > 1e-6:
-                fwd_x /= n
-                fwd_y /= n
-            else:
-                fwd_x, fwd_y = 1.0, 0.0
-            left_x = -fwd_y
-            left_y = fwd_x
-
-            # center + 4 corners, unrolled for numba
-            check_xs = (
-                x_world,
-                x_world + fwd_x * front_len + left_x * half_w,
-                x_world + fwd_x * front_len - left_x * half_w,
-                x_world - fwd_x * rear_len  + left_x * half_w,
-                x_world - fwd_x * rear_len  - left_x * half_w,
-            )
-            check_ys = (
-                y_world,
-                y_world + fwd_y * front_len + left_y * half_w,
-                y_world + fwd_y * front_len - left_y * half_w,
-                y_world - fwd_y * rear_len  + left_y * half_w,
-                y_world - fwd_y * rear_len  - left_y * half_w,
-            )
-
-            for k in range(5):
-                x_img = int((check_xs[k] - origin[0]) / resolution)
-                y_img = int((check_ys[k] - origin[1]) / resolution)
-                if 0 <= x_img < ESDF_rows and 0 <= y_img < ESDF_cols:
-                    dist = ESDF_map[x_img, y_img]
-                    if dist < min_dist_for_traj:
-                        min_dist_for_traj = dist
-                        closest_step_for_traj = i
-
-        if min_dist_for_traj < 1e-3:  # collision
-            scores.append(float('inf'))
-        elif min_dist_for_traj != float('inf'):
-            if min_dist_for_traj > safety_radius:
-                scores.append(0.0)
-            else:
-                max_steps = len(traj)
-                decay_factor = (max_steps - closest_step_for_traj) / max_steps
-                base_score = 1.0 / (min_dist_for_traj + 1e-3)
-                scores.append(decay_factor * base_score)
-        else:
-            scores.append(0.0)
-        occ_points.append(closest_step_for_traj)
-    return scores, occ_points
 
 def roll_occupancy_grid(occupancy_grid, old_origin, new_origin, resolution):
     shift_m = new_origin - old_origin
@@ -511,37 +292,15 @@ class PlanningNode(Node):
         self.smoothed_velocity = 0.0
         self.dt = 0.1
         self.planning_latency_s = 0.2
-        # HOW FAR THE SEED MAY DISAGREE WITH THE MEASUREMENT BEFORE IT IS THROWN AWAY.
-        #
-        # This used to be 2.0 m, which is not a sanity check, it is a licence to dead
-        # reckon. The seed is the previous trajectory sampled forward in time, so it is
-        # a PREDICTION of where the robot will be, and it is fed back in as the start
-        # state of the next prediction. The measurement enters only through this
-        # comparison. Set the bound loose enough and the loop is open: every cycle the
-        # planner believes its own last guess and the error grows without ever being
-        # corrected.
-        #
-        # That is exactly what the 2026-08-10 15:00 run did. Relocalization put the
-        # robot 1.79 m from where it started; wheel_odometry's own closing pose agreed
-        # (x=1.619 y=-0.626, 1.74 m); planning believed 3.08 m. The robot was tracking
-        # its commanded speed at roughly 58%, and because 1.3 m of disagreement is
-        # comfortably inside 2.0 m, nothing ever rejected the prediction.
-        #
-        # The bound is now what the robot could physically have moved since the
-        # measurement -- top speed over one planning latency, with margin for a slow
-        # cycle. Rejecting the seed is cheap: planning simply restarts from the
-        # measured pose, which is what it should have been doing.
+        # The seed is a prediction fed back as the next prediction's start state; this
+        # bound is the only place the measurement enters. At 2.0 m the loop was open and
+        # the estimate drifted 1.3 m unchallenged. 0.5 m is one planning latency of travel.
         self.seed_fallback_distance_m = 0.5
         self.target_reached_distance_m = 0.15
         self.last_planned_traj = None
         self.last_planned_traj_base_stamp = None
-        # A static path says "I am not moving", so seeding the next cycle from it
-        # re-asserts wherever the last cycle THOUGHT the robot was and never lets the
-        # measurement back in. In the 2026-08-10 15:00 run that closed the loop: the
-        # arrival test fired on a predicted position, the static path was built at that
-        # same predicted position, the next seed read it back, and the reported distance
-        # to target sat at exactly 0.105 m for four and a half minutes while the robot
-        # stood 1.3 m short of the POI. Static paths are therefore not seed material.
+        # A static path only records where the last cycle *believed* the robot was;
+        # seeding from it locks the estimate and the robot never moves again.
         self.last_planned_traj_is_static = True
         self._last_static_log_ns = {}
         self._last_target_rx_ns = 0
@@ -575,39 +334,16 @@ class PlanningNode(Node):
     def _start_trajectory_warmup(self):
         """Compile the trajectory kernels before the first target, not after it.
 
-        WHAT THIS COSTS WHEN IT IS MISSING -- measured, not estimated. Everything
-        after the "No target pose" early return is unreachable until a target
-        exists, and two of the heaviest njit kernels live there:
-        generate_trajectory_library_3d and score_trajectories_by_ESDF. So on a cold
-        numba cache the first target does not start navigation, it starts a
-        compile. In the 2026-08-10 12:00 run sync_callback went silent for 71.85 s
-        at exactly the instant the target arrived (last line 1786334323.461, next
-        1786334395.315), cmd_vel_control logged 69 consecutive "trajectory expired"
-        with vx=0, and the trajectory that finally came out carried a first pose
-        stamp 71.72 s behind the current odometry. The operator saw a path drawn on
-        screen and a robot that did not move for over a minute.
-
-        map_node already solved this for its path-search kernels
-        (_start_nav_path_search_warmup) and this node was simply never given the
-        same treatment. Same shape of fix: a daemon thread, so the constructor and
-        every callback keep running while the compile happens.
-
-        WHY THE CACHE DOES NOT ALREADY COVER IT. It does, until this file is
-        edited. numba's on-disk cache key includes the function's source LINE
-        NUMBER -- the cache holds score_trajectories_by_ESDF-243, -264 and -309 for
-        three past versions of the same function -- so inserting a line anywhere
-        above a kernel invalidates it. Every session that touches this file pays
-        the compile once on the next run, which is precisely when a board test is
-        happening. The warmup makes that cost invisible instead of making it land
-        on the first navigation command.
+        generate_trajectory_library_3d and score_trajectories_by_ESDF sit past the
+        "No target pose" early return, so on a cold cache the first target starts a
+        72 s compile instead of navigation. Same background-thread shape as
+        map_node._start_nav_path_search_warmup.
         """
 
         def _run():
             t0 = time.monotonic()
             try:
-                # Shapes and dtypes must match the real call sites or numba compiles
-                # a signature the real call will not hit, and the warmup buys nothing
-                # while still looking successful in the log.
+                # Must match the real call sites or numba compiles an unused signature.
                 init_p = np.zeros(3)
                 init_q = np.array([0.0, 0.0, 0.0, 1.0])
                 trajectories, params = generate_trajectory_library_3d(
@@ -621,10 +357,7 @@ class PlanningNode(Node):
                 if len(vocab_trajs) > 0:
                     trajectories = np.concatenate([trajectories, vocab_trajs], axis=0)
                     params = np.concatenate([params, vocab_params], axis=0)
-                # ESDF_map is a 2-D float32 distance field over the (x, y) grid; see
-                # the distance_transform_edt call in sync_callback. A uniformly large
-                # clearance keeps every trajectory collision-free, so the warmup can
-                # never be mistaken for real planning output.
+                # 2-D float32 clearance field, as built in sync_callback.
                 esdf = np.full(self.grid_shape[:2], 10.0, dtype=np.float32)
                 front_len, rear_len, half_w = self.robot.footprint_from_control()
                 score_trajectories_by_ESDF(
@@ -833,9 +566,7 @@ class PlanningNode(Node):
         if self.last_planned_traj is None or self.last_planned_traj_base_stamp is None:
             return None
         if self.last_planned_traj_is_static:
-            # See last_planned_traj_is_static in __init__: a standstill path carries no
-            # information about where the robot is, only about where the last cycle
-            # believed it was, and feeding that back locks the estimate.
+            # See last_planned_traj_is_static.
             return None
         traj = self.last_planned_traj
         if len(traj) < 1:
@@ -1009,9 +740,7 @@ class PlanningNode(Node):
                     init_p, init_v, init_q = init_p_seed, init_v_seed, init_q_seed
                     planning_base_stamp = seed_stamp
                 else:
-                    # Worth a line: this is the planner's prediction disagreeing with
-                    # the wheels, which is the quantity that silently reached 1.3 m
-                    # before anyone noticed. Rare and throttled, so it costs nothing.
+                    # Prediction vs wheels: the quantity that silently reached 1.3 m.
                     now_ns = self.get_clock().now().nanoseconds
                     if now_ns - self._last_static_log_ns.get("seed_reject", 0) >= 1_000_000_000:
                         self._last_static_log_ns["seed_reject"] = now_ns
@@ -1044,11 +773,7 @@ class PlanningNode(Node):
                 return
 
             if not self._traj_warmup_done.is_set():
-                # Not a wait -- the compile below will block this callback anyway,
-                # because both it and the warmup thread hold the same numba
-                # compilation lock. The point is that the log says so, so the next
-                # reader does not have to infer a JIT stall from a 70 s hole in the
-                # timestamps the way this one had to.
+                # Says so explicitly, so a JIT stall is not inferred from a hole in the log.
                 self.get_logger().warning(
                     "first target arrived before the trajectory kernels finished "
                     "compiling -- this callback will block until they do"
@@ -1120,9 +845,7 @@ class PlanningNode(Node):
                     f"navigating: ground_dist_xy={target_dist_xy:.3f}m "
                     f"(threshold {self.target_reached_distance_m:.2f}m) "
                     f"robot=[{init_p[0]:.2f},{init_p[1]:.2f},{init_p[2]:.2f}] "
-                    # The measured pose next to the one being planned from. They were
-                    # 1.3 m apart for four and a half minutes on 2026-08-10 and the log
-                    # showed only the first, so the stall read as "already arrived".
+                    # Measured next to planned-from: a stall between them reads as arrival.
                     f"measured=[{measured_center[0]:.2f},{measured_center[1]:.2f},{measured_center[2]:.2f}] "
                     f"seed_err={self._seed_error_m:.2f}m "
                     f"target=[{target_pose[0]:.2f},{target_pose[1]:.2f},{target_pose[2]:.2f}]"
