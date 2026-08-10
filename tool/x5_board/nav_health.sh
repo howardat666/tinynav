@@ -46,6 +46,25 @@ if [ -n "$m" ]; then
   if [ -n "$r" ]; then echo "$r"; else echo "   nothing in window (map_node stopped, or nav nodes not enabled)"; fi
 else echo "   no map_node log at all -- nav nodes have never been enabled"; fi
 
+# Rates, which the window line carries but only implicitly: it prints the keyframe
+# COUNT and the attempt/success rates, so the keyframe rate -- the one that says
+# whether the perception front end is feeding map_node fast enough -- had to be
+# divided out by hand every time.
+#
+# sed rather than awk's match(str, re, arr): that form is a GNU extension and this
+# board has busybox awk, where it is a syntax error rather than a wrong answer.
+if [ -n "$m" ]; then
+  recent "$m" | grep "window:" | tail -3 | while read -r ln; do
+    span=$(echo "$ln" | sed -n 's/.*relocalization \([0-9]*\)s window.*/\1/p')
+    kf=$(echo "$ln" | sed -n 's/.*window: \([0-9]*\) keyframes.*/\1/p')
+    att=$(echo "$ln" | sed -n 's/.*attempts (\([0-9.]*\) Hz).*/\1/p')
+    okp=$(echo "$ln" | sed -n 's/.*ok (\([^)]*\)).*/\1/p')
+    [ -n "$span" ] && [ "$span" != "0" ] || continue
+    khz=$(awk -v a="$kf" -v b="$span" 'BEGIN{printf "%.2f", a/b}')
+    echo "   rates over ${span}s: keyframe ${khz} Hz | reloc attempt ${att} Hz | reloc ok ${okp}"
+  done
+fi
+
 echo "-- planning --"
 if [ -n "$p" ]; then
   nav=$(recent "$p" | grep -c "navigating:")
