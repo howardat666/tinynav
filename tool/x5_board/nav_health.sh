@@ -51,6 +51,34 @@ if [ -n "$w" ]; then
   if [ -n "$f" ] && [ -n "$f0" ]; then echo "   read failures in window: $((f - f0))  (cumulative $f)"
   else echo "   no read failures logged in window"; fi
 fi
+echo "-- processes --"
+# app_start.sh stop has been seen to leave the previous wheel_odometry alive, so two
+# of them ended up sharing /dev/ttyS3 across a restart. Nothing reported it: both
+# nodes log "wheel odometry up" and the port opens for both. Same class of failure as
+# a leaked measurement process, so both are checked here rather than remembered.
+h=0
+for pp in /proc/[0-9]*; do
+  for f in $pp/fd/*; do
+    case "$(readlink $f 2>/dev/null)" in */ttyS3) h=$((h+1));; esac
+  done
+done
+echo "   ttyS3 holders: $h"
+[ "$h" -gt 1 ] && echo "   !! more than one process holds the servo bus -- run cleanup.sh"
+[ "$h" = "0" ] && echo "   !! nobody holds the servo bus -- wheel_odometry is down"
+for n in wheel_odometry_node map_node planning_node looper_bridge_node cmd_vel_control; do
+  c=0
+  for pp in /proc/[0-9]*; do
+    case "$(tr '\0' ' ' < $pp/cmdline 2>/dev/null)" in *$n*) c=$((c+1));; esac
+  done
+  [ "$c" -gt 1 ] && echo "   !! $c copies of $n running"
+done
+for pp in /proc/[0-9]*; do
+  case "$(tr '\0' ' ' < $pp/cmdline 2>/dev/null)" in
+    *bus_loss_live*|*servo_usb_ground_ab*|*servo_failure_pattern*)
+      echo "   note: diagnostic tool still running (pid ${pp#/proc/}) -- it costs CPU and RAM";;
+  esac
+done
+
 echo "-- board --"
 printf "   temp %sC   load %s   avail %s kB\n" \
   "$(awk '{printf "%.1f", $1/1000}' /sys/class/thermal/thermal_zone0/temp)" \
