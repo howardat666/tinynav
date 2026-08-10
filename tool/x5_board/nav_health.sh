@@ -1,10 +1,33 @@
 #!/bin/sh
+exec 2>/dev/null   # /proc entries vanish mid-scan; those races are not findings
 # One screen answering "is the navigation chain actually working right now".
 # Every number here had to be dug out of five separate log files by hand during the
 # 2026-08-10 run; the chain fails silently at four different layers and each layer
 # looks like success from the one above it.
 N=/userdata/x5/logs/nodes
-newest() { ls -1t $N/*_$1.txt 2>/dev/null | head -1; }
+# Resolve each node's log from the LIVE process, not from the newest matching file.
+# Globbing by mtime picked a killed duplicate's log on 2026-08-10 -- both files carried
+# the same mtime to the second, ls -t broke the tie arbitrarily, and the summary
+# reported 581 read failures that belonged to a process that no longer existed. Same
+# class as tailing app.log for lines that only ever went to logs/nodes/: a confident
+# wrong number, which is worse than no number.
+#
+# Two guards against matching this script's own shell, whose command string contains
+# every node name below: require the cmdline to start with python3, and require fd 1
+# to point inside logs/nodes/.
+newest() {
+  for pp in /proc/[0-9]*; do
+    c=$(tr '\0' ' ' < $pp/cmdline 2>/dev/null) || continue
+    case "$c" in
+      python3*$1*)
+        l=$(readlink $pp/fd/1 2>/dev/null)
+        case "$l" in $N/*) echo "$l"; return 0;; esac ;;
+    esac
+  done
+  # Nothing live: fall back to the newest file so a post-mortem still works, but the
+  # caller can tell the difference because the live case never reaches here.
+  ls -1t $N/*_$1.txt 2>/dev/null | head -1
+}
 W=${1:-120}   # seconds of history to summarise
 now=$(date +%s)
 since=$((now - W))
@@ -12,7 +35,7 @@ since=$((now - W))
 recent() { [ -f "$1" ] && awk -v s="$since" 'match($0,/\[[0-9]+\.[0-9]+\]/){t=substr($0,RSTART+1,RLENGTH-2)+0; if(t>=s) print}' "$1"; }
 
 echo "=== last ${W}s ==="
-m=$(newest map_node); p=$(newest planning); c=$(newest cmd_vel_control); w=$(newest wheel_odometry)
+m=$(newest map_node.py); p=$(newest planning_node.py); c=$(newest cmd_vel_control); w=$(newest wheel_odometry_node.py)
 
 echo "-- relocalization (map_node) --"
 if [ -n "$m" ]; then
@@ -68,13 +91,13 @@ echo "   ttyS3 holders: $h"
 for n in wheel_odometry_node map_node planning_node looper_bridge_node cmd_vel_control; do
   c=0
   for pp in /proc/[0-9]*; do
-    case "$(tr '\0' ' ' < $pp/cmdline 2>/dev/null)" in *$n*) c=$((c+1));; esac
+    case "$(tr '\0' ' ' < $pp/cmdline 2>/dev/null)" in python3*$n*) c=$((c+1));; esac
   done
   [ "$c" -gt 1 ] && echo "   !! $c copies of $n running"
 done
 for pp in /proc/[0-9]*; do
   case "$(tr '\0' ' ' < $pp/cmdline 2>/dev/null)" in
-    *bus_loss_live*|*servo_usb_ground_ab*|*servo_failure_pattern*)
+    python3*bus_loss_live*|python3*servo_usb_ground_ab*|python3*servo_failure_pattern*)
       echo "   note: diagnostic tool still running (pid ${pp#/proc/}) -- it costs CPU and RAM";;
   esac
 done
