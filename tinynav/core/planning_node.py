@@ -1,3 +1,4 @@
+import math
 import array
 import os
 import threading
@@ -305,6 +306,7 @@ class PlanningNode(Node):
         self._last_static_log_ns = {}
         self._last_target_rx_ns = 0
         self._last_cycle_ns = 0
+        self._seed_debug = (0.0, 0, 0.0)
         # How long /control/target_pose must go quiet before proximity to it counts as
         # arrival rather than as passing over a waypoint. map_node republishes roughly
         # once a second while it is navigating and stops entirely once the POI list is
@@ -563,6 +565,16 @@ class PlanningNode(Node):
         ]
         self.occupancy_cloud_esdf_pub.publish(pc2.create_cloud(header, fields, points))
 
+    @staticmethod
+    def _wrap(a):
+        return (a + math.pi) % (2.0 * math.pi) - math.pi
+
+    @staticmethod
+    def _yaw_of(quat_xyzw):
+        """Ground-plane heading of a pose. Body +z is forward; see omni3_kinematics."""
+        fwd = quat_to_matrix(np.asarray(quat_xyzw, dtype=np.float64)) @ np.array([0.0, 0.0, 1.0])
+        return math.atan2(float(fwd[1]), float(fwd[0]))
+
     def _esdf_at(self, esdf_map, p):
         """Clearance under a world point, or nan if it is off the local grid."""
         i = int((p[0] - self.origin[0]) / self.resolution)
@@ -598,6 +610,7 @@ class PlanningNode(Node):
         else:
             v = (traj[idx, :3] - traj[idx - 1, :3]) / self.dt
         v = np.asarray(v, dtype=np.float64)
+        self._seed_debug = (rel_t, idx, seed_stamp)
         return p, v, q, seed_stamp
 
     def _make_static_path(self, init_p, init_q, header, base_time, num_steps):
@@ -933,6 +946,9 @@ class PlanningNode(Node):
             top_indices = np.argsort(np.array([cost_function(trajectories[i], params[i], scores[i], self.target_pose) for i in range(len(trajectories))]), kind='stable')[:top_k]
             self.last_param = params[top_indices[0]]
             best_idx = int(top_indices[0])
+            yaw_now = self._yaw_of(init_q)
+            to_t = target_pose[:2] - init_p[:2]
+            yaw_to_target = math.atan2(float(to_t[1]), float(to_t[0]))
             now_ns = self.get_clock().now().nanoseconds
             if now_ns - self._last_static_log_ns.get("decision", 0) >= 1_000_000_000:
                 cycle_s = (now_ns - self._last_cycle_ns) / 1e9 if self._last_cycle_ns else float('nan')
@@ -944,6 +960,10 @@ class PlanningNode(Node):
                     f"gate={'reverse' if front_clearance <= enter_threshold else 'forward'} "
                     f"esdf_at_robot={self._esdf_at(ESDF_map, init_p):.2f}m "
                     f"seed={'used' if seed is not None else 'rejected'} seed_err={self._seed_error_m:.2f}m "
+                    f"seed_rel_t={self._seed_debug[0]:.2f}s idx={self._seed_debug[1]} "
+                    f"seed_ahead={self._seed_debug[2] - stamp:+.2f}s "
+                    f"yaw={math.degrees(yaw_now):+.0f}deg to_target={math.degrees(yaw_to_target):+.0f}deg "
+                    f"heading_err={math.degrees(self._wrap(yaw_to_target - yaw_now)):+.0f}deg "
                     f"cycle={cycle_s:.2f}s stamp_lag={(now_ns / 1e9 - stamp):.2f}s"
                 )
             self._last_cycle_ns = now_ns
@@ -967,6 +987,17 @@ class PlanningNode(Node):
                     pose.pose.orientation.w = qw
                     path.poses.append(pose)
             self.path_pub.publish(path)
+            if now_ns - self._last_static_log_ns.get("traj_pub", 0) >= 1_000_000_000:
+                self._last_static_log_ns["traj_pub"] = now_ns
+                pts = np.array([[q.pose.position.x, q.pose.position.y, q.pose.position.z]
+                                for q in path.poses], dtype=np.float64)
+                gaps = np.linalg.norm(np.diff(pts, axis=0), axis=1) if len(pts) > 1 else np.zeros(1)
+                self.get_logger().info(
+                    f"traj published: n={len(pts)} "
+                    f"first=[{pts[0][0]:.2f},{pts[0][1]:.2f},{pts[0][2]:.2f}] "
+                    f"last=[{pts[-1][0]:.2f},{pts[-1][1]:.2f},{pts[-1][2]:.2f}] "
+                    f"span={np.linalg.norm(pts[-1][:2] - pts[0][:2]):.2f}m max_gap={gaps.max():.3f}m"
+                )
 
 def main(args=None):
     rclpy.init(args=args)
