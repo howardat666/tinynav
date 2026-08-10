@@ -1,5 +1,7 @@
 import array
 import os
+import threading
+import time
 
 import rclpy
 from rclpy.executors import ExternalShutdownException
@@ -538,6 +540,80 @@ class PlanningNode(Node):
 
         self.poi_change_sub = self.create_subscription(Odometry, "/mapping/poi_change", self.poi_change_callback, 10)
 
+        self._traj_warmup_done = threading.Event()
+        self._traj_warmup_ms = None
+        self._start_trajectory_warmup()
+
+    def _start_trajectory_warmup(self):
+        """Compile the trajectory kernels before the first target, not after it.
+
+        WHAT THIS COSTS WHEN IT IS MISSING -- measured, not estimated. Everything
+        after the "No target pose" early return is unreachable until a target
+        exists, and two of the heaviest njit kernels live there:
+        generate_trajectory_library_3d and score_trajectories_by_ESDF. So on a cold
+        numba cache the first target does not start navigation, it starts a
+        compile. In the 2026-08-10 12:00 run sync_callback went silent for 71.85 s
+        at exactly the instant the target arrived (last line 1786334323.461, next
+        1786334395.315), cmd_vel_control logged 69 consecutive "trajectory expired"
+        with vx=0, and the trajectory that finally came out carried a first pose
+        stamp 71.72 s behind the current odometry. The operator saw a path drawn on
+        screen and a robot that did not move for over a minute.
+
+        map_node already solved this for its path-search kernels
+        (_start_nav_path_search_warmup) and this node was simply never given the
+        same treatment. Same shape of fix: a daemon thread, so the constructor and
+        every callback keep running while the compile happens.
+
+        WHY THE CACHE DOES NOT ALREADY COVER IT. It does, until this file is
+        edited. numba's on-disk cache key includes the function's source LINE
+        NUMBER -- the cache holds score_trajectories_by_ESDF-243, -264 and -309 for
+        three past versions of the same function -- so inserting a line anywhere
+        above a kernel invalidates it. Every session that touches this file pays
+        the compile once on the next run, which is precisely when a board test is
+        happening. The warmup makes that cost invisible instead of making it land
+        on the first navigation command.
+        """
+
+        def _run():
+            t0 = time.monotonic()
+            try:
+                # Shapes and dtypes must match the real call sites or numba compiles
+                # a signature the real call will not hit, and the warmup buys nothing
+                # while still looking successful in the log.
+                init_p = np.zeros(3)
+                init_q = np.array([0.0, 0.0, 0.0, 1.0])
+                trajectories, params = generate_trajectory_library_3d(
+                    init_p=init_p, init_q=init_q, dt=self.dt
+                )
+                trajectories = normalize_pose_trajectories(trajectories)
+                vocab_trajs, vocab_params = generate_predefined_trajectory_vocabularies(
+                    init_p=init_p, init_q=init_q, dt=self.dt
+                )
+                vocab_trajs = normalize_pose_trajectories(vocab_trajs)
+                if len(vocab_trajs) > 0:
+                    trajectories = np.concatenate([trajectories, vocab_trajs], axis=0)
+                    params = np.concatenate([params, vocab_params], axis=0)
+                # ESDF_map is a 2-D float32 distance field over the (x, y) grid; see
+                # the distance_transform_edt call in sync_callback. A uniformly large
+                # clearance keeps every trajectory collision-free, so the warmup can
+                # never be mistaken for real planning output.
+                esdf = np.full(self.grid_shape[:2], 10.0, dtype=np.float32)
+                front_len, rear_len, half_w = self.robot.footprint_from_control()
+                score_trajectories_by_ESDF(
+                    trajectories, esdf, self.origin, self.resolution,
+                    self.robot.safety_radius, front_len, rear_len, half_w,
+                )
+            except Exception as e:  # noqa: BLE001 - a warmup thread must never die silently
+                self.get_logger().error(f"trajectory warmup failed: {e}")
+            finally:
+                self._traj_warmup_ms = (time.monotonic() - t0) * 1000.0
+                self._traj_warmup_done.set()
+                self.get_logger().info(
+                    f"trajectory kernels ready in {self._traj_warmup_ms:.0f} ms"
+                )
+
+        threading.Thread(target=_run, name="trajectory_warmup", daemon=True).start()
+
     def poi_change_callback(self, msg):
         # This silently discards the target, and it is a prime suspect for the
         # remaining stalls: in one run planning held a target for about 2 s out of a
@@ -920,6 +996,16 @@ class PlanningNode(Node):
                 )
                 return
 
+            if not self._traj_warmup_done.is_set():
+                # Not a wait -- the compile below will block this callback anyway,
+                # because both it and the warmup thread hold the same numba
+                # compilation lock. The point is that the log says so, so the next
+                # reader does not have to infer a JIT stall from a 70 s hole in the
+                # timestamps the way this one had to.
+                self.get_logger().warning(
+                    "first target arrived before the trajectory kernels finished "
+                    "compiling -- this callback will block until they do"
+                )
             target_pose = self.target_pose.copy()
             # Components 0 and 1 are the ground plane and this is correct -- do not
             # "fix" it to [0, 2]. It was changed to [0, 2] on 2026-08-10 and reverted
