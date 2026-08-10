@@ -78,7 +78,7 @@ def main() -> int:
     z = np.array([0, 0, 0], dtype=np.int32)
     timed("A* search_close", lambda: search_close_to_sdf_map_numba(z, small_sdf, small_occ, 0.2))
     timed("A* search_within", lambda: search_within_sdf_map_numba(
-        z, np.array([2, 2, 2], dtype=np.int32), small_sdf, small_occ, float(meta[3])))
+        z, np.array([2, 2, 2], dtype=np.int32), small_sdf, small_occ, meta[3]))
     return 0
 
 

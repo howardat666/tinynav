@@ -475,12 +475,15 @@ class MapNode(Node):
             small_sdf[1, 1, 1] = 0.0
             small_occupancy = np.zeros((3, 3, 3), dtype=self.occupancy_map.dtype)
             search_close_to_sdf_map_numba(np.array([0, 0, 0], dtype=np.int32), small_sdf, small_occupancy, 0.2)
+            # NOT float(...): occupancy_meta is float32, and the cast made this a
+            # float64 signature the real call never hits, so the first path search
+            # recompiled from scratch -- 17.9 s, logged as search time.
             search_within_sdf_map_numba(
                 np.array([0, 0, 0], dtype=np.int32),
                 np.array([2, 2, 2], dtype=np.int32),
                 small_sdf,
                 small_occupancy,
-                float(self.occupancy_map_meta[3]),
+                self.occupancy_map_meta[3],
             )
             self._nav_warmed = True
 
