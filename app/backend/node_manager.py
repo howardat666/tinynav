@@ -733,9 +733,16 @@ class BackendNode(Ros2NodeManager):
         ])
 
     def _transform_path_via_tf(self, path: list) -> list:
-        """Transform map-frame path points to odom (world) frame via TF lookup."""
+        """Transform map-frame path points to odom (world) frame via TF lookup.
+
+        Returns [] rather than the untransformed input when the transform is
+        missing: the local view draws this over the ESDF heatmap in odom
+        coordinates, so map coordinates land a metre or two off and read as a
+        stray path. Drawing nothing for the second before relocalization
+        publishes world<-map is the honest answer.
+        """
         if not path or self._tf_buffer is None:
-            return path
+            return []
         try:
             t = self._tf_buffer.lookup_transform('world', 'map', rclpy.time.Time())
             tr = t.transform.translation
@@ -748,7 +755,14 @@ class BackendNode(Ros2NodeManager):
                 result.append({'x': float(p[0]), 'y': float(p[1])})
             return result
         except Exception:
-            return path  # TF not yet available — fall back to map-frame coords
+            now = time.monotonic()
+            if now - getattr(self, '_last_tf_path_warn', 0.0) > 5.0:
+                self._last_tf_path_warn = now
+                self.get_logger().warning(
+                    'world<-map transform unavailable; global path withheld from the '
+                    'local view this cycle (it would be drawn in map coordinates)'
+                )
+            return []
 
     # ------------------------------------------------------------------ #
     # Sensor / camera                                                      #
