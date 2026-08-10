@@ -932,6 +932,24 @@ class PlanningNode(Node):
                 )
                 return
 
+            # The counterpart to "Target pose reached", which did not exist: while the
+            # robot was actually navigating this node logged nothing at all, so a run
+            # that drove badly and a run that never started were indistinguishable in
+            # the log. Diagnosing the axis bug above needed init_p, and init_p had to
+            # be reconstructed by solving backwards from the reported distance --
+            # guesswork standing in for evidence. Both positions go in raw for that
+            # reason, and the distance is labelled with the axes it was taken over so
+            # the next reader does not have to work out which plane was meant.
+            now_ns = self.get_clock().now().nanoseconds
+            if now_ns - self._last_static_log_ns.get("navigating", 0) >= 1_000_000_000:
+                self._last_static_log_ns["navigating"] = now_ns
+                self.get_logger().info(
+                    f"navigating: ground_dist_xz={target_dist_xy:.3f}m "
+                    f"(threshold {self.target_reached_distance_m:.2f}m) "
+                    f"robot=[{init_p[0]:.2f},{init_p[1]:.2f},{init_p[2]:.2f}] "
+                    f"target=[{target_pose[0]:.2f},{target_pose[1]:.2f},{target_pose[2]:.2f}]"
+                )
+
             trajectories, params = generate_trajectory_library_3d(
                 init_p = init_p,
                 init_q = init_q,
