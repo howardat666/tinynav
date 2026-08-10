@@ -317,6 +317,10 @@ class PlanningNode(Node):
         # must be before turning is preferred over closing the last few centimetres.
         self.min_progress_m = 0.05
         self.rotate_first_min_dist_m = 0.5
+        # A heading counts as an escape only if the probe finds nothing within this
+        # much. Above enter_threshold (0.30 m) so the turn actually releases the gate
+        # instead of handing back a heading that re-triggers it next cycle.
+        self.escape_min_clearance_m = 0.4
 
         # TRANSIENT_LOCAL because this topic carries state -- where the robot is going --
         # not a stream. map_node publishes it once per POI transition, so a volatile
@@ -459,13 +463,55 @@ class PlanningNode(Node):
         msg.points = points
         self.footprint_pub.publish(msg)
 
-    def _front_obstacle_dist(self, T, obstacle_mask, max_dist=0.5):
-        """Distance from the robot's front face to the nearest obstacle in the forward corridor.
-        Scans start at the front face so the returned value matches physical clearance."""
-        center = self.camera_to_robot_center(T)
-        fwd = T[:3, :3] @ np.array([0.0, 0.0, 1.0])
-        n = (fwd[0] ** 2 + fwd[1] ** 2) ** 0.5
-        fx, fy = (fwd[0] / n, fwd[1] / n) if n > 1e-6 else (1.0, 0.0)
+    @staticmethod
+    def _is_turn_in_place(param):
+        return abs(param[0]) < 1e-6 and abs(param[1]) > 1e-6
+
+    def _motion_gate_penalty(self, param, front_blocked):
+        """1e9 on any motion this sensor cannot vouch for, 0.0 otherwise.
+
+        The occupancy grid is written only by forward raycasting, so a reverse
+        trajectory cannot be rejected for collision -- it is scored against cells the
+        camera never looked at. Measured 2026-08-10 19:19: 40 s of vx=-0.2 straight
+        into an obstacle while up to 100 of the 106 trajectories were collision-free,
+        because the old gate made reverse the *only* admissible option whenever the
+        front was blocked and the library holds exactly one reverse."""
+        is_reverse = param[0] < 0.0
+        if is_reverse:
+            return 0.0 if (front_blocked and self.robot.allow_reverse) else 1e9
+        if front_blocked and not self._is_turn_in_place(param):
+            # Blocked ahead: turn until the camera faces a way out. Turning in place is
+            # the only motion whose swept volume the camera has already observed.
+            return 1e9
+        return 0.0
+
+    def _pick_escape_turn(self, center, turns, trajectories, yaw_to_target, obstacle_mask):
+        """Index of the in-place turn to commit to, plus the clearance it buys.
+
+        Lexicographic, not a weighted sum: a heading the camera can vouch for beats a
+        better-aimed one it cannot. Falls back to the freest heading when every
+        candidate is tight, so this always yields a turn rather than a standstill."""
+        end_yaws = np.array([self._yaw_of(trajectories[i][-1, 3:7]) for i in turns])
+        clear = np.array([self._clearance_along(center, math.cos(y), math.sin(y), obstacle_mask)
+                          for y in end_yaws])
+        head_err = np.array([abs(self._wrap(yaw_to_target - y)) for y in end_yaws])
+        usable = np.flatnonzero(clear >= self.escape_min_clearance_m)
+        k = int(usable[int(np.argmin(head_err[usable]))]) if len(usable) else int(np.argmax(clear))
+        return turns[k], float(clear[k])
+
+    @staticmethod
+    def _fmt_clearance(d, max_dist=0.5):
+        """">0.50m" rather than "1.50m": the probe stops at max_dist, so the sentinel
+        max_dist+1.0 is not a distance and reading it as one is misleading."""
+        if math.isnan(d):
+            return "n/a"
+        return f">{max_dist:.2f}m" if d > max_dist else f"{d:.2f}m"
+
+    def _clearance_along(self, center, fx, fy, obstacle_mask, max_dist=0.5):
+        """Clearance from the footprint edge to the nearest obstacle along (fx, fy).
+
+        Returns max_dist + 1.0 when the corridor is clear, which is a "nothing found"
+        marker rather than a measured distance -- do not print it as one."""
         lx, ly = -fy, fx
         fl, _, hw = self.robot.footprint_from_control()
         rows, cols = obstacle_mask.shape
@@ -479,6 +525,14 @@ class PlanningNode(Node):
                 if 0 <= xi < rows and 0 <= yi < cols and obstacle_mask[xi, yi]:
                     return d_from_face
         return max_dist + 1.0
+
+    def _front_obstacle_dist(self, T, obstacle_mask, max_dist=0.5):
+        """Clearance in the corridor the robot is currently facing."""
+        center = self.camera_to_robot_center(T)
+        fwd = T[:3, :3] @ np.array([0.0, 0.0, 1.0])
+        n = (fwd[0] ** 2 + fwd[1] ** 2) ** 0.5
+        fx, fy = (fwd[0] / n, fwd[1] / n) if n > 1e-6 else (1.0, 0.0)
+        return self._clearance_along(center, fx, fy, obstacle_mask, max_dist)
 
     def publish_obstacle_mask(self, mask, stamp):
         msg = OccupancyGrid()
@@ -898,16 +952,10 @@ class PlanningNode(Node):
         with Timer(name='pub', text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=_TIMER_LOGGER):
             front_clearance = self._front_obstacle_dist(T, obstacle_mask)
             enter_threshold = 0.30
+            front_blocked = front_clearance <= enter_threshold
 
             def cost_function(traj, param, score, target_pose):
-                # predefined backward trajectory penalty
-                is_backward_traj = param[0] < 0.0
-                should_reverse = front_clearance <= enter_threshold
-                reverse_gate_penalty = 0.0
-                if should_reverse and not is_backward_traj:
-                        reverse_gate_penalty = 1e9
-                elif not should_reverse and is_backward_traj:
-                        reverse_gate_penalty = 1e9
+                gate_penalty = self._motion_gate_penalty(param, front_blocked)
 
                 # regular trajectory penalty
                 traj_end = np.array(traj[-1,:3])
@@ -918,7 +966,7 @@ class PlanningNode(Node):
                 # against 0.762, so continuity outweighed goal-seeking.
                 dist = np.linalg.norm(traj_end[:2] - target_end[:2])
 
-                return score * 100000 + 100 * dist + 40 * abs(self.last_param[0] - param[0]) + 10 * abs(self.last_param[1] - param[1]) + reverse_gate_penalty
+                return score * 100000 + 100 * dist + 40 * abs(self.last_param[0] - param[0]) + 10 * abs(self.last_param[1] - param[1]) + gate_penalty
 
             # path
             path = Path()
@@ -938,8 +986,8 @@ class PlanningNode(Node):
                 self._publish_static_path(
                     init_p, init_q, depth_msg.header, base_time, planning_base_stamp, len(trajectories[0]),
                     f"All {len(scores)} trajectories in collision "
-                    f"(front_clearance={front_clearance:.2f}m, reverse_gate="
-                    f"{'reverse only' if front_clearance <= enter_threshold else 'forward only'}, "
+                    f"(front_clearance={self._fmt_clearance(front_clearance)}, gate="
+                    f"{'turn only' if front_blocked else 'forward only'}, "
                     f"obstacle_cells={int(np.count_nonzero(obstacle_mask))}, "
                     f"esdf_at_robot={self._esdf_at(ESDF_map, init_p):.2f}m, "
                     f"safety_r={self.robot.safety_radius:.2f}m)",
@@ -958,29 +1006,54 @@ class PlanningNode(Node):
             top_indices = np.argsort(costs, kind='stable')[:top_k]
             turned_in_place = False
 
-            # ROTATE-FIRST ESCAPE HATCH. cost_function scores only the endpoint
-            # POSITION, and turning in place does not move the endpoint, so a target
-            # behind the robot makes every forward option score worse than standing
-            # still and the continuity term hands the tie to "do nothing". Measured
-            # 2026-08-10 18:12: vx=0 omega=0 for 91 s with 0/106 trajectories blocked
-            # and 1.5 m of clearance, until the operator gave up.
+            # TURN-IN-PLACE ESCAPE HATCH, for the two states where the cost function
+            # cannot steer. cost_function scores only the endpoint POSITION, so (a) a
+            # target behind the robot makes every forward option score worse than
+            # standing still and the continuity term hands the tie to "do nothing"
+            # (91 s of vx=0 omega=0, 2026-08-10 18:12), and (b) with the front blocked
+            # every turn has the same stationary endpoint, so the tie goes to whatever
+            # omega was last commanded -- including zero.
             #
-            # Deliberately not a heading term in cost_function: that would reweight
-            # every cycle. This fires only when nothing gets meaningfully closer, so
-            # ordinary driving never reaches it, and it keeps the camera pointed at
-            # where the robot is about to go rather than reversing blind.
+            # It picks among pure turns only. The previous version picked the lowest
+            # heading error over the whole admissible set, which under a blocked front
+            # was the single hard-coded reverse: 40 s of vx=-0.200 omega=+0.000 into an
+            # obstacle, 2026-08-10 19:19.
             admissible = np.flatnonzero(costs < 1e9)
-            if len(admissible) > 0:
-                ends_xy = np.array([trajectories[i][-1, :2] for i in admissible])
-                best_gain = stand_dist - float(np.min(np.linalg.norm(
-                    ends_xy - target_pose[None, :2], axis=1)))
-                if stand_dist > self.rotate_first_min_dist_m and best_gain < self.min_progress_m:
-                    errs = np.array([abs(self._wrap(yaw_to_target - self._yaw_of(trajectories[i][-1, 3:7])))
-                                     for i in admissible])
-                    # argmin takes the first minimum and the library is vx-major from
-                    # zero, so a pure in-place turn wins ties against a curving one.
-                    top_indices = np.array([admissible[int(np.argmin(errs))]])
-                    turned_in_place = True
+            escape_clear = float('nan')
+            best_gain = float('nan')
+            turns = [int(i) for i in admissible if self._is_turn_in_place(params[i])]
+
+            # Before trusting argsort. A gated trajectory costs 1e9 and a collided one
+            # costs inf, so 1e9 < inf makes argsort hand back the gated one -- the
+            # banned reverse -- whenever every ungated option is in collision.
+            if len(admissible) == 0 or (front_blocked and not turns):
+                self._publish_static_path(
+                    init_p, init_q, depth_msg.header, base_time, planning_base_stamp, len(trajectories[0]),
+                    f"No admissible motion: {n_blocked}/{len(scores)} in collision and the rest "
+                    f"gated (front_clearance={self._fmt_clearance(front_clearance)}, "
+                    f"gate={'turn only' if front_blocked else 'forward only'}, "
+                    f"turns_left={len(turns)}, "
+                    f"esdf_at_robot={self._esdf_at(ESDF_map, init_p):.2f}m) -- holding still "
+                    f"rather than moving somewhere the camera has not looked",
+                    log_key="no admissible motion",
+                )
+                return
+
+            ends_xy = np.array([trajectories[i][-1, :2] for i in admissible])
+            best_gain = stand_dist - float(np.min(np.linalg.norm(
+                ends_xy - target_pose[None, :2], axis=1)))
+            escape_reason = ""
+            if front_blocked:
+                escape_reason = "blocked"
+            elif stand_dist > self.rotate_first_min_dist_m and best_gain < self.min_progress_m:
+                escape_reason = "no-progress"
+
+            if escape_reason and turns:
+                pick, escape_clear = self._pick_escape_turn(
+                    self.camera_to_robot_center(T), turns, trajectories,
+                    yaw_to_target, obstacle_mask)
+                top_indices = np.array([pick])
+                turned_in_place = True
 
             self.last_param = params[top_indices[0]]
             best_idx = int(top_indices[0])
@@ -989,10 +1062,12 @@ class PlanningNode(Node):
                 cycle_s = (now_ns - self._last_cycle_ns) / 1e9 if self._last_cycle_ns else float('nan')
                 self._last_static_log_ns["decision"] = now_ns
                 self.get_logger().info(
-                    f"decision: {'ROTATE-FIRST ' if turned_in_place else ''}chose vx={params[best_idx][0]:+.3f} omega={params[best_idx][1]:+.3f} "
+                    f"decision: {'TURN-IN-PLACE ' if turned_in_place else ''}chose vx={params[best_idx][0]:+.3f} omega={params[best_idx][1]:+.3f} "
                     f"(cap {self.robot.max_vx:.2f}) blocked={n_blocked}/{len(scores)} "
-                    f"front_clearance={front_clearance:.2f}m "
-                    f"gate={'reverse' if front_clearance <= enter_threshold else 'forward'} "
+                    f"front_clearance={self._fmt_clearance(front_clearance)} "
+                    f"gate={'turn-only' if front_blocked else 'forward'} "
+                    f"escape={escape_reason or 'off'} turns={len(turns)} "
+                    f"best_gain={best_gain:+.2f}m escape_clear={self._fmt_clearance(escape_clear)} "
                     f"esdf_at_robot={self._esdf_at(ESDF_map, init_p):.2f}m "
                     f"seed={'used' if seed is not None else 'rejected'} seed_err={self._seed_error_m:.2f}m "
                     f"seed_rel_t={self._seed_debug[0]:.2f}s idx={self._seed_debug[1]} "

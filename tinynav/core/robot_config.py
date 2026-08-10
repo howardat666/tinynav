@@ -37,6 +37,10 @@ class RobotConfig:
     max_vx: float = 0.5
     max_reverse_vx: float = 0.2
     max_yaw: float = 0.8
+    # The occupancy grid is written only by forward raycasting, so a reverse move is
+    # scored against cells the camera never looked at. Off for bases that can turn in
+    # place instead of backing up blind.
+    allow_reverse: bool = True
 
     @property
     def cam_offset_3d(self):
@@ -114,6 +118,7 @@ LEKIWI_CONFIG = RobotConfig(
     # is already the STS3215's no-load speed at 12 V. 0.22 leaves headroom so a yaw
     # component does not saturate body_to_wheel_raw and silently scale vx down.
     max_vx=0.22,
+    allow_reverse=False,
 )
 
 ROBOT_CONFIGS = {cfg.name: cfg for cfg in (GO2_CONFIG, B2_CONFIG, LEKIWI_CONFIG)}
