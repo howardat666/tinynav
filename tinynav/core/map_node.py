@@ -885,9 +885,11 @@ class MapNode(Node):
     # A dedicated latched topic rather than more traffic on /mapping/poi_change, which
     # already carries two different meanings in two directions and would make the
     # backend hear its own cancels.
-    # 0.5 m read as "stopped short of the marker" indoors. Z stays wide: it is a
-    # different-floor bound, and these poses carry a constant camera height.
-    POI_ARRIVAL_RADIUS_XY_M = 0.25
+    # 0.25 m was below the pose uncertainty: relocalization alone moved the reported
+    # position 0.15 m while the wheels stood still, and the path can only end on a free
+    # cell, which sat 0.13 m from the POI. Closest approach was 0.276 m, so arrival never
+    # fired. Z stays wide -- it is a different-floor bound, not a precision target.
+    POI_ARRIVAL_RADIUS_XY_M = 0.4
     POI_ARRIVAL_RADIUS_Z_M = 2.0
 
     def _publish_poi_status(self, pose_in_map_position: np.ndarray, advanced: int) -> None:
@@ -1314,6 +1316,16 @@ class MapNode(Node):
             poi = self.pois[self.poi_index]
             diff_position_norm_xy = np.linalg.norm(poi[:2] - pose_in_map_position[:2])
             diff_position_norm_z = np.linalg.norm(poi[2] - pose_in_map_position[2])
+            # The one number that decides whether a run counts as arrived, and it was
+            # nowhere in the log -- the closest approach had to be reconstructed from
+            # robot_map minus the POI by hand.
+            self.get_logger().info(
+                f"poi {self.poi_index}/{len(self.pois)}: dist_xy={diff_position_norm_xy:.3f}m "
+                f"(radius {self.POI_ARRIVAL_RADIUS_XY_M:.2f}m) dz={diff_position_norm_z:.2f}m "
+                f"robot_map=[{pose_in_map_position[0]:.2f},{pose_in_map_position[1]:.2f}] "
+                f"poi_map=[{poi[0]:.2f},{poi[1]:.2f}]",
+                throttle_duration_sec=1.0,
+            )
             if (diff_position_norm_xy < self.POI_ARRIVAL_RADIUS_XY_M
                     and diff_position_norm_z < self.POI_ARRIVAL_RADIUS_Z_M):
                 # Emit the 100% frame *before* advancing the index, otherwise the UI's

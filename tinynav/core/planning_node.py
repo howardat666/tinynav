@@ -304,6 +304,7 @@ class PlanningNode(Node):
         self.last_planned_traj_is_static = True
         self._last_static_log_ns = {}
         self._last_target_rx_ns = 0
+        self._last_cycle_ns = 0
         # How long /control/target_pose must go quiet before proximity to it counts as
         # arrival rather than as passing over a waypoint. map_node republishes roughly
         # once a second while it is navigating and stops entirely once the POI list is
@@ -561,6 +562,14 @@ class PlanningNode(Node):
             PointField(name="rgb", offset=12, datatype=PointField.UINT32, count=1),
         ]
         self.occupancy_cloud_esdf_pub.publish(pc2.create_cloud(header, fields, points))
+
+    def _esdf_at(self, esdf_map, p):
+        """Clearance under a world point, or nan if it is off the local grid."""
+        i = int((p[0] - self.origin[0]) / self.resolution)
+        j = int((p[1] - self.origin[1]) / self.resolution)
+        if 0 <= i < esdf_map.shape[0] and 0 <= j < esdf_map.shape[1]:
+            return float(esdf_map[i, j])
+        return float('nan')
 
     def _seed_from_last_trajectory(self, query_stamp):
         if self.last_planned_traj is None or self.last_planned_traj_base_stamp is None:
@@ -902,10 +911,17 @@ class PlanningNode(Node):
                 )
                 return
 
-            if all(s == float('inf') for s in scores):
+            n_blocked = int(sum(1 for s in scores if s == float('inf')))
+            if n_blocked == len(scores):
                 self._publish_static_path(
                     init_p, init_q, depth_msg.header, base_time, planning_base_stamp, len(trajectories[0]),
-                    "All trajectories in collision"
+                    f"All {len(scores)} trajectories in collision "
+                    f"(front_clearance={front_clearance:.2f}m, reverse_gate="
+                    f"{'reverse only' if front_clearance <= enter_threshold else 'forward only'}, "
+                    f"obstacle_cells={int(np.count_nonzero(obstacle_mask))}, "
+                    f"esdf_at_robot={self._esdf_at(ESDF_map, init_p):.2f}m, "
+                    f"safety_r={self.robot.safety_radius:.2f}m)",
+                    log_key="all in collision",
                 )
                 return
 
@@ -913,6 +929,20 @@ class PlanningNode(Node):
             top_indices = np.argsort(np.array([cost_function(trajectories[i], params[i], scores[i], self.target_pose) for i in range(len(trajectories))]), kind='stable')[:top_k]
             self.last_param = params[top_indices[0]]
             best_idx = int(top_indices[0])
+            now_ns = self.get_clock().now().nanoseconds
+            if now_ns - self._last_static_log_ns.get("decision", 0) >= 1_000_000_000:
+                cycle_s = (now_ns - self._last_cycle_ns) / 1e9 if self._last_cycle_ns else float('nan')
+                self._last_static_log_ns["decision"] = now_ns
+                self.get_logger().info(
+                    f"decision: chose vx={params[best_idx][0]:+.3f} omega={params[best_idx][1]:+.3f} "
+                    f"(cap {self.robot.max_vx:.2f}) blocked={n_blocked}/{len(scores)} "
+                    f"front_clearance={front_clearance:.2f}m "
+                    f"gate={'reverse' if front_clearance <= enter_threshold else 'forward'} "
+                    f"esdf_at_robot={self._esdf_at(ESDF_map, init_p):.2f}m "
+                    f"seed={'used' if seed is not None else 'rejected'} seed_err={self._seed_error_m:.2f}m "
+                    f"cycle={cycle_s:.2f}s stamp_lag={(now_ns / 1e9 - stamp):.2f}s"
+                )
+            self._last_cycle_ns = now_ns
             self.last_planned_traj = trajectories[best_idx].copy()
             self.last_planned_traj_base_stamp = planning_base_stamp
             self.last_planned_traj_is_static = False
