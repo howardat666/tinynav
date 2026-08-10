@@ -1620,26 +1620,57 @@ class MapNode(Node):
             with Timer(name = "Find target position", text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=self.timer_logger):
                 max_speed = 0.5
                 lookahead_seconds = 10.0
+                accumulated_distance = 0.0
+                chosen_index = max(len(paths_in_map) - 1, 0)
                 if len(paths_in_map) > 1:
-                    accumulated_distance = 0.0
                     start_point = pose_in_map_position[:3]
                     target_position = paths_in_map[-1]
                     for i in range(len(paths_in_map) - 1):
                         accumulated_distance += np.linalg.norm(paths_in_map[i] - start_point)
                         if accumulated_distance > max_speed * lookahead_seconds:
                             target_position = paths_in_map[i]
+                            chosen_index = i
                             break
                         start_point = paths_in_map[i]
                 else:
                     target_position = paths_in_map[0]
+                    chosen_index = 0
                 target_position_in_map = np.array([target_position[0], target_position[1], target_position[2]])
                 pose_in_origin_odom = self.odom[timestamp]
                 T = pose_in_origin_odom @ se3_inv(pose_in_map)
                 target_position_in_odom = T[:3, :3] @ target_position_in_map + T[:3, 3]
                 dummy_pose = np.eye(4)
                 dummy_pose[:3, 3] = target_position_in_odom
-                #logging.info(f"target_position_in_odom: {target_position_in_odom}")
-                print(f"target_position_in_odom: {target_position_in_odom}")
+                # Instrumented 2026-08-10. The published target kept landing 0.1-0.2 m
+                # from the robot even with 27 points in the path, so the lookahead was
+                # not looking ahead -- and this block reported none of the quantities
+                # that would say why, so the cause could only be guessed at. It now
+                # prints the path's actual arc length, how much of the 5 m budget was
+                # consumed, which index won, and the resulting robot-to-target distance
+                # in the (x, y) ground plane. Note the world frame here is z-up, so the
+                # third component is height and carries no horizontal information --
+                # reading it as "forward" produces a plausible wrong answer, which is
+                # exactly the mistake this line exists to prevent a repeat of.
+                #
+                # Replaces a bare print() that emitted one unthrottled line per nav
+                # path with only the odom-frame vector on it -- the one number from
+                # which the interesting ones cannot be recovered.
+                path_arr = np.asarray(paths_in_map, dtype=float)
+                path_len_m = (
+                    float(np.sum(np.linalg.norm(np.diff(path_arr[:, :3], axis=0), axis=1)))
+                    if len(path_arr) > 1 else 0.0
+                )
+                self.get_logger().info(
+                    f"nav target: points={len(path_arr)} path_len={path_len_m:.2f}m "
+                    f"budget={max_speed * lookahead_seconds:.1f}m used={accumulated_distance:.2f}m "
+                    f"index={chosen_index}/{len(path_arr) - 1} "
+                    f"robot_to_target_xy="
+                    f"{float(np.linalg.norm((target_position_in_map - pose_in_map_position)[:2])):.3f}m "
+                    f"robot_map={np.round(pose_in_map_position[:3], 2)} "
+                    f"target_map={np.round(target_position_in_map, 2)} "
+                    f"target_odom={np.round(target_position_in_odom, 2)}",
+                    throttle_duration_sec=1.0,
+                )
             t_stage = mark_stage("target_select", t_stage)
 
             self.target_pose_pub.publish(np2msg(dummy_pose, self.get_clock().now().to_msg(), "world", "camera"))

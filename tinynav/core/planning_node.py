@@ -514,6 +514,12 @@ class PlanningNode(Node):
         self.last_planned_traj = None
         self.last_planned_traj_base_stamp = None
         self._last_static_log_ns = {}
+        self._last_target_rx_ns = 0
+        # How long /control/target_pose must go quiet before proximity to it counts as
+        # arrival rather than as passing over a waypoint. map_node republishes roughly
+        # once a second while it is navigating and stops entirely once the POI list is
+        # done, so anything comfortably above its period separates the two.
+        self.target_idle_arrival_s = 2.0
 
         # TRANSIENT_LOCAL because this topic carries state -- where the robot is going --
         # not a stream. map_node publishes it once per POI transition, so a volatile
@@ -537,6 +543,9 @@ class PlanningNode(Node):
 
     def target_pose_callback(self, msg):
         self.target_pose = np.array([msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z])
+        # When the target last arrived, which is what separates "standing on a rolling
+        # waypoint" from "the run is over". See the arrival test in the planning loop.
+        self._last_target_rx_ns = self.get_clock().now().nanoseconds
 
     def info_callback(self, msg):
         if self.K is None:
@@ -900,34 +909,53 @@ class PlanningNode(Node):
                 return
 
             target_pose = self.target_pose.copy()
-            # Ground plane is (x, z), not (x, y). This stack carries poses in the
-            # camera-optical convention throughout -- x right, y DOWN, z FORWARD --
-            # which is why the trajectory library puts the forward speed sample into
-            # component 2 (see v_body_by_vx above). Measuring [:2] here took (right,
-            # height); the robot and its target are both on the floor, so the height
-            # term is always ~0 and the test collapsed to the lateral offset alone.
-            # A target dead ahead therefore always read as already reached.
+            # Components 0 and 1 are the ground plane and this is correct -- do not
+            # "fix" it to [0, 2]. It was changed to [0, 2] on 2026-08-10 and reverted
+            # the same day. The reasoning that led there was: this stack carries poses
+            # in the camera-optical convention, the trajectory library above puts its
+            # forward speed sample into component 2, therefore forward is z therefore
+            # the ground plane is (x, z). Every step is true except the conclusion.
             #
-            # Measured 2026-08-10, one 19-minute run: map_node published a target at
-            # [2.73, 0.20, 0.84] while this line reported 0.123 m, and 113 ticks
-            # logged "Target pose reached" with every single distance between 0.114
-            # and 0.149 m against the 0.15 m threshold -- the width of that band is
-            # the lateral offset alone, not a robot converging on anything. cmd_vel
-            # was non-zero on 1.1% of ticks and the robot moved for 11 s out of 19
-            # minutes, in bursts that happened whenever the path curved enough to
-            # push the lateral offset past the threshold.
+            # base_pose_to_camera_pose (omni3_kinematics.py) is the authority, since it
+            # is what produces these poses, and it says: body +z forward / +x right /
+            # +y down, "expressed in a gravity-aligned, z-up world frame". Only the
+            # ORIENTATION is camera-optical. The POSITION is z-up world, and its third
+            # component is literally assigned the constant camera height. So (x, y) is
+            # the ground plane and component 2 carries no horizontal information.
             #
-            # It failed silently in the worst way: the log line says "reached", so it
-            # reads as success rather than as a fault.
-            ground = [0, 2]
-            target_dist_xy = float(
-                np.linalg.norm(init_p[ground] - target_pose[ground])
-            )
-            if target_dist_xy <= self.target_reached_distance_m:
+            # The lesson is about where to look, not about axes: the convention of a
+            # pose is fixed by whatever publishes it, and inferring it from a consumer
+            # -- even a consumer in this same file -- gets a plausible wrong answer.
+            target_dist_xy = float(np.linalg.norm(init_p[:2] - target_pose[:2]))
+            # Proximity alone is not arrival. /control/target_pose carries a ROLLING
+            # LOOKAHEAD point, not the goal: map_node walks the path until it has
+            # spent a 5 m budget and publishes wherever it stopped, so on a short path
+            # the point sits a few tens of centimetres ahead and the robot is
+            # permanently "within 0.15 m" of it. Clearing the target there stalled
+            # navigation into a loop of reach-stop-refetch: measured 113 arrivals in
+            # one 19-minute run, cmd_vel non-zero on 1.1% of ticks, the robot moving
+            # for 11 s in total.
+            #
+            # The real arrival signal is map_node going quiet. It owns the POI list
+            # and a 0.5 m arrival radius, it is what the UI reports as reached, and it
+            # stops publishing once the list is done. So require both: close to the
+            # point AND nothing new for target_idle_arrival_s.
+            #
+            # (2026-08-10 also saw this "fixed" by switching the axes to [0, 2], which
+            # appeared to work -- the robot drove to the goal -- because the target's
+            # height sits about a metre off the robot's, so the distance never fell
+            # under the threshold and the test simply stopped firing. That is this
+            # change by accident, resting on a height offset nobody controls. The axes
+            # are (x, y): base_pose_to_camera_pose emits a z-up world position whose
+            # third component is the camera height.)
+            target_idle_s = (
+                self.get_clock().now().nanoseconds - self._last_target_rx_ns) / 1e9
+            if (target_dist_xy <= self.target_reached_distance_m
+                    and target_idle_s >= self.target_idle_arrival_s):
                 self.target_pose = None
                 self._publish_static_path(
                     init_p, init_q, depth_msg.header, base_time, planning_base_stamp, static_steps,
-                    f"Target pose reached (xy_dist={target_dist_xy:.3f}m)",
+                    f"Target pose reached (xy_dist={target_dist_xy:.3f}m, target idle {target_idle_s:.1f}s)",
                     log_key="Target pose reached"
                 )
                 return
