@@ -91,6 +91,20 @@ def usb_label() -> str:
     return "?"
 
 
+def read_voltage(bus, motor: int) -> float:
+    """Bus voltage in volts as the servo sees it, or NaN.
+
+    This is the self-label for the robot-battery-charging experiment: the board
+    cannot see whether a charger is plugged into the battery, but the servos sit
+    on that rail and report it, and charging moves it by a whole volt or so. Two
+    extra single-byte reads per 500-cycle round is nothing on the wire.
+    """
+    try:
+        return bus.read("Present_Voltage", motor, num_retry=8) / 10.0
+    except FeetechBusError:
+        return float("nan")
+
+
 def read_cpu() -> tuple[int, int]:
     with open("/proc/stat") as fh:
         fields = [int(x) for x in fh.readline().split()[1:]]
@@ -161,7 +175,7 @@ def main() -> int:
 
     header = ("round\telapsed_s\tlabel\tfails\tcycles\tfail_pct\t"
               "cpu_pct\ttemp_c\tusb_rx_Bps\tusb_tx_Bps\tdwc3_irq_s\tttyS3_irq_s\t"
-              "t0_epoch\tt1_epoch\n")
+              "t0_epoch\tt1_epoch\tvolt0\tvolt1\n")
     out = open(args.out, "w")
     out.write(header)
     out.flush()
@@ -172,6 +186,7 @@ def main() -> int:
     rows = []
     try:
         for r in range(args.rounds):
+            volt0 = read_voltage(bus, ids[0])
             before = Snapshot()
             fails = 0
             for _ in range(args.cycles_per_round):
@@ -185,6 +200,7 @@ def main() -> int:
                 if remaining > 0:
                     time.sleep(remaining)
             after = Snapshot()
+            volt1 = read_voltage(bus, ids[0])
 
             # A round straddling a plug event is not evidence for either side.
             label = before.label if before.label == after.label else "TRANS"
@@ -207,13 +223,16 @@ def main() -> int:
                 "ttys3": (after.irq["ttyS3"] - before.irq["ttyS3"]) / dt,
                 "t0": before.wall,
                 "t1": after.wall,
+                "v0": volt0,
+                "v1": volt1,
             }
             rows.append(row)
             line = (f"{row['round']}\t{row['elapsed']:.1f}\t{row['label']}\t"
                     f"{row['fails']}\t{row['cycles']}\t{row['pct']:.2f}\t"
                     f"{row['cpu']:.1f}\t{row['temp']:.1f}\t{row['rx']:.0f}\t"
                     f"{row['tx']:.0f}\t{row['dwc3']:.0f}\t{row['ttys3']:.0f}\t"
-                    f"{row['t0']:.1f}\t{row['t1']:.1f}\n")
+                    f"{row['t0']:.1f}\t{row['t1']:.1f}\t"
+                    f"{row['v0']:.1f}\t{row['v1']:.1f}\n")
             out.write(line)
             out.flush()
             os.fsync(out.fileno())

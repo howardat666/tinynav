@@ -900,7 +900,29 @@ class PlanningNode(Node):
                 return
 
             target_pose = self.target_pose.copy()
-            target_dist_xy = float(np.linalg.norm(init_p[:2] - target_pose[:2]))
+            # Ground plane is (x, z), not (x, y). This stack carries poses in the
+            # camera-optical convention throughout -- x right, y DOWN, z FORWARD --
+            # which is why the trajectory library puts the forward speed sample into
+            # component 2 (see v_body_by_vx above). Measuring [:2] here took (right,
+            # height); the robot and its target are both on the floor, so the height
+            # term is always ~0 and the test collapsed to the lateral offset alone.
+            # A target dead ahead therefore always read as already reached.
+            #
+            # Measured 2026-08-10, one 19-minute run: map_node published a target at
+            # [2.73, 0.20, 0.84] while this line reported 0.123 m, and 113 ticks
+            # logged "Target pose reached" with every single distance between 0.114
+            # and 0.149 m against the 0.15 m threshold -- the width of that band is
+            # the lateral offset alone, not a robot converging on anything. cmd_vel
+            # was non-zero on 1.1% of ticks and the robot moved for 11 s out of 19
+            # minutes, in bursts that happened whenever the path curved enough to
+            # push the lateral offset past the threshold.
+            #
+            # It failed silently in the worst way: the log line says "reached", so it
+            # reads as success rather than as a fault.
+            ground = [0, 2]
+            target_dist_xy = float(
+                np.linalg.norm(init_p[ground] - target_pose[ground])
+            )
             if target_dist_xy <= self.target_reached_distance_m:
                 self.target_pose = None
                 self._publish_static_path(
