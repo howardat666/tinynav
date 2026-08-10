@@ -890,6 +890,7 @@ class MapNode(Node):
     # cell, which sat 0.13 m from the POI. Closest approach was 0.276 m, so arrival never
     # fired. There is no z condition: this robot drives on one floor, and a second
     # condition that always passes is a trap waiting for the day it does not.
+    POI_ARRIVAL_RADIUS_XY_M = 0.4
 
     def _publish_poi_status(self, pose_in_map_position: np.ndarray, advanced: int) -> None:
         total = len(self.pois)
