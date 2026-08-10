@@ -312,6 +312,11 @@ class PlanningNode(Node):
         # once a second while it is navigating and stops entirely once the POI list is
         # done, so anything comfortably above its period separates the two.
         self.target_idle_arrival_s = 2.0
+        # Rotate-first escape hatch: how much closer the best trajectory must get
+        # than standing still to count as progress, and how far from the target it
+        # must be before turning is preferred over closing the last few centimetres.
+        self.min_progress_m = 0.05
+        self.rotate_first_min_dist_m = 0.5
 
         # TRANSIENT_LOCAL because this topic carries state -- where the robot is going --
         # not a stream. map_node publishes it once per POI transition, so a volatile
@@ -942,19 +947,49 @@ class PlanningNode(Node):
                 )
                 return
 
-            top_k = 1
-            top_indices = np.argsort(np.array([cost_function(trajectories[i], params[i], scores[i], self.target_pose) for i in range(len(trajectories))]), kind='stable')[:top_k]
-            self.last_param = params[top_indices[0]]
-            best_idx = int(top_indices[0])
+            stand_dist = target_dist_xy
             yaw_now = self._yaw_of(init_q)
             to_t = target_pose[:2] - init_p[:2]
             yaw_to_target = math.atan2(float(to_t[1]), float(to_t[0]))
+
+            top_k = 1
+            costs = np.array([cost_function(trajectories[i], params[i], scores[i], self.target_pose)
+                              for i in range(len(trajectories))])
+            top_indices = np.argsort(costs, kind='stable')[:top_k]
+            turned_in_place = False
+
+            # ROTATE-FIRST ESCAPE HATCH. cost_function scores only the endpoint
+            # POSITION, and turning in place does not move the endpoint, so a target
+            # behind the robot makes every forward option score worse than standing
+            # still and the continuity term hands the tie to "do nothing". Measured
+            # 2026-08-10 18:12: vx=0 omega=0 for 91 s with 0/106 trajectories blocked
+            # and 1.5 m of clearance, until the operator gave up.
+            #
+            # Deliberately not a heading term in cost_function: that would reweight
+            # every cycle. This fires only when nothing gets meaningfully closer, so
+            # ordinary driving never reaches it, and it keeps the camera pointed at
+            # where the robot is about to go rather than reversing blind.
+            admissible = np.flatnonzero(costs < 1e9)
+            if len(admissible) > 0:
+                ends_xy = np.array([trajectories[i][-1, :2] for i in admissible])
+                best_gain = stand_dist - float(np.min(np.linalg.norm(
+                    ends_xy - target_pose[None, :2], axis=1)))
+                if stand_dist > self.rotate_first_min_dist_m and best_gain < self.min_progress_m:
+                    errs = np.array([abs(self._wrap(yaw_to_target - self._yaw_of(trajectories[i][-1, 3:7])))
+                                     for i in admissible])
+                    # argmin takes the first minimum and the library is vx-major from
+                    # zero, so a pure in-place turn wins ties against a curving one.
+                    top_indices = np.array([admissible[int(np.argmin(errs))]])
+                    turned_in_place = True
+
+            self.last_param = params[top_indices[0]]
+            best_idx = int(top_indices[0])
             now_ns = self.get_clock().now().nanoseconds
             if now_ns - self._last_static_log_ns.get("decision", 0) >= 1_000_000_000:
                 cycle_s = (now_ns - self._last_cycle_ns) / 1e9 if self._last_cycle_ns else float('nan')
                 self._last_static_log_ns["decision"] = now_ns
                 self.get_logger().info(
-                    f"decision: chose vx={params[best_idx][0]:+.3f} omega={params[best_idx][1]:+.3f} "
+                    f"decision: {'ROTATE-FIRST ' if turned_in_place else ''}chose vx={params[best_idx][0]:+.3f} omega={params[best_idx][1]:+.3f} "
                     f"(cap {self.robot.max_vx:.2f}) blocked={n_blocked}/{len(scores)} "
                     f"front_clearance={front_clearance:.2f}m "
                     f"gate={'reverse' if front_clearance <= enter_threshold else 'forward'} "
