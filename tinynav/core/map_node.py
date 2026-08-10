@@ -1109,7 +1109,15 @@ class MapNode(Node):
     # A dedicated latched topic rather than more traffic on /mapping/poi_change, which
     # already carries two different meanings in two directions and would make the
     # backend hear its own cancels.
-    POI_ARRIVAL_RADIUS_XY_M = 0.5
+    # 0.5 m was too coarse to be called arrival indoors: in the 2026-08-10 12:00 run
+    # the robot stopped at map [-2.33, 0.97] against a POI at [-2.63, 1.40], declared
+    # "All POIs have been visited" and went quiet, while to the operator watching it
+    # the robot had plainly stopped short of the marker. Halved on that evidence.
+    #
+    # The z radius stays wide on purpose -- it is a sanity bound against matching a POI
+    # on a different floor, not a precision target. Poses here carry a constant camera
+    # height in the world z, so a tight z radius would reject perfectly good arrivals.
+    POI_ARRIVAL_RADIUS_XY_M = 0.25
     POI_ARRIVAL_RADIUS_Z_M = 2.0
 
     def _publish_poi_status(self, pose_in_map_position: np.ndarray, advanced: int) -> None:
