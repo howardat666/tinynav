@@ -539,7 +539,19 @@ class PlanningNode(Node):
         self.poi_change_sub = self.create_subscription(Odometry, "/mapping/poi_change", self.poi_change_callback, 10)
 
     def poi_change_callback(self, msg):
+        # This silently discards the target, and it is a prime suspect for the
+        # remaining stalls: in one run planning held a target for about 2 s out of a
+        # 72 s window and then reported "No target pose" 563 times, with only one
+        # genuine arrival. /mapping/poi_change is published by map_node when POIs are
+        # cleared and again on every POI advance, and by the backend to cancel -- three
+        # senders, no payload distinguishing them, and nothing logged at either end.
+        had = self.target_pose is not None
         self.target_pose = None
+        if had:
+            self.get_logger().info(
+                "target cleared by /mapping/poi_change (POI advance, POI clear, or a "
+                "cancel from the backend -- the message does not say which)"
+            )
 
     def target_pose_callback(self, msg):
         self.target_pose = np.array([msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z])
