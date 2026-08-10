@@ -24,7 +24,8 @@ for p in /proc/[0-9]*; do
   case "$(tr '\0' ' ' < $p/cmdline 2>/dev/null)" in
     *wheel_odom*node.py*)
       if [ "$pid" != "$newest" ]; then echo "killing stale duplicate $pid"; kill -9 "$pid"; fi ;;
-    *bus_loss_live*) echo "killing leftover monitor $pid"; kill -9 "$pid" ;;
+    *bus_loss_live*|*run_stats.sh*|*nav_health_record.sh*|*servo_usb_ground_ab*|*servo_failure_pattern*)
+      echo "stopping recorder/diagnostic $pid"; kill -9 "$pid" ;;
   esac
 done
 sleep 2
