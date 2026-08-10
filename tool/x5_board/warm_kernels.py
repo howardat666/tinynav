@@ -43,6 +43,8 @@ def main() -> int:
     robot = robot_config("lekiwi")
     front, rear, half_w = robot.footprint_from_control()
 
+    # vx_max must be passed, not defaulted: numba treats an omitted default as a
+    # distinct Omitted() type and compiles a second signature the node never uses.
     # Both depth dtypes: mono16 arrives as float32, 32FC1 as float64.
     depth32 = np.full((544, 640), 2.0, dtype=np.float32)
     timed("raycasting float32", lambda: run_raycasting_loopy(
@@ -53,7 +55,7 @@ def main() -> int:
     trajs = [None]
 
     def build():
-        t, p = generate_trajectory_library_3d(init_p=ip, init_q=iq, dt=0.1)
+        t, p = generate_trajectory_library_3d(init_p=ip, init_q=iq, dt=0.1, vx_max=robot.max_vx)
         t = normalize_pose_trajectories(t)
         v, _ = generate_predefined_trajectory_vocabularies(init_p=ip, init_q=iq, dt=0.1)
         v = normalize_pose_trajectories(v)
