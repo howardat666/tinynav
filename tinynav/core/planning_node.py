@@ -744,7 +744,7 @@ class PlanningNode(Node):
             self._seed_error_m = 0.0
             if seed is not None:
                 init_p_seed, init_v_seed, init_q_seed, seed_stamp = seed
-                self._seed_error_m = float(np.linalg.norm(init_p_seed - measured_center))
+                self._seed_error_m = float(np.linalg.norm(init_p_seed[:2] - measured_center[:2]))
                 if self._seed_error_m <= self.seed_fallback_distance_m:
                     init_p, init_v, init_q = init_p_seed, init_v_seed, init_q_seed
                     planning_base_stamp = seed_stamp
@@ -894,7 +894,11 @@ class PlanningNode(Node):
                 # regular trajectory penalty
                 traj_end = np.array(traj[-1,:3])
                 target_end = target_pose if target_pose is not None else traj_end
-                dist = np.linalg.norm(traj_end - target_end)
+                # xy only. The target carries a camera height ~0.7 m above the
+                # trajectory plane, and sqrt(dxy^2 + 0.7^2) compresses the ranking to
+                # nothing near the goal: 0.1 m and 0.3 m of real error scored 0.707
+                # against 0.762, so continuity outweighed goal-seeking.
+                dist = np.linalg.norm(traj_end[:2] - target_end[:2])
 
                 return score * 100000 + 100 * dist + 40 * abs(self.last_param[0] - param[0]) + 10 * abs(self.last_param[1] - param[1]) + reverse_gate_penalty
 

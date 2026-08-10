@@ -888,9 +888,8 @@ class MapNode(Node):
     # 0.25 m was below the pose uncertainty: relocalization alone moved the reported
     # position 0.15 m while the wheels stood still, and the path can only end on a free
     # cell, which sat 0.13 m from the POI. Closest approach was 0.276 m, so arrival never
-    # fired. Z stays wide -- it is a different-floor bound, not a precision target.
-    POI_ARRIVAL_RADIUS_XY_M = 0.4
-    POI_ARRIVAL_RADIUS_Z_M = 2.0
+    # fired. There is no z condition: this robot drives on one floor, and a second
+    # condition that always passes is a trap waiting for the day it does not.
 
     def _publish_poi_status(self, pose_in_map_position: np.ndarray, advanced: int) -> None:
         total = len(self.pois)
@@ -1315,19 +1314,18 @@ class MapNode(Node):
         while self.poi_index < len(self.pois):
             poi = self.pois[self.poi_index]
             diff_position_norm_xy = np.linalg.norm(poi[:2] - pose_in_map_position[:2])
-            diff_position_norm_z = np.linalg.norm(poi[2] - pose_in_map_position[2])
+            dz = float(poi[2] - pose_in_map_position[2])  # logged only, not a condition
             # The one number that decides whether a run counts as arrived, and it was
             # nowhere in the log -- the closest approach had to be reconstructed from
             # robot_map minus the POI by hand.
             self.get_logger().info(
                 f"poi {self.poi_index}/{len(self.pois)}: dist_xy={diff_position_norm_xy:.3f}m "
-                f"(radius {self.POI_ARRIVAL_RADIUS_XY_M:.2f}m) dz={diff_position_norm_z:.2f}m "
+                f"(radius {self.POI_ARRIVAL_RADIUS_XY_M:.2f}m) dz={dz:+.2f}m(ignored) "
                 f"robot_map=[{pose_in_map_position[0]:.2f},{pose_in_map_position[1]:.2f}] "
                 f"poi_map=[{poi[0]:.2f},{poi[1]:.2f}]",
                 throttle_duration_sec=1.0,
             )
-            if (diff_position_norm_xy < self.POI_ARRIVAL_RADIUS_XY_M
-                    and diff_position_norm_z < self.POI_ARRIVAL_RADIUS_Z_M):
+            if diff_position_norm_xy < self.POI_ARRIVAL_RADIUS_XY_M:
                 # Emit the 100% frame *before* advancing the index, otherwise the UI's
                 # last observed progress for this POI is whatever partial value the
                 # previous keyframe happened to publish, and the bar never fills.
@@ -1374,8 +1372,10 @@ class MapNode(Node):
         t_stage = mark_stage("generate_path", t_stage)
 
         if paths_in_map is not None:
+            # xy only: the map's path points span 0.4 m in z, which inflated both the
+            # progress percentage and the ETA on a robot that cannot change height.
             remaining_length = sum(
-                np.linalg.norm(paths_in_map[i + 1] - paths_in_map[i])
+                np.linalg.norm(paths_in_map[i + 1][:2] - paths_in_map[i][:2])
                 for i in range(len(paths_in_map) - 1)
             ) if len(paths_in_map) > 1 else 0.0
 
@@ -1419,7 +1419,7 @@ class MapNode(Node):
                     start_point = pose_in_map_position[:3]
                     target_position = paths_in_map[-1]
                     for i in range(len(paths_in_map) - 1):
-                        accumulated_distance += np.linalg.norm(paths_in_map[i] - start_point)
+                        accumulated_distance += np.linalg.norm(paths_in_map[i][:2] - start_point[:2])
                         if accumulated_distance > max_speed * lookahead_seconds:
                             target_position = paths_in_map[i]
                             chosen_index = i
