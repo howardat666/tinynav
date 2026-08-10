@@ -511,10 +511,38 @@ class PlanningNode(Node):
         self.smoothed_velocity = 0.0
         self.dt = 0.1
         self.planning_latency_s = 0.2
-        self.seed_fallback_distance_m = 2.0
+        # HOW FAR THE SEED MAY DISAGREE WITH THE MEASUREMENT BEFORE IT IS THROWN AWAY.
+        #
+        # This used to be 2.0 m, which is not a sanity check, it is a licence to dead
+        # reckon. The seed is the previous trajectory sampled forward in time, so it is
+        # a PREDICTION of where the robot will be, and it is fed back in as the start
+        # state of the next prediction. The measurement enters only through this
+        # comparison. Set the bound loose enough and the loop is open: every cycle the
+        # planner believes its own last guess and the error grows without ever being
+        # corrected.
+        #
+        # That is exactly what the 2026-08-10 15:00 run did. Relocalization put the
+        # robot 1.79 m from where it started; wheel_odometry's own closing pose agreed
+        # (x=1.619 y=-0.626, 1.74 m); planning believed 3.08 m. The robot was tracking
+        # its commanded speed at roughly 58%, and because 1.3 m of disagreement is
+        # comfortably inside 2.0 m, nothing ever rejected the prediction.
+        #
+        # The bound is now what the robot could physically have moved since the
+        # measurement -- top speed over one planning latency, with margin for a slow
+        # cycle. Rejecting the seed is cheap: planning simply restarts from the
+        # measured pose, which is what it should have been doing.
+        self.seed_fallback_distance_m = 0.5
         self.target_reached_distance_m = 0.15
         self.last_planned_traj = None
         self.last_planned_traj_base_stamp = None
+        # A static path says "I am not moving", so seeding the next cycle from it
+        # re-asserts wherever the last cycle THOUGHT the robot was and never lets the
+        # measurement back in. In the 2026-08-10 15:00 run that closed the loop: the
+        # arrival test fired on a predicted position, the static path was built at that
+        # same predicted position, the next seed read it back, and the reported distance
+        # to target sat at exactly 0.105 m for four and a half minutes while the robot
+        # stood 1.3 m short of the POI. Static paths are therefore not seed material.
+        self.last_planned_traj_is_static = True
         self._last_static_log_ns = {}
         self._last_target_rx_ns = 0
         # How long /control/target_pose must go quiet before proximity to it counts as
@@ -804,6 +832,11 @@ class PlanningNode(Node):
     def _seed_from_last_trajectory(self, query_stamp):
         if self.last_planned_traj is None or self.last_planned_traj_base_stamp is None:
             return None
+        if self.last_planned_traj_is_static:
+            # See last_planned_traj_is_static in __init__: a standstill path carries no
+            # information about where the robot is, only about where the last cycle
+            # believed it was, and feeding that back locks the estimate.
+            return None
         traj = self.last_planned_traj
         if len(traj) < 1:
             return None
@@ -856,6 +889,7 @@ class PlanningNode(Node):
         path, static_traj = self._make_static_path(init_p, init_q, header, base_time, num_steps)
         self.last_planned_traj = static_traj.copy()
         self.last_planned_traj_base_stamp = base_stamp
+        self.last_planned_traj_is_static = True
         self.path_pub.publish(path)
 
         now_ns = self.get_clock().now().nanoseconds
@@ -966,13 +1000,26 @@ class PlanningNode(Node):
             query_stamp = stamp + self.planning_latency_s
             seed = self._seed_from_last_trajectory(query_stamp)
             planning_base_stamp = stamp
+            measured_center = self.camera_to_robot_center(T)
+            self._seed_error_m = 0.0
             if seed is not None:
                 init_p_seed, init_v_seed, init_q_seed, seed_stamp = seed
-                current_center = self.camera_to_robot_center(T)
-                if np.linalg.norm(init_p_seed - current_center) <= self.seed_fallback_distance_m:
+                self._seed_error_m = float(np.linalg.norm(init_p_seed - measured_center))
+                if self._seed_error_m <= self.seed_fallback_distance_m:
                     init_p, init_v, init_q = init_p_seed, init_v_seed, init_q_seed
                     planning_base_stamp = seed_stamp
                 else:
+                    # Worth a line: this is the planner's prediction disagreeing with
+                    # the wheels, which is the quantity that silently reached 1.3 m
+                    # before anyone noticed. Rare and throttled, so it costs nothing.
+                    now_ns = self.get_clock().now().nanoseconds
+                    if now_ns - self._last_static_log_ns.get("seed_reject", 0) >= 1_000_000_000:
+                        self._last_static_log_ns["seed_reject"] = now_ns
+                        self.get_logger().warning(
+                            f"seed rejected: prediction is {self._seed_error_m:.2f}m from the "
+                            f"measured pose (limit {self.seed_fallback_distance_m:.2f}m) -- "
+                            "replanning from the measurement"
+                        )
                     seed = None
             if seed is None:
                 v_dir = T[:3, :3] @ np.array([0, 0, 1])
@@ -1070,9 +1117,14 @@ class PlanningNode(Node):
             if now_ns - self._last_static_log_ns.get("navigating", 0) >= 1_000_000_000:
                 self._last_static_log_ns["navigating"] = now_ns
                 self.get_logger().info(
-                    f"navigating: ground_dist_xz={target_dist_xy:.3f}m "
+                    f"navigating: ground_dist_xy={target_dist_xy:.3f}m "
                     f"(threshold {self.target_reached_distance_m:.2f}m) "
                     f"robot=[{init_p[0]:.2f},{init_p[1]:.2f},{init_p[2]:.2f}] "
+                    # The measured pose next to the one being planned from. They were
+                    # 1.3 m apart for four and a half minutes on 2026-08-10 and the log
+                    # showed only the first, so the stall read as "already arrived".
+                    f"measured=[{measured_center[0]:.2f},{measured_center[1]:.2f},{measured_center[2]:.2f}] "
+                    f"seed_err={self._seed_error_m:.2f}m "
                     f"target=[{target_pose[0]:.2f},{target_pose[1]:.2f},{target_pose[2]:.2f}]"
                 )
 
@@ -1139,6 +1191,7 @@ class PlanningNode(Node):
             best_idx = int(top_indices[0])
             self.last_planned_traj = trajectories[best_idx].copy()
             self.last_planned_traj_base_stamp = planning_base_stamp
+            self.last_planned_traj_is_static = False
 
             for i in top_indices:
                 for j in range(0, len(trajectories[i]), 1):
