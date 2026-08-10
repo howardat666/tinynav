@@ -347,7 +347,7 @@ class PlanningNode(Node):
                 init_p = np.zeros(3)
                 init_q = np.array([0.0, 0.0, 0.0, 1.0])
                 trajectories, params = generate_trajectory_library_3d(
-                    init_p=init_p, init_q=init_q, dt=self.dt
+                    init_p=init_p, init_q=init_q, dt=self.dt, vx_max=self.robot.max_vx
                 )
                 trajectories = normalize_pose_trajectories(trajectories)
                 vocab_trajs, vocab_params = generate_predefined_trajectory_vocabularies(
@@ -854,7 +854,8 @@ class PlanningNode(Node):
             trajectories, params = generate_trajectory_library_3d(
                 init_p = init_p,
                 init_q = init_q,
-                dt = self.dt
+                dt = self.dt,
+                vx_max = self.robot.max_vx,
             )
             trajectories = normalize_pose_trajectories(trajectories)
             vocab_trajs, vocab_params = generate_predefined_trajectory_vocabularies(init_p=init_p, init_q=init_q, dt=self.dt)

@@ -31,6 +31,12 @@ class RobotConfig:
     control_x: float = 0.0
     control_y: float = 0.0
     safety_radius: float = 0.1
+    # What the base can actually deliver, not what we would like. The planner used
+    # to sample up to 0.5 m/s on a chassis that saturates at 0.268, so its
+    # predictions ran 2x ahead of reality; see LEKIWI_CONFIG.
+    max_vx: float = 0.5
+    max_reverse_vx: float = 0.2
+    max_yaw: float = 0.8
 
     @property
     def cam_offset_3d(self):
@@ -104,6 +110,10 @@ LEKIWI_CONFIG = RobotConfig(
     camera_x=0.06, camera_y=0.05,
     control_x=0.0, control_y=0.0,
     safety_radius=0.1,
+    # Omni3Kinematics.max_body_velocity(3000) gives vx = 0.268 m/s, and 3000 ticks/s
+    # is already the STS3215's no-load speed at 12 V. 0.22 leaves headroom so a yaw
+    # component does not saturate body_to_wheel_raw and silently scale vx down.
+    max_vx=0.22,
 )
 
 ROBOT_CONFIGS = {cfg.name: cfg for cfg in (GO2_CONFIG, B2_CONFIG, LEKIWI_CONFIG)}

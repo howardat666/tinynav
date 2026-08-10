@@ -457,8 +457,8 @@ class CmdVelControlNode(Node):
         v = v_ref * math.cos(heading_err) + k * tx
         wz = w_ref + k * heading_err + b * v_ref * self._sinc(heading_err) * ty
         v *= self._vx_gain_comp
-        v = float(np.clip(v, -0.2, 0.6))
-        wz = float(np.clip(wz, -0.8, 0.8))
+        v = float(np.clip(v, -self.robot.max_reverse_vx, self.robot.max_vx))
+        wz = float(np.clip(wz, -self.robot.max_yaw, self.robot.max_yaw))
 
         heading_to_goal = self._wrap_angle(float(self._path_ref[-1, 2]) - robot_yaw)
         if (

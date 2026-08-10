@@ -583,7 +583,11 @@ class MapNode(Node):
     # side of it is cheap. Running it once a second rather than five times keeps
     # every keyframe in the graph while removing the overload -- and the
     # relocalization budget for this robot is 5 s, so 1 Hz is already 5x margin.
-    max_keyframe_age_s = 0.5
+    # Raised from 0.5 s: that was sized for 4.83 Hz keyframes against 374 ms
+    # relocalization. The bridge now delivers 0.71 Hz with a p90 publish lag of
+    # 0.83 s, so 0.5 s was rejecting 19% of perfectly usable frames to protect
+    # against an overload that no longer exists.
+    max_keyframe_age_s = 1.0
     min_relocalization_interval_s = 1.0
 
     def keyframe_callback(self, keyframe_image_msg:Image, keyframe_odom_msg:Odometry):
@@ -1392,7 +1396,10 @@ class MapNode(Node):
 
             # use the max_speed to publish the position the robot should be after 10 seconds
             with Timer(name = "Find target position", text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=self.timer_logger):
-                max_speed = 0.5
+                # LEKIWI_CONFIG.max_vx; map_node has no robot config of its own.
+                # At the old 0.5 the 5 m budget put the lookahead at the path end on
+                # every short path, so the arrival test had nothing to converge on.
+                max_speed = 0.22
                 lookahead_seconds = 10.0
                 accumulated_distance = 0.0
                 chosen_index = max(len(paths_in_map) - 1, 0)
