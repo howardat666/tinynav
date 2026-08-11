@@ -13,6 +13,7 @@ shipped logic rather than a copy of it.
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 
@@ -43,6 +44,7 @@ def bare_node(robot):
     n.escape_min_clearance_m = 0.4
     n.rotate_first_min_dist_m = 0.5
     n.min_progress_m = 0.05
+    n.force_turn_heading_rad = math.radians(80.0)
     return n
 
 
@@ -116,9 +118,20 @@ def report(title, node, T, center, p, q, target, mask, front_clearance):
                  "forward": sum(1 for i in adm if params[i][0] > 1e-6)}
         ends = np.array([trajs[i][-1, :2] for i in adm])
         gain = stand_dist - float(np.min(np.linalg.norm(ends - target[None, :2], axis=1)))
-        fires = front_blocked or (stand_dist > node.rotate_first_min_dist_m and gain < node.min_progress_m)
+        heading_err = abs(node._wrap(yaw_to_target - yaw_now))
+        if name == "old":
+            # The gain-only trigger, kept verbatim so the comparison shows what the
+            # heading test changes.
+            reason = "fires" if front_blocked or (
+                stand_dist > node.rotate_first_min_dist_m
+                and gain < node.min_progress_m) else ""
+        else:
+            # The node's own test, not a copy of it. The copy that used to live on this
+            # line is how a replay can report an escape the robot never takes.
+            reason = node._escape_reason(front_blocked, stand_dist, heading_err, gain)
+        fires = bool(reason)
         print(f"  {name} gate: admissible={len(adm)} {kinds} best_gain={gain:+.2f}m "
-              f"hatch={'fires' if fires else 'off'}")
+              f"heading_err={np.degrees(heading_err):+.0f}deg hatch={reason or 'off'}")
         if not fires:
             continue
         if name == "old":
@@ -173,6 +186,21 @@ def main():
     m4 = blocked_mask(go2, c4, f4[0] / n4, f4[1] / n4, at=0.0)
     report("go2, blocked front (allow_reverse stays on)", go2, T4, c4,
            p4, q4, np.array([0.73, -0.32, 0.16]), m4, go2._front_obstacle_dist(T4, m4))
+
+    # The 13:53:55 standstill, replayed from the logged numbers rather than a synthetic
+    # pose. It is here because no synthetic pose reproduced it: the gain the geometry
+    # happens to produce is what decided the run, and it landed on the threshold
+    # exactly. Kept as a regression so a future tweak to min_progress_m cannot quietly
+    # reopen a 69 s deadlock.
+    print("\n=== regression: the logged 13:53:55 values ===")
+    for label, n in (("old (gain only)", None), ("new (heading first)", node)):
+        stand_dist, heading_err, gain = 1.913, math.radians(172.0), 0.05
+        if n is None:
+            fired = stand_dist > 0.5 and gain < 0.05
+            print(f"  {label:20s} -> {'fires' if fired else 'off  '}  "
+                  f"(0.05 < 0.05 is False, which is why the robot stood still)")
+        else:
+            print(f"  {label:20s} -> {n._escape_reason(False, stand_dist, heading_err, gain) or 'off'}")
     return 0
 
 

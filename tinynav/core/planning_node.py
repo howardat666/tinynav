@@ -317,6 +317,12 @@ class PlanningNode(Node):
         # must be before turning is preferred over closing the last few centimetres.
         self.min_progress_m = 0.05
         self.rotate_first_min_dist_m = 0.5
+        # The primary deadlock detector, taken from main's force_turn (#152). A gain
+        # threshold was the wrong instrument: it measures the symptom, and a run with
+        # the target 172 deg behind produced best_gain = 0.05 m against a 0.05 m
+        # threshold, so the escape missed by an epsilon and the robot stood still for
+        # 69 s. Heading error measures the cause and has no scale to get wrong.
+        self.force_turn_heading_rad = math.radians(80.0)
         # A heading counts as an escape only if the probe finds nothing within this
         # much. Above enter_threshold (0.30 m) so the turn actually releases the gate
         # instead of handing back a heading that re-triggers it next cycle.
@@ -484,6 +490,30 @@ class PlanningNode(Node):
             # the only motion whose swept volume the camera has already observed.
             return 1e9
         return 0.0
+
+    def _escape_reason(self, front_blocked, stand_dist, heading_err_abs, best_gain):
+        """Why the robot should turn in place instead of following the ranking, or "".
+
+        A method rather than an inline condition so tool/x5_board/replay_escape_decision.py
+        exercises this exact test: it used to keep its own copy, which agreed right up
+        until the copies diverged and the replay reported an escape the robot did not
+        take."""
+        if front_blocked:
+            return "blocked"
+        if stand_dist <= self.rotate_first_min_dist_m:
+            return ""
+        # Heading before progress. The cost function scores only how close a
+        # trajectory's endpoint gets to the target, and an in-place turn ends where it
+        # started, so turning can never outscore standing still while the omega
+        # continuity term makes it strictly worse. With the target behind, standing
+        # still is the global optimum -- not a tuning failure, and not something a
+        # threshold on progress can be set around: the run this fixes had best_gain
+        # 0.05 m against a 0.05 m threshold and stood still for 69 s.
+        if heading_err_abs > self.force_turn_heading_rad:
+            return "heading"
+        if best_gain < self.min_progress_m:
+            return "no-progress"
+        return ""
 
     def _pick_escape_turn(self, center, turns, trajectories, yaw_to_target, obstacle_mask):
         """Index of the in-place turn to commit to, plus the clearance it buys.
@@ -1042,11 +1072,9 @@ class PlanningNode(Node):
             ends_xy = np.array([trajectories[i][-1, :2] for i in admissible])
             best_gain = stand_dist - float(np.min(np.linalg.norm(
                 ends_xy - target_pose[None, :2], axis=1)))
-            escape_reason = ""
-            if front_blocked:
-                escape_reason = "blocked"
-            elif stand_dist > self.rotate_first_min_dist_m and best_gain < self.min_progress_m:
-                escape_reason = "no-progress"
+            escape_reason = self._escape_reason(
+                front_blocked, stand_dist,
+                abs(self._wrap(yaw_to_target - yaw_now)), best_gain)
 
             if escape_reason and turns:
                 pick, escape_clear = self._pick_escape_turn(
