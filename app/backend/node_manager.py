@@ -31,6 +31,7 @@ from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from sensor_msgs.msg import CompressedImage, Image, PointCloud, PointCloud2
 from std_msgs.msg import Bool, Float32, String
 
+from tinynav.core.robot_config import robot_config
 from tool.ros2_node_manager import Ros2NodeManager
 
 _DEFAULT_TINYNAV_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -76,6 +77,9 @@ _MAPPING_PERCENT_PREFIX = 'MAPPING_PERCENT:'
 # LeKiwi comparison runs need wheel *actuation* with VIO *odometry*, which is the
 # combination that isolates the odometry change from everything else.
 _ROBOT_TYPE = os.environ.get('TINYNAV_ROBOT_TYPE', 'go2')
+# Safe to import here: robot_config deliberately depends on nothing but dataclasses and
+# numpy, so this does not pull the planning stack into the backend.
+_ROBOT = robot_config(_ROBOT_TYPE)
 _ACTUATOR = os.environ.get('TINYNAV_ACTUATOR', 'unitree')
 _ODOM_SOURCE = os.environ.get('TINYNAV_ODOM_SOURCE', 'vio')
 
@@ -330,6 +334,10 @@ class BackendNode(Ros2NodeManager):
 
         # Planning / localization state (read via get_planning_snapshot)
         self._odom_pose: dict | None = None
+        # The local view's canvas origin. Every other layer is world coordinates around
+        # the control centre, but /slam/odometry_visual reports the camera -- 78 mm off on
+        # LeKiwi, which put the arrow outside the centre of its own footprint.
+        self._control_pose: dict | None = None
         self._odom_pose_at_kf: dict | None = None  # odom pose snapshotted at last mapPose update
         self._map_pose: dict | None = None
         self._localized: bool = False
@@ -514,6 +522,7 @@ class BackendNode(Ros2NodeManager):
         with self._lock:
             self.current_pose = pose
             self._odom_pose = pose
+            self._control_pose = self._to_control_centre(pose)
         for cb in self.pose_callbacks:
             try:
                 cb(pose)
@@ -737,6 +746,16 @@ class BackendNode(Ros2NodeManager):
             'timestamp': msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9,
             'source': source,
         }
+
+    @classmethod
+    def _to_control_centre(cls, pose: dict | None) -> dict | None:
+        """The same pose moved from the camera to the robot's control centre, matching
+        planning's camera_to_robot_center and cmd_vel_control's robot_pos."""
+        if pose is None:
+            return None
+        R = cls._quat_to_rot(pose['qx'], pose['qy'], pose['qz'], pose['qw'])
+        c = np.array([pose['x'], pose['y'], pose['z']]) - R @ _ROBOT.cam_offset_3d
+        return {**pose, 'x': float(c[0]), 'y': float(c[1]), 'z': float(c[2])}
 
     @staticmethod
     def _quat_to_rot(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
@@ -999,7 +1018,10 @@ class BackendNode(Ros2NodeManager):
             path_snapshot = list(self._global_path)
             snapshot = {
                 'localized': self._localized,
-                'odom_pose': self._odom_pose,
+                # The control centre, not the camera -- see _control_pose. The frontend
+                # uses this as the canvas origin for every layer and for the long-press
+                # manual target, so all of them shift together.
+                'odom_pose': self._control_pose or self._odom_pose,
                 'odom_pose_at_kf': self._odom_pose_at_kf,
                 'map_pose': self._map_pose,
                 'esdf_image': base64.b64encode(self._esdf_bytes).decode() if self._esdf_bytes else None,
