@@ -1127,6 +1127,9 @@ class PlanningNode(Node):
                     f"gate={'turn-only' if front_blocked else 'forward'} "
                     f"escape={escape_reason or 'off'} turns={len(turns)} "
                     f"best_gain={best_gain:+.2f}m escape_clear={self._fmt_clearance(escape_clear)} "
+                    # Was only logged on the two give-up branches, so a run could not
+                    # be read for whether the z band and dilation did what they claim.
+                    f"obstacle_cells={int(np.count_nonzero(obstacle_mask))} "
                     f"esdf_at_robot={self._esdf_at(ESDF_map, init_p):.2f}m "
                     f"seed={'used' if seed is not None else 'rejected'} seed_err={self._seed_error_m:.2f}m "
                     f"seed_rel_t={self._seed_debug[0]:.2f}s idx={self._seed_debug[1]} "

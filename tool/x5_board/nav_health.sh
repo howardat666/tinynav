@@ -75,6 +75,35 @@ if [ -n "$p" ]; then
   [ "$nav" = "0" ] && [ "$reach" != "0" ] && echo "   !! never navigating, always 'reached' -- check the arrival test axes"
 fi
 
+echo "-- avoidance (planning decision log) --"
+if [ -n "$p" ]; then
+  # The config line is printed once at startup, so it comes from the whole file, not
+  # the window: a run's numbers are unreadable without knowing which parameters made
+  # them, and this is the only place they appear.
+  grep -h "Robot: " "$p" | tail -1 | sed 's/.*\]: /   /'
+  d=$(recent "$p" | grep "decision:")
+  n=$(echo "$d" | grep -c "decision:")
+  if [ "$n" = "0" ]; then
+    echo "   no decisions in window (no target, or planning is not running)"
+  else
+    rev=$(echo "$d" | grep -c "chose vx=-")
+    zero=$(echo "$d" | grep -c "chose vx=+0.000 omega=+0.000")
+    echo "   decisions=$n   turn-in-place=$(echo "$d" | grep -c TURN-IN-PLACE)   reverse=$rev   standstill=$zero"
+    echo "   escape:$(for r in off blocked heading no-progress; do
+        printf ' %s=%s' "$r" "$(echo "$d" | grep -c "escape=$r")"; done)"
+    # turns=0 while the gate is turn-only is the silent failure the 2026-08-11 change
+    # fixed: the escape hatch fires but has nothing admissible to commit to.
+    t0=$(echo "$d" | grep "gate=turn-only" | grep -c "turns=0 ")
+    [ "$t0" != "0" ] && echo "   !! $t0 cycles blocked with turns=0 -- escape hatch had nothing to pick"
+    for k in blocked= obstacle_cells= esdf_at_robot= front_clearance=; do
+      printf '   %-18s' "$k"
+      echo "$d" | sed -n "s/.*$k\([^ ]*\).*/\1/p" | sort -V | awk '
+        {a[NR]=$1} END {if(NR) printf "p50=%s  min=%s  max=%s  (n=%d)\n", a[int(NR/2)+1], a[1], a[NR], NR; else print "-"}'
+    done
+    echo "$d" | tail -1 | sed 's/.*\]: /   last: /'
+  fi
+fi
+
 echo "-- control (cmd_vel_control) --"
 if [ -n "$c" ]; then
   tot=$(recent "$c" | grep -c "sent cmd_vel")
