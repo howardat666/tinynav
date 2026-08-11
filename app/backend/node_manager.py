@@ -628,12 +628,26 @@ class BackendNode(Ros2NodeManager):
         except Exception:
             pass
 
+    # Anything below this span is planning's zero-motion placeholder: coincident points
+    # carrying stamps spread seconds into the future. The history keeps hold of them,
+    # and drawn together with a real trajectory they read as a start point sitting
+    # where the robot was when navigation was enabled -- visible until the last of them
+    # ages past the new path's start, then gone on its own. It is the history of a
+    # robot that was not moving, so there is nothing worth keeping.
+    _DEGENERATE_PATH_SPAN_M = 1e-3
+
     def _on_trajectory_path(self, msg: Path):
         new_ref = self._rebuild_trajectory_ref(msg)
         with self._lock:
             if new_ref is None:
                 self._trajectory_ref = None
                 self._trajectory = []
+                return
+            span = float(np.max(np.linalg.norm(
+                new_ref[:, :2] - new_ref[0, :2], axis=1))) if len(new_ref) > 1 else 0.0
+            if span <= self._DEGENERATE_PATH_SPAN_M:
+                self._trajectory_ref = new_ref
+                self._trajectory = self._trajectory_ref_to_points(new_ref)
                 return
             if self._trajectory_ref is None or len(self._trajectory_ref) == 0:
                 self._trajectory_ref = new_ref
