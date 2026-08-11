@@ -164,6 +164,10 @@ class WheelOdometryNode(Node):
         self.declare_parameter("camera_pose_topic", "/wheel/camera_pose")
         self.declare_parameter("camera_offset_xyz", [0.06, 0.05, 0.18])
         self.declare_parameter("camera_frame", "camera")
+        # The published pose's world z is a *datum choice*, not the mount height. Using
+        # camera_offset_xyz[2] for both put this stream 0.18 m off the VIO's world z = 0,
+        # which the map's 20x z-weighted A* notices. That field still drives the TF.
+        self.declare_parameter("camera_pose_z", 0.0)
 
         # -- covariance model ---------------------------------------------- #
         # Two separate error mechanisms, because they grow at different rates and
@@ -279,6 +283,12 @@ class WheelOdometryNode(Node):
                 f"camera_offset_xyz must have 3 elements, got {self.camera_offset_xyz.tolist()}"
             )
         self.camera_frame = str(p("camera_frame").value)
+        # The pose offset actually published: xy from the mount, z from the datum.
+        self.camera_pose_offset_xyz = np.array(
+            [self.camera_offset_xyz[0], self.camera_offset_xyz[1],
+             float(p("camera_pose_z").value)],
+            dtype=float,
+        )
         self.tf_broadcaster = TransformBroadcaster(self) if self.publish_tf else None
         # base_link -> camera as a static TF too. Not needed by any node -- the
         # stack passes camera poses around in messages, not through TF -- but it
@@ -302,7 +312,8 @@ class WheelOdometryNode(Node):
         )
         self.get_logger().info(
             f"camera pose -> {camera_pose_topic or '<disabled>'} "
-            f"offset[fwd,left,up]={self.camera_offset_xyz.tolist()} "
+            f"mount[fwd,left,up]={self.camera_offset_xyz.tolist()} "
+            f"pose_z={self.camera_pose_offset_xyz[2]:.3f} "
             f"cmd={'/' + str(p('cmd_vel_topic').value).lstrip('/') if self.enable_wheel_command else '<disabled>'}"
         )
 
@@ -609,7 +620,7 @@ class WheelOdometryNode(Node):
 
         if self.camera_pose_pub is not None:
             position, quaternion = base_pose_to_camera_pose(
-                self.x, self.y, self.theta, self.camera_offset_xyz
+                self.x, self.y, self.theta, self.camera_pose_offset_xyz
             )
             pose_msg = PoseStamped()
             pose_msg.header.stamp = stamp

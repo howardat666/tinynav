@@ -64,7 +64,8 @@ def main() -> int:
     timed("trajectory library", build)
     esdf = np.full(grid[:2], 10.0, dtype=np.float32)
     timed("trajectory scoring", lambda: score_trajectories_by_ESDF(
-        trajs[0], esdf, origin, 0.1, robot.safety_radius, front, rear, half_w))
+        trajs[0], esdf, origin, 0.1, robot.hard_clearance, robot.soft_clearance,
+        front, rear, half_w, robot.is_circle))
 
     try:
         sdf = np.load(MAP + "/sdf_map.npy")

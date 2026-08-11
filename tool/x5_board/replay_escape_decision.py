@@ -18,6 +18,7 @@ import os
 import sys
 
 import numpy as np
+from scipy.ndimage import distance_transform_edt
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
@@ -53,7 +54,7 @@ def pose_at(x, y, yaw_deg):
     in this convention, which is how an earlier offline test produced nonsense."""
     p, q = base_pose_to_camera_pose(
         x, y, np.deg2rad(yaw_deg),
-        [LEKIWI_CONFIG.camera_x, LEKIWI_CONFIG.camera_y, 0.18],
+        [LEKIWI_CONFIG.camera_x, LEKIWI_CONFIG.camera_y, 0.0],
     )
     T = np.eye(4)
     T[:3, :3] = quat_to_matrix(np.asarray(q, dtype=np.float64))
@@ -64,7 +65,7 @@ def pose_at(x, y, yaw_deg):
 def blocked_mask(node, center, fx, fy, at=0.1):
     """Obstacle wall across the corridor `at` metres beyond the footprint edge."""
     mask = np.zeros(GRID, dtype=bool)
-    fl, _, _ = node.robot.footprint_from_control()
+    fl, _ = node.robot.probe_geometry()
     lx, ly = -fy, fx
     for w in np.arange(-0.6, 0.61, 0.05):
         for d in (at, at + RESOLUTION):
@@ -97,25 +98,39 @@ def old_gate(param, front_blocked):
 
 def report(title, node, T, center, p, q, target, mask, front_clearance):
     trajs, params = build_library(p, q, node.robot.max_vx)
-    front_blocked = front_clearance <= 0.30
+    front_blocked = front_clearance <= node.robot.front_blocked_m
     yaw_now = node._yaw_of(q)
     to_t = target[:2] - p[:2]
     yaw_to_target = float(np.arctan2(to_t[1], to_t[0]))
+
+    # The node admits on `costs < 1e9`, which is gate AND collision, so scoring here too.
+    # The 23 s wedge was the gate admitting 14 turns and collision killing 12 -- and a
+    # gate-only replay of it showed nothing wrong.
+    esdf = distance_transform_edt(~mask).astype(np.float32) * RESOLUTION
+    scores, _ = node._score_trajectories(trajs, esdf, params)
+    scores = np.asarray(scores, dtype=np.float64)
 
     print(f"\n=== {title} ===")
     print(f"  robot=[{p[0]:.2f},{p[1]:.2f}] yaw={np.degrees(yaw_now):+.0f}deg "
           f"target=[{target[0]:.2f},{target[1]:.2f}] "
           f"heading_err={np.degrees(node._wrap(yaw_to_target - yaw_now)):+.0f}deg")
     print(f"  front_clearance={node._fmt_clearance(front_clearance)} blocked={front_blocked} "
-          f"allow_reverse={node.robot.allow_reverse} library={len(params)}")
+          f"allow_reverse={node.robot.allow_reverse} library={len(params)} "
+          f"in_collision={int(np.count_nonzero(np.isinf(scores)))}/{len(scores)}")
 
     stand_dist = float(np.linalg.norm(target[:2] - p[:2]))
     for name, gate in (("old", old_gate), ("new", node._motion_gate_penalty)):
-        adm = [i for i in range(len(params)) if gate(params[i], front_blocked) < 1e9]
+        adm = [i for i in range(len(params))
+               if gate(params[i], front_blocked) < 1e9 and not np.isinf(scores[i])]
         turns = [i for i in adm if node._is_turn_in_place(params[i])]
         kinds = {"reverse": sum(1 for i in adm if params[i][0] < 0),
                  "turn": len(turns),
                  "forward": sum(1 for i in adm if params[i][0] > 1e-6)}
+        if not adm:
+            # The node's own "no admissible motion" branch: it holds still rather than
+            # moving somewhere the camera has not looked.
+            print(f"  {name} gate: admissible=0 {kinds} -- holds still")
+            continue
         ends = np.array([trajs[i][-1, :2] for i in adm])
         gain = stand_dist - float(np.min(np.linalg.norm(ends - target[None, :2], axis=1)))
         heading_err = abs(node._wrap(yaw_to_target - yaw_now))

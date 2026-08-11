@@ -31,6 +31,22 @@ class RobotConfig:
     control_x: float = 0.0
     control_y: float = 0.0
     safety_radius: float = 0.1
+    # Round bases only: the shell's true reach. `radius` is the wheel-ground contact
+    # circle, which is smaller. None means "same as radius".
+    collision_radius: float | None = None
+    # Round bases only: soft-penalty width past the hard limit, so a tight corridor
+    # degrades into "prefer the middle" instead of "all forbidden".
+    comfort_margin: float = 0.1
+    # The z slice, relative to the camera, projected into 2D. Per-robot because GO2's
+    # camera sits at z ~ 0 over a floor at -0.35 and LeKiwi's at 0.18 over a floor at 0.
+    obstacle_z_bottom: float = -0.4
+    obstacle_z_top: float = 0.4
+    # front_clearance at or below which only turning in place is admissible. Measured
+    # from the hull edge, so LeKiwi gates 0.50 m out from its control centre.
+    front_blocked_m: float = 0.3
+    # Obstacle inflation in cells. Measured x2.3 on the cell count, and scipy's default
+    # cross element makes it directional: 0.100 m on the axes, 0.041 m on the diagonals.
+    dilation_cells: int = 1
     # What the base can actually deliver, not what we would like. The planner used
     # to sample up to 0.5 m/s on a chassis that saturates at 0.268, so its
     # predictions ran 2x ahead of reality; see LEKIWI_CONFIG.
@@ -38,8 +54,7 @@ class RobotConfig:
     max_reverse_vx: float = 0.2
     max_yaw: float = 0.8
     # The occupancy grid is written only by forward raycasting, so a reverse move is
-    # scored against cells the camera never looked at. Off for bases that can turn in
-    # place instead of backing up blind.
+    # scored against cells the camera never looked at. Gated on front_blocked too.
     allow_reverse: bool = True
 
     @property
@@ -60,8 +75,36 @@ class RobotConfig:
         )
 
     @property
+    def is_circle(self) -> bool:
+        return self.shape == 'circle'
+
+    @property
+    def hull_radius(self) -> float:
+        """Collision hull radius for a round base. Meaningless for a square one."""
+        return float(self.radius if self.collision_radius is None else self.collision_radius)
+
+    @property
+    def hard_clearance(self) -> float:
+        """ESDF below which a pose is a collision.
+
+        A round base is one lookup at the centre, so the hull must be in the threshold.
+        A square one carries its geometry in the sample offsets and keeps the historical
+        "the sample cell is an obstacle cell" test, untouched.
+        """
+        return self.hull_radius + self.safety_radius if self.is_circle else 1e-3
+
+    @property
+    def soft_clearance(self) -> float:
+        """ESDF above which a pose costs nothing at all."""
+        return (
+            self.hull_radius + self.safety_radius + self.comfort_margin
+            if self.is_circle
+            else self.safety_radius
+        )
+
+    @property
     def half_size(self):
-        if self.shape == 'circle':
+        if self.is_circle:
             return (self.radius, self.radius)
         return (self.length / 2.0, self.width / 2.0)
 
@@ -70,17 +113,29 @@ class RobotConfig:
         hl, hw = self.half_size
         return float(hl - self.control_x), float(hl + self.control_x), float(hw)
 
+    def probe_geometry(self):
+        """(front_len, half_w) for the forward clearance probe. A round base probes from
+        its hull; footprint_from_control would give `radius` and understate the reach."""
+        if self.is_circle:
+            r = self.hull_radius
+            return r, r
+        fl, _, hw = self.footprint_from_control()
+        return fl, hw
+
     def describe(self) -> str:
         size = (
-            f"r={self.radius}m"
-            if self.shape == 'circle'
+            f"r={self.radius}m hull={self.hull_radius}m"
+            if self.is_circle
             else f"{self.length}x{self.width}m"
         )
         return (
             f"{self.name} ({self.shape} {size}, "
             f"cam=({self.camera_x},{self.camera_y}), "
             f"ctrl=({self.control_x},{self.control_y}), "
-            f"safety_r={self.safety_radius}m)"
+            f"safety_r={self.safety_radius}m, "
+            f"hard/soft={self.hard_clearance:.2f}/{self.soft_clearance:.2f}m, "
+            f"z_band=[{self.obstacle_z_bottom:+.2f},{self.obstacle_z_top:+.2f}], "
+            f"dilation={self.dilation_cells}, reverse={self.allow_reverse})"
         )
 
 
@@ -111,6 +166,15 @@ B2_CONFIG = RobotConfig(
 LEKIWI_CONFIG = RobotConfig(
     name='lekiwi', shape='circle',
     radius=0.15,
+    # Plate and Looper mount reach 0.20; see docs/x5/nav_obstacle_tuning.md section 3.
+    collision_radius=0.20,
+    comfort_margin=0.1,
+    # Top matters, bottom does not. Capping at 0.38 m of world height halved the
+    # obstacle count on a real floor (40.2 -> 17.4 cells) by dropping table tops the
+    # 0.25 m robot drives under. Below the floor the layers measured empty.
+    obstacle_z_bottom=-0.2,
+    obstacle_z_top=0.2,
+    dilation_cells=0,
     camera_x=0.06, camera_y=0.05,
     control_x=0.0, control_y=0.0,
     safety_radius=0.1,
@@ -118,7 +182,9 @@ LEKIWI_CONFIG = RobotConfig(
     # is already the STS3215's no-load speed at 12 V. 0.22 leaves headroom so a yaw
     # component does not saturate body_to_wheel_raw and silently scale vx down.
     max_vx=0.22,
-    allow_reverse=False,
+    # Only reachable through the front_blocked gate, so it is a way out of a dead end,
+    # not a way to reach a POI behind the robot -- that case is the turn-in-place escape's.
+    allow_reverse=True,
 )
 
 ROBOT_CONFIGS = {cfg.name: cfg for cfg in (GO2_CONFIG, B2_CONFIG, LEKIWI_CONFIG)}

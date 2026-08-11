@@ -522,10 +522,12 @@ def _build_trajectory_frame(
         esdf_map,
         occ.origin,
         resolution,
-        GO2_CONFIG.safety_radius,
+        GO2_CONFIG.hard_clearance,
+        GO2_CONFIG.soft_clearance,
         front_len,
         rear_len,
         half_w,
+        GO2_CONFIG.is_circle,
     )
     scores = np.asarray(scores, dtype=np.float64)
     esdf_top = np.argsort(scores, kind="stable")[: max(0, max_candidates)]

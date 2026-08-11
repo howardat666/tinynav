@@ -286,7 +286,13 @@ class PlanningNode(Node):
         self.baseline = None
         self.last_T = None
         self.last_param = (0.0, 0.0) # acc and gyro
-        self.obstacle_config = ObstacleConfig()
+        # From the robot, not defaulted: the band is relative to the camera, and the two
+        # configs mount it at different heights above the floor.
+        self.obstacle_config = ObstacleConfig(
+            robot_z_bottom=self.robot.obstacle_z_bottom,
+            robot_z_top=self.robot.obstacle_z_top,
+            dilation_cells=self.robot.dilation_cells,
+        )
         self.stamp = None
         self.current_pose = None  # Store the latest pose from odometry
 
@@ -324,9 +330,9 @@ class PlanningNode(Node):
         # 69 s. Heading error measures the cause and has no scale to get wrong.
         self.force_turn_heading_rad = math.radians(80.0)
         # A heading counts as an escape only if the probe finds nothing within this
-        # much. Above enter_threshold (0.30 m) so the turn actually releases the gate
+        # much. Above robot.front_blocked_m so the turn actually releases the gate
         # instead of handing back a heading that re-triggers it next cycle.
-        self.escape_min_clearance_m = 0.4
+        self.escape_min_clearance_m = max(0.4, self.robot.front_blocked_m + 0.1)
 
         # TRANSIENT_LOCAL because this topic carries state -- where the robot is going --
         # not a stream. map_node publishes it once per POI transition, so a volatile
@@ -377,11 +383,7 @@ class PlanningNode(Node):
                     params = np.concatenate([params, vocab_params], axis=0)
                 # 2-D float32 clearance field, as built in sync_callback.
                 esdf = np.full(self.grid_shape[:2], 10.0, dtype=np.float32)
-                front_len, rear_len, half_w = self.robot.footprint_from_control()
-                score_trajectories_by_ESDF(
-                    trajectories, esdf, self.origin, self.resolution,
-                    self.robot.safety_radius, front_len, rear_len, half_w,
-                )
+                self._score_trajectories(trajectories, esdf)
             except Exception as e:  # noqa: BLE001 - a warmup thread must never die silently
                 self.get_logger().error(f"trajectory warmup failed: {e}")
             finally:
@@ -428,18 +430,30 @@ class PlanningNode(Node):
         """World control-center position derived from camera pose T_cam->world."""
         return T[:3, 3] - T[:3, :3] @ self.robot.cam_offset_3d
 
+    # Reads as a circle at the app's scale, and clear of node_manager._on_footprint's
+    # `n >= 84 and n % 21 == 0` rectangle-outline branch.
+    _CIRCLE_SEGMENTS = 16
+
     def publish_footprint(self, T, stamp):
-        """Publish robot footprint rectangle as a PointCloud for RViz."""
+        """Footprint outline as a PointCloud for RViz and the app. Both consumers close
+        the polygon themselves, so a round base is just a 16-gon and needs no change."""
         forward = T[:3, :3] @ np.array([0.0, 0.0, 1.0])
         left    = T[:3, :3] @ np.array([1.0, 0.0, 0.0])
         center  = self.camera_to_robot_center(T)
-        fl, rl, hw = self.robot.footprint_from_control()
-        corners = [
-            center + forward * fl + left * hw,
-            center + forward * fl - left * hw,
-            center - forward * rl - left * hw,
-            center - forward * rl + left * hw,
-        ]
+        if self.robot.is_circle:
+            r = self.robot.hull_radius
+            corners = [
+                center + forward * (r * math.cos(a)) + left * (r * math.sin(a))
+                for a in np.linspace(0.0, 2.0 * math.pi, self._CIRCLE_SEGMENTS, endpoint=False)
+            ]
+        else:
+            fl, rl, hw = self.robot.footprint_from_control()
+            corners = [
+                center + forward * fl + left * hw,
+                center + forward * fl - left * hw,
+                center - forward * rl - left * hw,
+                center - forward * rl + left * hw,
+            ]
         # Four corners by default, not 84 interpolated points along the edges.
         #
         # The interpolation exists so RViz's PointCloud display draws a rectangle
@@ -454,8 +468,8 @@ class PlanningNode(Node):
         # with docs/vis.rviz can get the outline back; RViz shows four dots without it.
         if _FOOTPRINT_OUTLINE:
             points = []
-            for i in range(4):
-                a, b = corners[i], corners[(i + 1) % 4]
+            for i in range(len(corners)):
+                a, b = corners[i], corners[(i + 1) % len(corners)]
                 for k in range(21):
                     t = k / 20
                     p = (1.0 - t) * a + t * b
@@ -472,6 +486,25 @@ class PlanningNode(Node):
     @staticmethod
     def _is_turn_in_place(param):
         return abs(param[0]) < 1e-6 and abs(param[1]) > 1e-6
+
+    def _score_trajectories(self, trajectories, esdf, params=None):
+        """Collision scores, with in-place turns exempted on a round base.
+
+        A circle rotating in place sweeps the area it already occupies, so the verdict is
+        about the present, not the motion, and is unactionable. Measured 2026-08-10: it
+        killed 12 of 14 turns, and the escape hatch then failed silently for 23 s.
+        """
+        front_len, rear_len, half_w = self.robot.footprint_from_control()
+        scores, occ_points = score_trajectories_by_ESDF(
+            trajectories, esdf, self.origin, self.resolution,
+            self.robot.hard_clearance, self.robot.soft_clearance,
+            front_len, rear_len, half_w, self.robot.is_circle,
+        )
+        if params is not None and self.robot.is_circle:
+            for i in range(len(params)):
+                if self._is_turn_in_place(params[i]):
+                    scores[i] = 0.0
+        return scores, occ_points
 
     def _motion_gate_penalty(self, param, front_blocked):
         """1e9 on any motion this sensor cannot vouch for, 0.0 otherwise.
@@ -543,7 +576,7 @@ class PlanningNode(Node):
         Returns max_dist + 1.0 when the corridor is clear, which is a "nothing found"
         marker rather than a measured distance -- do not print it as one."""
         lx, ly = -fy, fx
-        fl, _, hw = self.robot.footprint_from_control()
+        fl, hw = self.robot.probe_geometry()
         rows, cols = obstacle_mask.shape
         steps = int(max_dist / self.resolution) + 1
         for step in range(steps):
@@ -976,13 +1009,11 @@ class PlanningNode(Node):
                 params = np.concatenate([params, vocab_params], axis=0)
 
         with Timer(name='traj score', text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=_TIMER_LOGGER):
-            front_len, rear_len, half_w = self.robot.footprint_from_control()
-            scores, occ_points = score_trajectories_by_ESDF(trajectories, ESDF_map, self.origin, self.resolution, self.robot.safety_radius, front_len, rear_len, half_w)
+            scores, occ_points = self._score_trajectories(trajectories, ESDF_map, params)
 
         with Timer(name='pub', text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=_TIMER_LOGGER):
             front_clearance = self._front_obstacle_dist(T, obstacle_mask)
-            enter_threshold = 0.30
-            front_blocked = front_clearance <= enter_threshold
+            front_blocked = front_clearance <= self.robot.front_blocked_m
 
             def cost_function(traj, param, score, target_pose):
                 gate_penalty = self._motion_gate_penalty(param, front_blocked)

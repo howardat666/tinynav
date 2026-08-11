@@ -167,12 +167,20 @@ def generate_trajectory_library_3d(
 
 
 @njit(cache=True)
-def score_trajectories_by_ESDF(trajectories, ESDF_map, origin, resolution, safety_radius=0.1,
-                                front_len=0.35, rear_len=0.35, half_w=0.15):
-    """Score trajectories by minimum ESDF clearance across the robot footprint (center + 4 corners)."""
+def score_trajectories_by_ESDF(trajectories, ESDF_map, origin, resolution,
+                                hard_clearance=1e-3, soft_clearance=0.1,
+                                front_len=0.35, rear_len=0.35, half_w=0.15,
+                                is_circle=False):
+    """Score trajectories by minimum ESDF clearance, inf on collision.
+
+    A circle is one lookup at the centre -- exact, since the ESDF already is the distance
+    to the nearest obstacle. Sampling it as its circumscribing square instead put the
+    corners 41% too far out, and rotating. Squares keep the 5-corner sampling.
+    """
     scores = []
     occ_points = []
     ESDF_rows, ESDF_cols = ESDF_map.shape
+    n_samples = 1 if is_circle else 5
 
     for t in range(len(trajectories)):
         traj = trajectories[t]
@@ -211,7 +219,7 @@ def score_trajectories_by_ESDF(trajectories, ESDF_map, origin, resolution, safet
                 y_world - fwd_y * rear_len  - left_y * half_w,
             )
 
-            for k in range(5):
+            for k in range(n_samples):
                 x_img = int((check_xs[k] - origin[0]) / resolution)
                 y_img = int((check_ys[k] - origin[1]) / resolution)
                 if 0 <= x_img < ESDF_rows and 0 <= y_img < ESDF_cols:
@@ -220,15 +228,17 @@ def score_trajectories_by_ESDF(trajectories, ESDF_map, origin, resolution, safet
                         min_dist_for_traj = dist
                         closest_step_for_traj = i
 
-        if min_dist_for_traj < 1e-3:  # collision
+        if min_dist_for_traj < hard_clearance:  # collision
             scores.append(float('inf'))
         elif min_dist_for_traj != float('inf'):
-            if min_dist_for_traj > safety_radius:
+            if min_dist_for_traj > soft_clearance:
                 scores.append(0.0)
             else:
                 max_steps = len(traj)
                 decay_factor = (max_steps - closest_step_for_traj) / max_steps
-                base_score = 1.0 / (min_dist_for_traj + 1e-3)
+                # From the hard limit, so it blows up there. At the square's 1e-3 this is
+                # the previous 1/(d + 1e-3).
+                base_score = 1.0 / (min_dist_for_traj - hard_clearance + 1e-3)
                 scores.append(decay_factor * base_score)
         else:
             scores.append(0.0)
