@@ -53,6 +53,40 @@ def sh(cmd, timeout=60):
                           timeout=timeout, check=False)
 
 
+_EXPORT_RE = re.compile(
+    r'^\s*export\s+(TINYNAV_[A-Z0-9_]+)='          # name
+    r'(?:"\$\{\1:-([^}]*)\}"|([A-Za-z0-9_./-]+))\s*$',  # "${NAME:-default}" or a bare word
+    re.M)
+# Set by the scheme letter, not a default -- this tool chooses it per build.
+_SKIP_EXPORTS = {'TINYNAV_ODOM_SOURCE', 'TINYNAV_MAP_ODOM_SOURCE'}
+
+
+def app_start_defaults() -> dict:
+    """The TINYNAV_* values app_start.sh pins, read out of app_start.sh itself.
+
+    Copying them here instead would recreate the exact problem this tool exists to
+    avoid: a second set of build parameters that drifts from the app's. Four of them
+    are the difference between a build and an OOM kill -- most sharply the vocabulary,
+    since node_manager's default ORBvoc.txt needs 1735 MB, more than the board has,
+    and is not even shipped to it."""
+    path = os.path.join(_HERE, 'app_start.sh')
+    with open(path) as fh:
+        text = fh.read()
+    out = {}
+    for m in _EXPORT_RE.finditer(text):
+        name = m.group(1)
+        if name in _SKIP_EXPORTS:
+            continue
+        out[name] = m.group(2) if m.group(2) is not None else m.group(3)
+    for required in ('TINYNAV_DBOW3_VOCAB', 'TINYNAV_MAP_PLAY_RATE', 'TINYNAV_MAP_SYNC_QUEUE'):
+        if required not in out:
+            raise SystemExit(f'{required} not found in {path} -- the export form changed; '
+                             f'fix the parser rather than hardcoding a value here')
+    if not os.path.exists(out['TINYNAV_DBOW3_VOCAB']):
+        raise SystemExit(f"vocabulary missing: {out['TINYNAV_DBOW3_VOCAB']}")
+    return out
+
+
 def dir_bytes(path):
     total = 0
     for root, _, files in os.walk(path):
@@ -196,6 +230,10 @@ def main():
         return 1
 
     sources = [s.strip() for s in args.sources.split(',') if s.strip()]
+    defaults = app_start_defaults()
+    print('build parameters from app_start.sh:')
+    for k in sorted(defaults):
+        print(f'  {k}={defaults[k]}')
     os.makedirs(LOG_DIR, exist_ok=True)
     results = []
     for source in sources:
@@ -205,6 +243,7 @@ def main():
         print(f'\n=== building {source} map -> {map_path}')
         print(f'    log: {log_path}')
         env = dict(os.environ)
+        env.update(defaults)
         env['TINYNAV_MAP_ODOM_SOURCE'] = source
         child = subprocess.run(
             [sys.executable, os.path.abspath(__file__), '--bag', args.bag,
