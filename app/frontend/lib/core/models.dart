@@ -25,6 +25,71 @@ class NavProgress {
       );
 }
 
+/// One relocalisation counting window, as map_node reports it.
+class RelocWindow {
+  final int keyframes;
+  final int attempts;
+  final int success;
+  final int droppedStale;
+  final int skippedRateLimit;
+  final double? successRate;
+  final double spanS;
+  final Map<String, int> byCode;
+
+  const RelocWindow({
+    required this.keyframes,
+    required this.attempts,
+    required this.success,
+    required this.droppedStale,
+    required this.skippedRateLimit,
+    required this.successRate,
+    required this.spanS,
+    required this.byCode,
+  });
+
+  factory RelocWindow.fromJson(Map<String, dynamic> j) => RelocWindow(
+        keyframes: (j['keyframes'] as num?)?.toInt() ?? 0,
+        attempts: (j['attempts'] as num?)?.toInt() ?? 0,
+        success: (j['success'] as num?)?.toInt() ?? 0,
+        droppedStale: (j['dropped_stale'] as num?)?.toInt() ?? 0,
+        skippedRateLimit: (j['skipped_rate_limit'] as num?)?.toInt() ?? 0,
+        successRate: (j['successRate'] as num?)?.toDouble(),
+        spanS: (j['spanS'] as num?)?.toDouble() ?? 0.0,
+        byCode: (j['byCode'] as Map?)?.map(
+              (k, v) => MapEntry(k.toString(), (v as num).toInt()),
+            ) ??
+            const <String, int>{},
+      );
+}
+
+class RelocStats {
+  final RelocWindow? window;
+  final RelocWindow? total;
+  final String? lastFailureCode;
+  final String? lastFailureReason;
+  final double? secondsSinceLastSuccess;
+
+  const RelocStats({
+    this.window,
+    this.total,
+    this.lastFailureCode,
+    this.lastFailureReason,
+    this.secondsSinceLastSuccess,
+  });
+
+  factory RelocStats.fromJson(Map<String, dynamic> j) => RelocStats(
+        window: j['window'] == null
+            ? null
+            : RelocWindow.fromJson(j['window'] as Map<String, dynamic>),
+        total: j['total'] == null
+            ? null
+            : RelocWindow.fromJson(j['total'] as Map<String, dynamic>),
+        lastFailureCode: j['lastFailureCode'] as String?,
+        lastFailureReason: j['lastFailureReason'] as String?,
+        secondsSinceLastSuccess: (j['secondsSinceLastSuccess'] as num?)?.toDouble(),
+      );
+}
+
 class DeviceStatus {
   final bool online;
   final double? battery;
@@ -36,6 +101,7 @@ class DeviceStatus {
   final String rawState;
   final bool navNodesRunning;
   final bool navPaused;
+  final RelocStats? reloc;
 
   const DeviceStatus({
     required this.online,
@@ -48,6 +114,7 @@ class DeviceStatus {
     required this.rawState,
     required this.navNodesRunning,
     required this.navPaused,
+    this.reloc,
   });
 
   factory DeviceStatus.fromJson(Map<String, dynamic> json) => DeviceStatus(
@@ -61,6 +128,9 @@ class DeviceStatus {
         rawState: json['rawState'] as String? ?? 'unknown',
         navNodesRunning: json['navNodesRunning'] as bool? ?? false,
         navPaused: json['navPaused'] as bool? ?? false,
+        reloc: json['relocalization'] == null
+            ? null
+            : RelocStats.fromJson(json['relocalization'] as Map<String, dynamic>),
       );
 }
 

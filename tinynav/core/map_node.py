@@ -247,6 +247,9 @@ class MapNode(Node):
         self._reloc_start_monotonic = time.monotonic()
         self._reloc_window_t0 = self._reloc_start_monotonic
         self._reloc_last_success_monotonic = None
+        # Paired wall clock for the same event, for the status panel only: monotonic
+        # cannot be aged by another process, and the panel wants a live "N s ago".
+        self._reloc_last_success_epoch = None
         self._reloc_last_failure_code = ""
         self._reloc_stats_pub = self.create_publisher(
             String, '/map/relocalization_stats',
@@ -636,6 +639,7 @@ class MapNode(Node):
             if success:
                 self._reloc_tally('success')
                 self._reloc_last_success_monotonic = time.monotonic()
+                self._reloc_last_success_epoch = time.time()
         else:
             # Skipped, not failed. The keyframe still goes into the pose graph
             # below; only the expensive relocalization is rate-limited. Counted
@@ -844,10 +848,17 @@ class MapNode(Node):
             'window': rates(self._reloc_window, window_s),
             'total': rates(self._reloc_totals, uptime_s),
             'lastFailureCode': self._reloc_last_failure_code or None,
+            # The numbers behind the code, minus the candidate dump: that part runs to
+            # several hundred characters and belongs in the log, not on a status panel.
+            'lastFailureReason':
+                self.last_relocalization_failure_reason.split(', candidates=')[0][:160] or None,
             'secondsSinceLastSuccess': (
                 round(now - self._reloc_last_success_monotonic, 1)
                 if self._reloc_last_success_monotonic is not None else None
             ),
+            # Wall clock, so the backend can age it on every /device/status instead of
+            # serving whatever this 10 s snapshot happened to freeze.
+            'lastSuccessEpoch': self._reloc_last_success_epoch,
         }
 
     def _maybe_report_reloc_stats(self) -> None:

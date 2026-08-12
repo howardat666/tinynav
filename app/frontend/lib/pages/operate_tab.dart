@@ -12,6 +12,7 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../core/models.dart';
 import '../core/providers.dart';
+import 'debug_panel.dart';
 import 'local_voxel_painter.dart';
 import 'map_painter.dart';
 import 'planning_painter.dart';
@@ -252,6 +253,9 @@ class _OperateTabState extends ConsumerState<OperateTab> {
             ],
           ),
         ),
+        // Unflexed on purpose: collapsed it is a ~32 px strip, and the Expanded
+        // sections above give up height only while it is open.
+        const DebugPanel(),
         const Divider(height: 1, thickness: 1, color: Color(0xFFE0E0E0)),
         // ── Joystick panel (1/4) ──────────────────────────────────────
         Expanded(

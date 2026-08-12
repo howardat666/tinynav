@@ -1268,6 +1268,7 @@ class BackendNode(Ros2NodeManager):
             poi_status = self._poi_status
         if nav_nodes and self._report_dead_nav_procs():
             nav_nodes = False
+        reloc_stats = self._age_reloc_success(reloc_stats)
         bag_recording = self.is_bag_recording()
         bag_files_exist = self.active_bag_path is not None
         map_files_exist = os.path.exists(os.path.join(self.map_path, 'occupancy_grid.npy'))
@@ -1296,6 +1297,20 @@ class BackendNode(Ros2NodeManager):
             # whether relocalization is failing or simply not being attempted.
             'relocalization': reloc_stats,
         }
+
+    @staticmethod
+    def _age_reloc_success(stats: dict | None) -> dict | None:
+        """Re-age secondsSinceLastSuccess against now.
+
+        map_node only republishes this every 10 s, so the field as received says how
+        long ago the success was *when that snapshot was taken* -- a panel showing it
+        raw sits frozen and then jumps by 10. Same machine, same clock, so wall time
+        is safe here.
+        """
+        if not stats or stats.get('lastSuccessEpoch') is None:
+            return stats
+        return {**stats,
+                'secondsSinceLastSuccess': round(time.time() - stats['lastSuccessEpoch'], 1)}
 
     @staticmethod
     def _derive_nav_status(raw: str, poi_status: dict | None) -> str:
