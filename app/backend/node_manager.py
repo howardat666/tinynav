@@ -1431,7 +1431,7 @@ class BackendNode(Ros2NodeManager):
         if hasattr(self, '_lock'):
             with self._lock:
                 self._nav_nodes_running = False
-                self._nav_paused = False
+            self._set_nav_paused(False)
 
     def destroy_node(self):
         if getattr(self, '_destroyed', False):
@@ -1640,7 +1640,7 @@ class BackendNode(Ros2NodeManager):
         with self._lock:
             self._nav_nodes_running = False
             self._clear_nav_snapshot_locked()
-            self._nav_paused = False
+        self._set_nav_paused(False)
         self.get_logger().info('Nav nodes stopped')
 
     def cmd_restart_nav_nodes(self):
@@ -1990,17 +1990,28 @@ class BackendNode(Ros2NodeManager):
             self._stop_all()
         with self._lock:
             self._clear_nav_snapshot_locked()
-            self._nav_paused = False
+        self._set_nav_paused(False)
+
+    def _set_nav_paused(self, paused: bool):
+        """Set the pause flag and the latched topic together, never one alone.
+
+        /nav/paused is TRANSIENT_LOCAL, so a flag cleared without a publish leaves
+        cmd_vel_control paused forever -- and a controller restarted afterwards still
+        picks up the stale True. Call outside self._lock; it is not reentrant.
+        """
+        with self._lock:
+            if self._nav_paused == paused:
+                return
+            self._nav_paused = paused
+        pub = getattr(self, '_pause_pub', None)
+        if pub is not None and not getattr(self, '_destroyed', False):
+            pub.publish(Bool(data=paused))
 
     def cmd_nav_pause(self):
-        with self._lock:
-            self._nav_paused = True
-        self._pause_pub.publish(Bool(data=True))
+        self._set_nav_paused(True)
 
     def cmd_nav_resume(self):
-        with self._lock:
-            self._nav_paused = False
-        self._pause_pub.publish(Bool(data=False))
+        self._set_nav_paused(False)
 
     def cmd_action(self, action: str):
         self._action_pub.publish(String(data=f'play {action}'))

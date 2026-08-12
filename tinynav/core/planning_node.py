@@ -301,8 +301,10 @@ class PlanningNode(Node):
         self.planning_latency_s = 0.2
         # The seed is a prediction fed back as the next prediction's start state; this
         # bound is the only place the measurement enters. At 2.0 m the loop was open and
-        # the estimate drifted 1.3 m unchallenged. 0.5 m is one planning latency of travel.
-        self.seed_fallback_distance_m = 0.5
+        # the estimate drifted 1.3 m unchallenged. 0.5 m still let it sit at 0.31 m median
+        # while driving (2026-08-12) -- past the 0.20 m hull, so collisions were being
+        # scored off a pose the robot was not at. Now under the hull radius.
+        self.seed_fallback_distance_m = 0.15
         self.target_reached_distance_m = 0.15
         self.last_planned_traj = None
         self.last_planned_traj_base_stamp = None
