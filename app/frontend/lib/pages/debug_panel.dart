@@ -159,10 +159,10 @@ class DebugPanel extends ConsumerWidget {
           Text(title,
               style: const TextStyle(
                   color: _kAccent,
-                  fontSize: 10.5,
+                  fontSize: 12,
                   fontWeight: FontWeight.w700,
                   letterSpacing: 1.1)),
-          const SizedBox(height: 3),
+          const SizedBox(height: 5),
           ...rows,
         ],
       );
@@ -186,20 +186,20 @@ class _Row extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => Padding(
-        padding: const EdgeInsets.only(bottom: 1.5),
+        padding: const EdgeInsets.only(bottom: 3),
         child: Row(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             SizedBox(
-              width: 66,
+              width: 84,
               child: Text(label,
-                  style: const TextStyle(color: _kLabel, fontSize: 11)),
+                  style: const TextStyle(color: _kLabel, fontSize: 13)),
             ),
             Expanded(
               child: Text(value,
                   style: TextStyle(
                       color: color ?? _kValue,
-                      fontSize: small ? 10 : 11,
+                      fontSize: small ? 11.5 : 13,
                       height: 1.25,
                       fontFeatures: const [FontFeature.tabularFigures()])),
             ),

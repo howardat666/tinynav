@@ -323,6 +323,11 @@ class MapNode(Node):
 
         self.relocalization_threshold = 0.85
         self.relocalization_loop_top_k = 3
+        # Straight-line pursuit radius for /control/target_pose. 2.0 m sits at the
+        # 1.82 m median the old arc-length walk was actually producing, so a healthy
+        # path aims where it always did; the change is that a folded one no longer
+        # collapses the target onto the robot.
+        self.nav_lookahead_m = 2.0
 
         # There are two bow LoopClosures below (nav + map). Read the vocabulary
         # from disk once and hand the same object to both: each Database still
@@ -1418,48 +1423,43 @@ class MapNode(Node):
             })
             self.nav_progress_pub.publish(progress_msg)
 
-            # use the max_speed to publish the position the robot should be after 10 seconds
+            # Pure pursuit: the first path point that is far enough from the robot in a
+            # straight line. Walking the path by arc length instead put the target 0.20 m
+            # from the robot after spending 2.23 m of a 3.98 m path (2026-08-12): the
+            # global path doubles back on itself -- see nav_obstacle_tuning.md section 18
+            # -- so arc length gets eaten by a fold that goes nowhere, and the planner's
+            # 100*dist term then throttles vx to zero. Straight-line distance is immune:
+            # a fold does not get further away, so the scan simply walks past it.
             with Timer(name = "Find target position", text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=self.timer_logger):
-                # LEKIWI_CONFIG.max_vx; map_node has no robot config of its own.
-                # At the old 0.5 the 5 m budget put the lookahead at the path end on
-                # every short path, so the arrival test had nothing to converge on.
-                max_speed = 0.22
-                lookahead_seconds = 10.0
-                accumulated_distance = 0.0
-                chosen_index = max(len(paths_in_map) - 1, 0)
-                if len(paths_in_map) > 1:
-                    start_point = pose_in_map_position[:3]
-                    target_position = paths_in_map[-1]
-                    for i in range(len(paths_in_map) - 1):
-                        accumulated_distance += np.linalg.norm(paths_in_map[i][:2] - start_point[:2])
-                        if accumulated_distance > max_speed * lookahead_seconds:
-                            target_position = paths_in_map[i]
-                            chosen_index = i
-                            break
-                        start_point = paths_in_map[i]
-                else:
-                    target_position = paths_in_map[0]
-                    chosen_index = 0
+                lookahead_m = self.nav_lookahead_m
+                path_arr_xy = np.asarray(paths_in_map, dtype=float)[:, :2]
+                robot_xy = np.asarray(pose_in_map_position[:2], dtype=float)
+                radial = np.linalg.norm(path_arr_xy - robot_xy, axis=1)
+                beyond = np.flatnonzero(radial >= lookahead_m)
+                # Earliest qualifying point, not the nearest one: order along the path is
+                # what makes this follow the route rather than cut to whatever end is
+                # closest. Nothing qualifies only when the whole path is inside the
+                # radius, and then the far end is the best available aim point.
+                chosen_index = int(beyond[0]) if len(beyond) else len(paths_in_map) - 1
+                target_position = paths_in_map[chosen_index]
+                accumulated_distance = float(np.sum(np.linalg.norm(
+                    np.diff(path_arr_xy[:chosen_index + 1], axis=0), axis=1
+                ))) if chosen_index > 0 else 0.0
                 target_position_in_map = np.array([target_position[0], target_position[1], target_position[2]])
                 pose_in_origin_odom = self.odom[timestamp]
                 T = pose_in_origin_odom @ se3_inv(pose_in_map)
                 target_position_in_odom = T[:3, :3] @ target_position_in_map + T[:3, 3]
                 dummy_pose = np.eye(4)
                 dummy_pose[:3, 3] = target_position_in_odom
-                # Instrumented 2026-08-10. The published target kept landing 0.1-0.2 m
-                # from the robot even with 27 points in the path, so the lookahead was
-                # not looking ahead -- and this block reported none of the quantities
-                # that would say why, so the cause could only be guessed at. It now
-                # prints the path's actual arc length, how much of the 5 m budget was
-                # consumed, which index won, and the resulting robot-to-target distance
-                # in the (x, y) ground plane. Note the world frame here is z-up, so the
-                # third component is height and carries no horizontal information --
-                # reading it as "forward" produces a plausible wrong answer, which is
-                # exactly the mistake this line exists to prevent a repeat of.
-                #
-                # Replaces a bare print() that emitted one unthrottled line per nav
-                # path with only the odom-frame vector on it -- the one number from
-                # which the interesting ones cannot be recovered.
+                # Instrumented 2026-08-10 because the published target kept landing
+                # 0.1-0.2 m from the robot with 27 points in the path and this block
+                # reported none of the quantities that would say why. arc_to is the arc
+                # length spent reaching the chosen point: comparing it against
+                # robot_to_target_xy is what exposes a folded path, since a straight
+                # path makes them nearly equal and a fold makes arc_to much larger.
+                # The world frame is z-up, so the third component is height and carries
+                # no horizontal information -- reading it as "forward" gives a plausible
+                # wrong answer, which is what these labels exist to prevent.
                 path_arr = np.asarray(paths_in_map, dtype=float)
                 path_len_m = (
                     float(np.sum(np.linalg.norm(np.diff(path_arr[:, :3], axis=0), axis=1)))
@@ -1467,7 +1467,7 @@ class MapNode(Node):
                 )
                 self.get_logger().info(
                     f"nav target: points={len(path_arr)} path_len={path_len_m:.2f}m "
-                    f"budget={max_speed * lookahead_seconds:.1f}m used={accumulated_distance:.2f}m "
+                    f"lookahead={lookahead_m:.1f}m arc_to={accumulated_distance:.2f}m "
                     f"index={chosen_index}/{len(path_arr) - 1} "
                     f"robot_to_target_xy="
                     f"{float(np.linalg.norm((target_position_in_map - pose_in_map_position)[:2])):.3f}m "
