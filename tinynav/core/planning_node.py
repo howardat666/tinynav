@@ -1,5 +1,6 @@
 import math
 import array
+import json
 import os
 import threading
 import time
@@ -20,7 +21,7 @@ from rclpy.duration import Duration
 from sensor_msgs.msg import PointCloud2, PointCloud
 from geometry_msgs.msg import PoseStamped, Point32
 import sensor_msgs_py.point_cloud2 as pc2
-from std_msgs.msg import Header
+from std_msgs.msg import Header, String
 from codetiming import Timer
 import cv2
 from tinynav.core.math_utils import quat_to_matrix, matrix_to_quat, pose_msg2np
@@ -191,6 +192,8 @@ class PlanningNode(Node):
         self.get_logger().info(f"Robot: {self.robot.describe()}")
         self.bridge = CvBridge()
         self.path_pub = self.create_publisher(Path, '/planning/trajectory_path', 10)
+        # Throttled JSON for the app's diagnostics panel; see _publish_diagnostics.
+        self.diag_pub = self.create_publisher(String, '/planning/diagnostics', 1)
         self.height_map_pub = self.create_publisher(Image, "/planning/height_map", 10)
         self.obstacle_mask_pub = self.create_publisher(OccupancyGrid, '/planning/obstacle_mask', 10)
         self.footprint_pub = self.create_publisher(PointCloud, '/planning/footprint', 10)
@@ -302,6 +305,9 @@ class PlanningNode(Node):
         self._last_static_log_ns = {}
         self._last_target_rx_ns = 0
         self._last_cycle_ns = 0
+        self._last_diag_ns = 0
+        self._last_loop_ns = 0
+        self._loop_period_s = None
         # How long /control/target_pose must go quiet before proximity to it counts as
         # arrival rather than as passing over a waypoint. map_node republishes roughly
         # once a second while it is navigating and stops entirely once the POI list is
@@ -686,6 +692,42 @@ class PlanningNode(Node):
         fwd = quat_to_matrix(np.asarray(quat_xyzw, dtype=np.float64)) @ np.array([0.0, 0.0, 1.0])
         return math.atan2(float(fwd[1]), float(fwd[0]))
 
+    def _publish_diagnostics(self, front_clearance, obstacle_mask, esdf_map, T, stamp):
+        """The decision log's numbers, on a topic, for the app's diagnostics panel.
+
+        Throttled to 2 Hz: the panel is read by eye and the payload is small, but this
+        runs inside the loop that already drops a fifth of its frames.
+        """
+        now_ns = self.get_clock().now().nanoseconds
+        # Every call, before the throttle: _last_cycle_ns only advances on the decision
+        # path, so with no target the panel would show no rate at all -- which is when
+        # you most want to know whether the loop is even turning.
+        period_s = (now_ns - self._last_loop_ns) / 1e9 if self._last_loop_ns else None
+        self._last_loop_ns = now_ns
+        if period_s is not None:
+            self._loop_period_s = (0.7 * self._loop_period_s + 0.3 * period_s
+                                   if self._loop_period_s else period_s)
+        if now_ns - self._last_diag_ns < 500_000_000:
+            return
+        self._last_diag_ns = now_ns
+        centre = self.camera_to_robot_center(T)
+        esdf_at_robot = self._esdf_at(esdf_map, centre)
+        msg = String()
+        msg.data = json.dumps({
+            # None rather than the sentinel: "no obstacle within the probe" is not a
+            # distance, and the UI should say so rather than print the probe length.
+            'frontClearanceM': (None if not np.isfinite(front_clearance)
+                                else round(float(front_clearance), 2)),
+            'frontBlocked': bool(front_clearance <= self.robot.front_blocked_m),
+            'frontBlockedAtM': round(float(self.robot.front_blocked_m), 2),
+            'obstacleCells': int(np.count_nonzero(obstacle_mask)),
+            'esdfAtRobotM': (None if not np.isfinite(esdf_at_robot)
+                             else round(float(esdf_at_robot), 2)),
+            'cycleS': (round(self._loop_period_s, 3) if self._loop_period_s else None),
+            'stampLagS': round(now_ns / 1e9 - stamp, 2),
+        }, separators=(',', ':'))
+        self.diag_pub.publish(msg)
+
     def _esdf_at(self, esdf_map, p):
         """Clearance under a world point, or nan if it is off the local grid."""
         i = int((p[0] - self.origin[0]) / self.resolution)
@@ -795,6 +837,11 @@ class PlanningNode(Node):
                 robot_z=T[2, 3], config=self.obstacle_config,
             )
             ESDF_map = distance_transform_edt(~obstacle_mask).astype(np.float32) * self.resolution
+            # Before the no-target return below, so the UI keeps reading a clearance
+            # while the robot is parked -- which is exactly when you want to know
+            # whether it thinks something is in front of it.
+            front_clearance = self._front_obstacle_dist(T, obstacle_mask)
+            self._publish_diagnostics(front_clearance, obstacle_mask, ESDF_map, T, stamp)
 
         with Timer(name='vis', text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=_TIMER_LOGGER):
             if _PUBLISH_ESDF_CLOUD:
@@ -948,7 +995,6 @@ class PlanningNode(Node):
             scores, occ_points = self._score_trajectories(trajectories, ESDF_map, params)
 
         with Timer(name='pub', text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=_TIMER_LOGGER):
-            front_clearance = self._front_obstacle_dist(T, obstacle_mask)
             front_blocked = front_clearance <= self.robot.front_blocked_m
 
             def cost_function(traj, param, score, target_pose):

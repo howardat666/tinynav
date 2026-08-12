@@ -33,6 +33,8 @@ class RelocWindow {
   final int droppedStale;
   final int skippedRateLimit;
   final double? successRate;
+  final double attemptHz;
+  final double successHz;
   final double spanS;
   final Map<String, int> byCode;
 
@@ -43,9 +45,15 @@ class RelocWindow {
     required this.droppedStale,
     required this.skippedRateLimit,
     required this.successRate,
+    required this.attemptHz,
+    required this.successHz,
     required this.spanS,
     required this.byCode,
   });
+
+  /// Keyframes per second, which is what says whether the front end is feeding
+  /// map_node fast enough. Reported as a count and a span, never as a rate.
+  double get keyframeHz => spanS > 0 ? keyframes / spanS : 0.0;
 
   factory RelocWindow.fromJson(Map<String, dynamic> j) => RelocWindow(
         keyframes: (j['keyframes'] as num?)?.toInt() ?? 0,
@@ -54,6 +62,8 @@ class RelocWindow {
         droppedStale: (j['dropped_stale'] as num?)?.toInt() ?? 0,
         skippedRateLimit: (j['skipped_rate_limit'] as num?)?.toInt() ?? 0,
         successRate: (j['successRate'] as num?)?.toDouble(),
+        attemptHz: (j['attemptHz'] as num?)?.toDouble() ?? 0.0,
+        successHz: (j['successHz'] as num?)?.toDouble() ?? 0.0,
         spanS: (j['spanS'] as num?)?.toDouble() ?? 0.0,
         byCode: (j['byCode'] as Map?)?.map(
               (k, v) => MapEntry(k.toString(), (v as num).toInt()),
@@ -248,6 +258,37 @@ class GridInfo {
       );
 }
 
+/// planning_node's per-cycle numbers, published at 2 Hz for the diagnostics panel.
+class PlanningDiag {
+  final double? frontClearanceM;
+  final bool frontBlocked;
+  final double frontBlockedAtM;
+  final int obstacleCells;
+  final double? esdfAtRobotM;
+  final double? cycleS;
+  final double? stampLagS;
+
+  const PlanningDiag({
+    this.frontClearanceM,
+    required this.frontBlocked,
+    required this.frontBlockedAtM,
+    required this.obstacleCells,
+    this.esdfAtRobotM,
+    this.cycleS,
+    this.stampLagS,
+  });
+
+  factory PlanningDiag.fromJson(Map<String, dynamic> j) => PlanningDiag(
+        frontClearanceM: (j['frontClearanceM'] as num?)?.toDouble(),
+        frontBlocked: j['frontBlocked'] as bool? ?? false,
+        frontBlockedAtM: (j['frontBlockedAtM'] as num?)?.toDouble() ?? 0.0,
+        obstacleCells: (j['obstacleCells'] as num?)?.toInt() ?? 0,
+        esdfAtRobotM: (j['esdfAtRobotM'] as num?)?.toDouble(),
+        cycleS: (j['cycleS'] as num?)?.toDouble(),
+        stampLagS: (j['stampLagS'] as num?)?.toDouble(),
+      );
+}
+
 class PlanningState {
   final bool localized;
   final Pose? odomPose;
@@ -262,6 +303,7 @@ class PlanningState {
   final TrajPoint? navTargetPose;
   final List<TrajPoint> footprint;
   final List<VoxelPoint> voxelPoints;
+  final PlanningDiag? diag;
 
   const PlanningState({
     required this.localized,
@@ -277,6 +319,7 @@ class PlanningState {
     this.navTargetPose,
     this.footprint = const [],
     this.voxelPoints = const [],
+    this.diag,
   });
 
   factory PlanningState.fromJson(Map<String, dynamic> j) {
@@ -327,6 +370,9 @@ class PlanningState {
           (m['z'] as num).toDouble(),
         );
       }).toList(),
+      diag: j['diag'] == null
+          ? null
+          : PlanningDiag.fromJson(j['diag'] as Map<String, dynamic>),
     );
   }
 }

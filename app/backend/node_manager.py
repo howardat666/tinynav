@@ -340,6 +340,7 @@ class BackendNode(Ros2NodeManager):
         self._control_pose: dict | None = None
         self._odom_pose_at_kf: dict | None = None  # odom pose snapshotted at last mapPose update
         self._map_pose: dict | None = None
+        self._planning_diag: dict | None = None
         self._localized: bool = False
         self._esdf_bytes: bytes = b''
         self._obstacle_bytes: bytes = b''
@@ -408,6 +409,7 @@ class BackendNode(Ros2NodeManager):
             )
             self.create_subscription(PointCloud, '/planning/footprint', self._on_footprint, 1)
             self.create_subscription(PointCloud2, '/planning/occupied_voxels', self._on_occupied_voxels, 1)
+            self.create_subscription(String, '/planning/diagnostics', self._on_planning_diag, 1)
 
             self._tf_buffer = tf2_ros.Buffer()
             self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
@@ -695,6 +697,15 @@ class BackendNode(Ros2NodeManager):
         with self._lock:
             self._global_path = pts
 
+    def _on_planning_diag(self, msg: String):
+        try:
+            diag = json.loads(msg.data)
+        except (ValueError, TypeError) as e:
+            self.get_logger().warn(f'bad /planning/diagnostics payload: {e}')
+            return
+        with self._lock:
+            self._planning_diag = diag
+
     def _on_footprint(self, msg: PointCloud):
         n = len(msg.points)
         if n == 0:
@@ -764,6 +775,57 @@ class BackendNode(Ros2NodeManager):
             [    2*(qx*qy + qw*qz), 1 - 2*(qx*qx + qz*qz),     2*(qy*qz - qw*qx)],
             [    2*(qx*qz - qw*qy),     2*(qy*qz + qw*qx), 1 - 2*(qx*qx + qy*qy)],
         ])
+
+    @classmethod
+    def _rot_to_quat(cls, R: np.ndarray) -> tuple[float, float, float, float]:
+        """Rotation matrix -> (qx, qy, qz, qw), branching on the largest diagonal so the
+        square root stays well conditioned near a 180 degree turn."""
+        t = float(np.trace(R))
+        if t > 0.0:
+            s = math.sqrt(t + 1.0) * 2.0
+            return ((R[2, 1] - R[1, 2]) / s, (R[0, 2] - R[2, 0]) / s,
+                    (R[1, 0] - R[0, 1]) / s, 0.25 * s)
+        i = int(np.argmax(np.diag(R)))
+        j, k = (i + 1) % 3, (i + 2) % 3
+        s = math.sqrt(1.0 + R[i, i] - R[j, j] - R[k, k]) * 2.0
+        q = [0.0, 0.0, 0.0]
+        q[i], q[j], q[k] = 0.25 * s, (R[j, i] + R[i, j]) / s, (R[k, i] + R[i, k]) / s
+        return (q[0], q[1], q[2], (R[k, j] - R[j, k]) / s)
+
+    @classmethod
+    def _extrapolated_map_pose(cls, map_kf: dict | None, odom_kf: dict | None,
+                               odom_now: dict | None) -> dict | None:
+        """The map pose carried forward to now on wheel odometry.
+
+        map_pose is recomputed once per keyframe, and the keyframe is already about a
+        second old when map_node gets to it: measured 2026-08-12 at 0.97 s median age
+        on top of a ~1 s keyframe interval, so the marker trailed the robot by 20-30 cm
+        at 0.22 m/s, always backwards. odom_pose_at_kf was snapshotted for exactly this
+        and had no consumer. Composes map_kf * inv(odom_kf) * odom_now.
+        """
+        if map_kf is None:
+            return None
+        if odom_kf is None or odom_now is None:
+            return map_kf
+        R_kf = cls._quat_to_rot(odom_kf['qx'], odom_kf['qy'], odom_kf['qz'], odom_kf['qw'])
+        R_now = cls._quat_to_rot(odom_now['qx'], odom_now['qy'], odom_now['qz'], odom_now['qw'])
+        R_map = cls._quat_to_rot(map_kf['qx'], map_kf['qy'], map_kf['qz'], map_kf['qw'])
+        p_kf = np.array([odom_kf['x'], odom_kf['y'], odom_kf['z']])
+        p_now = np.array([odom_now['x'], odom_now['y'], odom_now['z']])
+        # The motion since the keyframe, expressed in the keyframe's own body frame.
+        dR = R_kf.T @ R_now
+        dp = R_kf.T @ (p_now - p_kf)
+        R_out = R_map @ dR
+        p_out = np.array([map_kf['x'], map_kf['y'], map_kf['z']]) + R_map @ dp
+        qx, qy, qz, qw = cls._rot_to_quat(R_out)
+        fwd = R_out @ np.array([0.0, 0.0, 1.0])
+        return {
+            **map_kf,
+            'x': float(p_out[0]), 'y': float(p_out[1]), 'z': float(p_out[2]),
+            'qx': qx, 'qy': qy, 'qz': qz, 'qw': qw,
+            'yaw': math.atan2(float(fwd[1]), float(fwd[0])),
+            'timestamp': odom_now.get('timestamp', map_kf.get('timestamp')),
+        }
 
     def _transform_path_via_tf(self, path: list) -> list:
         """Transform map-frame path points to odom (world) frame via TF lookup.
@@ -1023,7 +1085,11 @@ class BackendNode(Ros2NodeManager):
                 # manual target, so all of them shift together.
                 'odom_pose': self._control_pose or self._odom_pose,
                 'odom_pose_at_kf': self._odom_pose_at_kf,
-                'map_pose': self._map_pose,
+                # Aged forward on odometry and moved to the control centre, so the
+                # marker sits where the chassis is rather than where the camera was a
+                # keyframe ago. See _extrapolated_map_pose.
+                'map_pose': self._to_control_centre(self._extrapolated_map_pose(
+                    self._map_pose, self._odom_pose_at_kf, self._odom_pose)),
                 'esdf_image': base64.b64encode(self._esdf_bytes).decode() if self._esdf_bytes else None,
                 'obstacle_image': base64.b64encode(self._obstacle_bytes).decode() if self._obstacle_bytes else None,
                 'trajectory': list(self._trajectory),
@@ -1033,6 +1099,9 @@ class BackendNode(Ros2NodeManager):
                 'nav_target_pose': self._nav_target_pose,
                 'footprint': list(self._footprint),
                 'voxel_points': list(self._voxel_points),
+                # front clearance / obstacle cells / cycle time, for the app's
+                # diagnostics panel. See planning_node._publish_diagnostics.
+                'diag': self._planning_diag,
             }
         snapshot['global_path'] = self._transform_path_via_tf(path_snapshot)
         return snapshot
@@ -1047,6 +1116,7 @@ class BackendNode(Ros2NodeManager):
         self._footprint = []
         self._voxel_points = []
         self._nav_target_pose = None
+        self._planning_diag = None
         # Latched on the wire, so without this a cancelled or restarted run would keep
         # reporting the previous run's arrival.
         self._poi_status = None

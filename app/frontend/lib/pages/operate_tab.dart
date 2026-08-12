@@ -45,6 +45,7 @@ class _OperateTabState extends ConsumerState<OperateTab> {
   bool _showFootprint = true;
   bool _localMapFill = false;
   bool _showLocal3d = false;
+  bool _showDebug = false;
 
   @override
   void initState() {
@@ -253,17 +254,32 @@ class _OperateTabState extends ConsumerState<OperateTab> {
             ],
           ),
         ),
-        // Unflexed on purpose: collapsed it is a ~32 px strip, and the Expanded
-        // sections above give up height only while it is open.
-        const DebugPanel(),
         const Divider(height: 1, thickness: 1, color: Color(0xFFE0E0E0)),
-        // ── Joystick panel (1/4) ──────────────────────────────────────
+        // ── Joystick / diagnostics (1/4) ──────────────────────────────
+        // One slot, two pages. The diagnostics need the full width to lay out three
+        // columns without scrolling, and the two are never wanted at the same time.
         Expanded(
           flex: 2,
-          child: _JoystickPanel(
-            onLeft: _onLeftJoystick,
-            onRight: _onRightJoystick,
-            onStop: _emergencyStop,
+          child: Stack(
+            children: [
+              Positioned.fill(
+                child: _showDebug
+                    ? const DebugPanel()
+                    : _JoystickPanel(
+                        onLeft: _onLeftJoystick,
+                        onRight: _onRightJoystick,
+                        onStop: _emergencyStop,
+                      ),
+              ),
+              Positioned(
+                top: 4,
+                right: 6,
+                child: _PageToggle(
+                  showDebug: _showDebug,
+                  onTap: () => setState(() => _showDebug = !_showDebug),
+                ),
+              ),
+            ],
           ),
         ),
       ],
@@ -795,6 +811,46 @@ class _Local3dPlanningViewState extends State<_Local3dPlanningView> {
           ],
         ),
       )
+    );
+  }
+}
+
+/// Swaps the bottom slot between the joystick and the diagnostics page.
+class _PageToggle extends StatelessWidget {
+  final bool showDebug;
+  final VoidCallback onTap;
+
+  const _PageToggle({required this.showDebug, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        decoration: BoxDecoration(
+          color: Colors.black54,
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: Colors.white12),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(showDebug ? Icons.gamepad_outlined : Icons.analytics_outlined,
+                size: 14, color: Colors.white70),
+            const SizedBox(width: 5),
+            Text(
+              showDebug ? 'JOYSTICK' : 'INFO',
+              style: const TextStyle(
+                color: Colors.white70,
+                fontSize: 10.5,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 0.8,
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }
