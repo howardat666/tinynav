@@ -851,3 +851,54 @@ points=39  path_len=3.98m  budget=2.2m  used=2.23m  index=23/38  robot_to_target
 
 ⚠️ **前端不要写中文**：CanvasKit 只用打包进去的字体、不回退系统字体，而打包的是 Roboto，
 任何中日韩字形都画成方块。要中文就得把 CJK 字体子集化进 assets，且每次改字符串都要重新子集化。
+
+## 20. 前视探针的横向盲缝：车身宽度内只查 3 列（2026-08-12）
+
+现象由用户报出：正前方放一个水杯，面板 `clearance 0.30 m at robot` 正确，
+`front obst` 却是 `clear`。
+
+`_clearance_along` 每次只采 **18 个格子** —— 前向 6 步 × 横向 3 条线：
+
+```python
+for w in (-hw, 0.0, hw):      # LeKiwi: hw = 0.20 m
+```
+
+前向步长 0.10 m 等于栅格分辨率，无缝。**横向三条线间距 0.20 m，是分辨率的两倍。**
+车心在栅格 `(49, 50)`，车身横跨 y 列 `48..52`，而探针只落在 `48 / 50 / 52` ——
+**`49` 和 `51` 两列，即中线左右各 0.10 m，从来没被检查过。**
+
+复现（`tool` 下无脚本，用 AST 抽出三个函数直接跑，几何取 `LEKIWI_CONFIG`）：
+
+| 水杯位置（相对车心） | 修复前 | 修复后 |
+|---|---|---|
+| 前 0.30 m，左 0.10 m | `front obst = clear`，ESDF 0.32 m | `front obst = 0.10 m` |
+| 车身宽度内的漏检数 | **40 处** | **0 处** |
+| 探针覆盖的格子 | 18（y 列 48/50/52） | 30（y 列 48–52 全覆盖） |
+
+### 为什么这不只是显示问题
+
+`front_clearance` 驱动 `front_blocked` 门，而 `front_blocked` 是 `_escape_reason`
+的第一个判据。漏检时：
+
+1. `front_blocked = False` → `_escape_reason` 返回 `""` → **原地转向逃逸不触发**
+2. 但轨迹打分用 ESDF（`hard_clearance = 0.30 m`，从车心算），水杯在 0.32 m
+   处，任何向前一格的轨迹都跌破阈值 → 全部判碰撞
+3. 结果是日志写 `gate=forward only` 而所有前进轨迹在碰撞 —— 车停在原地
+   不动也不转
+
+即"莫名停住"的一条独立成因，与第 15 节的规划延迟、第 18 节的路径折叠都不同。
+
+### 修法
+
+横向采样步长改为等于分辨率，在 `__init__` 里预计算（`_clearance_along`
+每周期被调用一次做前向走廊，再为每个逃逸转向候选各调一次）：
+
+```python
+self._probe_lateral_offsets = np.linspace(
+    -_probe_hw, _probe_hw,
+    max(1, int(round(2.0 * _probe_hw / self.resolution))) + 1,
+)
+```
+
+LeKiwi 得到 5 条线（−0.20/−0.10/0/+0.10/+0.20），GO2 得到 4 条
+（half_w = 0.15，间距仍是 0.10）。代价是内层循环 18 → 30 次数组索引。

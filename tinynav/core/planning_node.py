@@ -311,6 +311,14 @@ class PlanningNode(Node):
         # How far the forward probe looks. Past this it reports the
         # sentinel max+1.0, which is not a distance -- see _clearance_along.
         self.front_probe_max_m = 0.5
+        # One probe line per grid column across the hull, precomputed because
+        # _clearance_along runs once for the forward corridor and again for every escape
+        # turn candidate. See _clearance_along for what three lines missed.
+        _probe_fl, _probe_hw = self.robot.probe_geometry()
+        self._probe_lateral_offsets = np.linspace(
+            -_probe_hw, _probe_hw,
+            max(1, int(round(2.0 * _probe_hw / self.resolution))) + 1,
+        )
         self._last_loop_ns = 0
         self._loop_period_s = None
         # How long /control/target_pose must go quiet before proximity to it counts as
@@ -604,13 +612,19 @@ class PlanningNode(Node):
         Returns max_dist + 1.0 when the corridor is clear, which is a "nothing found"
         marker rather than a measured distance -- do not print it as one."""
         lx, ly = -fy, fx
-        fl, hw = self.robot.probe_geometry()
+        fl, _hw = self.robot.probe_geometry()
         rows, cols = obstacle_mask.shape
         steps = int(max_dist / self.resolution) + 1
+        # One line per grid column across the hull. Sampling only (-hw, 0, +hw) spaced the
+        # lines 0.20 m apart on a 0.10 m grid, so LeKiwi probed columns 48/50/52 of the
+        # five its own body covers: a cup one cell wide, 0.10 m off the centreline and
+        # 0.10 m clear of the hull, read as "clear" while the ESDF at the robot correctly
+        # reported 0.32 m. Reproduced 2026-08-12. The forward step already equals the
+        # resolution, so only the lateral axis had gaps.
         for step in range(steps):
             d_from_face = step * self.resolution
             d_from_center = fl + d_from_face
-            for w in (-hw, 0.0, hw):
+            for w in self._probe_lateral_offsets:
                 xi = int((center[0] + fx * d_from_center + lx * w - self.origin[0]) / self.resolution)
                 yi = int((center[1] + fy * d_from_center + ly * w - self.origin[1]) / self.resolution)
                 if 0 <= xi < rows and 0 <= yi < cols and obstacle_mask[xi, yi]:
