@@ -172,13 +172,40 @@ final previewStreamProvider =
   return connectLoop();
 });
 
+// The live /ws/planning socket and the local view's current mode. Module-level because
+// there is exactly one of each: the provider owns the socket, the local view owns the
+// button, and neither can watch the other without forcing a reconnect on every toggle.
+WebSocketChannel? _planningChannel;
+bool _planningWantVoxels = false;
+
+void _sendPlanningViewMode() {
+  // The backend defaults to "no voxels", so a send that misses -- socket still opening,
+  // already closed -- costs a stale 2D payload, not a broken view.
+  try {
+    _planningChannel?.sink.add(jsonEncode({'voxels': _planningWantVoxels}));
+  } catch (_) {}
+}
+
+/// Tell the backend whether the local view is in 3D, so it can skip the voxel cloud.
+void setLocalViewWantsVoxels(bool want) {
+  _planningWantVoxels = want;
+  _sendPlanningViewMode();
+}
+
 /// Streams PlanningState from WS /ws/planning at ~5 fps.
 final planningStreamProvider = StreamProvider<PlanningState>((ref) {
   final ip = ref.watch(deviceIpProvider);
   if (ip == null) return const Stream.empty();
 
   final channel = WebSocketChannel.connect(Uri.parse('ws://$ip:8000/ws/planning'));
-  ref.onDispose(() => channel.sink.close());
+  _planningChannel = channel;
+  // Re-announce on every connect: the backend forgets the mode when the socket drops,
+  // and this provider rebuilds whenever the device IP changes.
+  channel.ready.then((_) => _sendPlanningViewMode()).catchError((_) {});
+  ref.onDispose(() {
+    if (identical(_planningChannel, channel)) _planningChannel = null;
+    channel.sink.close();
+  });
 
   return channel.stream.map(
     (data) => PlanningState.fromJson(jsonDecode(data as String) as Map<String, dynamic>),

@@ -228,6 +228,22 @@ async def ws_map_update(ws: WebSocket):
 # /ws/planning  — polls planning snapshot at 5 fps                            #
 # --------------------------------------------------------------------------- #
 
+async def _planning_view_mode_reader(ws: WebSocket, node):
+    """Read {"voxels": bool} from the client for as long as it keeps talking.
+
+    The socket used to be send-only. Reading on it is what lets the local view's 2D/3D
+    button reach the publisher without reconnecting -- a reconnect would blank the view
+    for the length of the retry, on a control page, to save bandwidth.
+    """
+    try:
+        while True:
+            msg = json.loads(await ws.receive_text())
+            if isinstance(msg, dict) and 'voxels' in msg:
+                node.set_want_voxels(bool(msg['voxels']))
+    except (WebSocketDisconnect, json.JSONDecodeError, KeyError, RuntimeError):
+        pass
+
+
 @router.websocket('/ws/planning')
 async def ws_planning(ws: WebSocket):
     await ws.accept()
@@ -235,6 +251,10 @@ async def ws_planning(ws: WebSocket):
     if node is None:
         await ws.close(code=1013)
         return
+    # Counted, not just flagged: planning_node stops producing the local-view layers
+    # while this is zero, so a second browser must not switch them off for the first.
+    node.ui_client_attach()
+    reader = asyncio.create_task(_planning_view_mode_reader(ws, node))
     try:
         while True:
             snapshot = _clear_stopped_nav_snapshot(node.get_planning_snapshot())
@@ -243,6 +263,9 @@ async def ws_planning(ws: WebSocket):
             await asyncio.sleep(0.2)
     except WebSocketDisconnect:
         pass
+    finally:
+        reader.cancel()
+        node.ui_client_detach()
 
 
 # --------------------------------------------------------------------------- #

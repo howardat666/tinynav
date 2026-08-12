@@ -196,7 +196,13 @@ class _OperateTabState extends ConsumerState<OperateTab> {
                         children: [
                           _LocalViewModeButton(
                             show3d: _showLocal3d,
-                            onTap: () => setState(() => _showLocal3d = !_showLocal3d),
+                            onTap: () {
+                              setState(() => _showLocal3d = !_showLocal3d);
+                              // The voxel cloud is 78% of this socket's bytes and is
+                              // drawn only in 3D, so the backend stops sending it -- and
+                              // planning_node stops publishing it -- while this is off.
+                              setLocalViewWantsVoxels(_showLocal3d);
+                            },
                           ),
                           const SizedBox(width: 6),
                           _LocalMapScaleButton(

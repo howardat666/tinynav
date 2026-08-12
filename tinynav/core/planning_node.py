@@ -21,7 +21,7 @@ from rclpy.duration import Duration
 from sensor_msgs.msg import PointCloud2, PointCloud
 from geometry_msgs.msg import PoseStamped, Point32
 import sensor_msgs_py.point_cloud2 as pc2
-from std_msgs.msg import Header, String
+from std_msgs.msg import Bool, Header, String
 from codetiming import Timer
 import cv2
 from tinynav.core.math_utils import quat_to_matrix, matrix_to_quat, pose_msg2np
@@ -75,6 +75,8 @@ _FOOTPRINT_OUTLINE = os.environ.get('TINYNAV_FOOTPRINT_OUTLINE', '0') == '1'
 # One switch because they are one feature -- see the publish site for why grid_info ties
 # them together. ON by default: the previous default of off left the UI blank, which read
 # as "the frontend is broken" rather than "the publishes are disabled".
+# This env var is the ceiling, not the switch: /planning/ui_active gates it at runtime,
+# so an unattended robot skips the work without anyone having to set anything.
 _PUBLISH_PLANNING_OVERLAYS = os.environ.get('TINYNAV_PUBLISH_PLANNING_OVERLAYS', '1') == '1'
 
 # Pose topics whose stamps are byte-identical to the image stamps, so exact-stamp
@@ -349,6 +351,26 @@ class PlanningNode(Node):
 
         self.poi_change_sub = self.create_subscription(Odometry, "/mapping/poi_change", self.poi_change_callback, 10)
 
+        # Whether a browser is actually looking at the local view. The overlay layers and
+        # the voxel cloud exist only to be drawn, and together they measured 25.9 ms of a
+        # 250 ms cycle -- the single largest stage -- so an unattended robot pays a tenth
+        # of its planning budget to render for nobody.
+        #
+        # A latched Bool rather than get_subscription_count(): node_manager subscribes for
+        # the whole life of the backend regardless of who is connected, so the count is
+        # always 1 and says nothing. Latched so a planning_node restarted mid-session
+        # inherits the current answer instead of guessing.
+        #
+        # Defaults to True, and stays True if node_manager never publishes: the failure
+        # mode of guessing wrong is a blank local view, and that reads as a broken
+        # frontend rather than as a disabled publish -- the same trap the env var above
+        # was moved off of.
+        self._ui_active = True
+        self.create_subscription(
+            Bool, '/planning/ui_active', self._ui_active_callback,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+        )
+
         self._traj_warmup_done = threading.Event()
         self._traj_warmup_ms = None
         self._start_trajectory_warmup()
@@ -413,6 +435,14 @@ class PlanningNode(Node):
         # When the target last arrived, which is what separates "standing on a rolling
         # waypoint" from "the run is over". See the arrival test in the planning loop.
         self._last_target_rx_ns = self.get_clock().now().nanoseconds
+
+    def _ui_active_callback(self, msg: Bool):
+        if bool(msg.data) != self._ui_active:
+            self._ui_active = bool(msg.data)
+            self.get_logger().info(
+                f"local-view publishes {'on' if self._ui_active else 'off'} "
+                f"({'a client is watching' if self._ui_active else 'nobody is watching'})"
+            )
 
     def info_callback(self, msg):
         if self.K is None:
@@ -835,7 +865,11 @@ class PlanningNode(Node):
             # (docs/x5/servo_bus.md) make memory bandwidth a suspect in its own right.
             np.clip(self.occupancy_grid, -0.2, 0.2, out=self.occupancy_grid)
 
-            self.publish_3d_occupancy_cloud(self.occupancy_grid, self.resolution, self.origin)
+            # Nothing but the app's 3D local view consumes this, so it follows the same
+            # gate as the overlays below rather than get_subscription_count() -- see
+            # _ui_active for why the count cannot answer the question.
+            if self._ui_active:
+                self.publish_3d_occupancy_cloud(self.occupancy_grid, self.resolution, self.origin)
 
         with Timer(name='obstacle map', text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=_TIMER_LOGGER):
             obstacle_mask = build_obstacle_map(
@@ -871,7 +905,7 @@ class PlanningNode(Node):
             # decides the fix. If one dominates it can be made cheaper on its own; if the
             # cost is spread evenly the only answer is to stop producing them when no UI
             # client is looking, which is a much bigger change.
-            if _PUBLISH_PLANNING_OVERLAYS:
+            if _PUBLISH_PLANNING_OVERLAYS and self._ui_active:
                 with Timer(name='vis:mask', text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=_TIMER_LOGGER):
                     self.publish_obstacle_mask(obstacle_mask, depth_msg.header.stamp)
                 with Timer(name='vis:heightmap', text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=_TIMER_LOGGER):
