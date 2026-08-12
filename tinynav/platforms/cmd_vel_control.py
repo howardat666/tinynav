@@ -208,10 +208,16 @@ class CmdVelControlNode(Node):
         self._track_idx = 0
         self._last_traj_update_sec = None
         self._last_traj_log_sec = None
+        # Its own throttle. Sharing _last_traj_log_sec meant a stale warning every cycle
+        # starved the accepted/ignored line, and nav_health then read "0 fresh / 54
+        # stale" -- which says the paths were rejected, when none of them were.
+        self._last_stale_log_sec = None
         self._last_zero_log_sec = {}
         self._last_cmd_log_sec = None
         self._time_lookahead_s = 0.15
         self._trajectory_expire_grace_s = 0.05
+        # Well under the 3 s trajectory span, well over the sensing latency.
+        self._path_lag_warn_s = 1.0
         self._vx_gain_comp = 1.2
 
         # The pose this controller closes its loop on. A parameter rather than a
@@ -297,14 +303,15 @@ class CmdVelControlNode(Node):
         if msg.poses and self._odom_stamp_sec is not None:
             path_start_sec = msg.poses[0].header.stamp.sec + msg.poses[0].header.stamp.nanosec * 1e-9
             path_lag_s = self._odom_stamp_sec - path_start_sec
-            # Rate-limited like every other log here. This is a *warning*, not a
-            # rejection -- the path is still accepted below. It fires whenever
-            # planning's fixed planning_latency_s lookahead undershoots the real
-            # planning time, which on a loaded board it routinely does.
-            if path_lag_s > 0.0 and (
-                self._last_traj_log_sec is None or now - self._last_traj_log_sec >= 1.0
+            # A warning, not a rejection -- the path is still accepted below, and this
+            # controller indexes it by wall clock, so a start stamp in the past is
+            # normal and self-correcting. Planning anchors the path at the depth frame's
+            # capture time, so a lag equal to the sensing latency (~0.37 s measured) is
+            # the healthy case; only a lag large enough to eat the 3 s span is news.
+            if path_lag_s > self._path_lag_warn_s and (
+                self._last_stale_log_sec is None or now - self._last_stale_log_sec >= 1.0
             ):
-                self._last_traj_log_sec = now
+                self._last_stale_log_sec = now
                 self.logger.warning(
                     f"received stale /planning/trajectory_path: first pose stamp is "
                     f"{path_lag_s:.3f}s behind latest {self._pose_topic} "

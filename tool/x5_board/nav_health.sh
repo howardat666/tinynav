@@ -109,9 +109,12 @@ if [ -n "$c" ]; then
   tot=$(recent "$c" | grep -c "sent cmd_vel")
   nz=$(recent "$c" | grep "sent cmd_vel" | grep -vc "vx=0.000 vyaw=0.000")
   acc=$(recent "$c" | grep -c "accepted")
-  stale=$(recent "$c" | grep -c "stale")
+  ign=$(recent "$c" | grep -c "ignored")
+  # "stale" is a lag *warning*; the path is still accepted. Reporting it next to
+  # "fresh" read as a rejection count and sent two sessions chasing a non-problem.
+  stale=$(recent "$c" | grep -c "received stale")
   exp=$(recent "$c" | grep -c "trajectory expired")
-  echo "   cmd_vel: $nz/$tot non-zero   trajectory: $acc fresh / $stale stale   expired: $exp"
+  echo "   cmd_vel: $nz/$tot non-zero   trajectory: $acc accepted / $ign ignored   expired: $exp   lag-warnings: $stale"
   [ "$nz" = "0" ] && echo "   !! robot is commanded to stand still"
 fi
 

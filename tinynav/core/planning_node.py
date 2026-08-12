@@ -298,23 +298,10 @@ class PlanningNode(Node):
 
         self.smoothed_velocity = 0.0
         self.dt = 0.1
-        self.planning_latency_s = 0.2
-        # The seed is a prediction fed back as the next prediction's start state; this
-        # bound is the only place the measurement enters. At 2.0 m the loop was open and
-        # the estimate drifted 1.3 m unchallenged. 0.5 m still let it sit at 0.31 m median
-        # while driving (2026-08-12) -- past the 0.20 m hull, so collisions were being
-        # scored off a pose the robot was not at. Now under the hull radius.
-        self.seed_fallback_distance_m = 0.15
         self.target_reached_distance_m = 0.15
-        self.last_planned_traj = None
-        self.last_planned_traj_base_stamp = None
-        # A static path only records where the last cycle *believed* the robot was;
-        # seeding from it locks the estimate and the robot never moves again.
-        self.last_planned_traj_is_static = True
         self._last_static_log_ns = {}
         self._last_target_rx_ns = 0
         self._last_cycle_ns = 0
-        self._seed_debug = (0.0, 0, 0.0)
         # How long /control/target_pose must go quiet before proximity to it counts as
         # arrival rather than as passing over a waypoint. map_node republishes roughly
         # once a second while it is navigating and stops entirely once the POI list is
@@ -707,36 +694,6 @@ class PlanningNode(Node):
             return float(esdf_map[i, j])
         return float('nan')
 
-    def _seed_from_last_trajectory(self, query_stamp):
-        if self.last_planned_traj is None or self.last_planned_traj_base_stamp is None:
-            return None
-        if self.last_planned_traj_is_static:
-            # See last_planned_traj_is_static.
-            return None
-        traj = self.last_planned_traj
-        if len(traj) < 1:
-            return None
-        rel_t = query_stamp - self.last_planned_traj_base_stamp
-        if rel_t < 0.0:
-            return None
-        traj_end_stamp = self.last_planned_traj_base_stamp + float(len(traj) - 1) * self.dt
-        if query_stamp > traj_end_stamp:
-            return None
-        idx = int(round(rel_t / self.dt))
-        idx = max(0, min(idx, len(traj) - 1))
-        seed_stamp = self.last_planned_traj_base_stamp + float(idx) * self.dt
-        p = traj[idx, :3].copy()
-        q = traj[idx, 3:7].copy()
-        if len(traj) == 1:
-            v = np.zeros(3, dtype=np.float64)
-        elif idx < len(traj) - 1:
-            v = (traj[idx + 1, :3] - traj[idx, :3]) / self.dt
-        else:
-            v = (traj[idx, :3] - traj[idx - 1, :3]) / self.dt
-        v = np.asarray(v, dtype=np.float64)
-        self._seed_debug = (rel_t, idx, seed_stamp)
-        return p, v, q, seed_stamp
-
     def _make_static_path(self, init_p, init_q, header, base_time, num_steps):
         """Build a fresh zero-motion path so controllers receive an explicit stop."""
         path = Path()
@@ -762,11 +719,8 @@ class PlanningNode(Node):
             path.poses.append(pose)
         return path, static_traj
 
-    def _publish_static_path(self, init_p, init_q, header, base_time, base_stamp, num_steps, reason, log_key=None):
-        path, static_traj = self._make_static_path(init_p, init_q, header, base_time, num_steps)
-        self.last_planned_traj = static_traj.copy()
-        self.last_planned_traj_base_stamp = base_stamp
-        self.last_planned_traj_is_static = True
+    def _publish_static_path(self, init_p, init_q, header, base_time, num_steps, reason, log_key=None):
+        path, _ = self._make_static_path(init_p, init_q, header, base_time, num_steps)
         self.path_pub.publish(path)
 
         now_ns = self.get_clock().now().nanoseconds
@@ -874,46 +828,27 @@ class PlanningNode(Node):
             #self.publish_2d_occupancy_grid(ESDF_map, self.origin, self.resolution, depth_msg.header.stamp, z_offset=self.grid_shape[2]*self.resolution/2)
 
         with Timer(name='traj gen', text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=_TIMER_LOGGER):
-            query_stamp = stamp + self.planning_latency_s
-            seed = self._seed_from_last_trajectory(query_stamp)
-            planning_base_stamp = stamp
-            measured_center = self.camera_to_robot_center(T)
-            self._seed_error_m = 0.0
-            if seed is not None:
-                init_p_seed, init_v_seed, init_q_seed, seed_stamp = seed
-                self._seed_error_m = float(np.linalg.norm(init_p_seed[:2] - measured_center[:2]))
-                if self._seed_error_m <= self.seed_fallback_distance_m:
-                    init_p, init_v, init_q = init_p_seed, init_v_seed, init_q_seed
-                    planning_base_stamp = seed_stamp
-                else:
-                    # Prediction vs wheels: the quantity that silently reached 1.3 m.
-                    now_ns = self.get_clock().now().nanoseconds
-                    if now_ns - self._last_static_log_ns.get("seed_reject", 0) >= 1_000_000_000:
-                        self._last_static_log_ns["seed_reject"] = now_ns
-                        self.get_logger().warning(
-                            f"seed rejected: prediction is {self._seed_error_m:.2f}m from the "
-                            f"measured pose (limit {self.seed_fallback_distance_m:.2f}m) -- "
-                            "replanning from the measurement"
-                        )
-                    seed = None
-            if seed is None:
-                v_dir = T[:3, :3] @ np.array([0, 0, 1])
-                magnitude = np.clip(self.smoothed_velocity, 0.05, 0.5)
-                init_v = v_dir * float(magnitude)
-                init_p = self.camera_to_robot_center(T)
-                init_q = np.array([
-                    pose_msg.pose.orientation.x,
-                    pose_msg.pose.orientation.y,
-                    pose_msg.pose.orientation.z,
-                    pose_msg.pose.orientation.w,
-                ])
+            # Straight from the wheels, like upstream main. This used to seed from the
+            # previous cycle's own trajectory to cover the sensing latency, but that fed
+            # each prediction into the next with no feedback: measured 2026-08-12 at a
+            # 0.29 m median offset while driving, and unbounded in yaw because the
+            # fallback compared positions only, which an in-place turn never changes.
+            # cmd_vel_control already indexes the path by wall clock, so the latency is
+            # compensated there, downstream, where a stale start is self-correcting.
+            init_p = self.camera_to_robot_center(T)
+            init_q = np.array([
+                pose_msg.pose.orientation.x,
+                pose_msg.pose.orientation.y,
+                pose_msg.pose.orientation.z,
+                pose_msg.pose.orientation.w,
+            ])
             self.last_T = T
             self.last_stamp = stamp
-            base_time = Time(seconds=planning_base_stamp)
+            base_time = Time(seconds=stamp)
             static_steps = max(2, int(round(2.0 / self.dt)) + 1)
             if self.target_pose is None:
                 self._publish_static_path(
-                    init_p, init_q, depth_msg.header, base_time, planning_base_stamp, static_steps,
+                    init_p, init_q, depth_msg.header, base_time, static_steps,
                     "No target pose"
                 )
                 return
@@ -970,7 +905,7 @@ class PlanningNode(Node):
                     and target_idle_s >= self.target_idle_arrival_s):
                 self.target_pose = None
                 self._publish_static_path(
-                    init_p, init_q, depth_msg.header, base_time, planning_base_stamp, static_steps,
+                    init_p, init_q, depth_msg.header, base_time, static_steps,
                     f"Target pose reached (xy_dist={target_dist_xy:.3f}m, target idle {target_idle_s:.1f}s)",
                     log_key="Target pose reached"
                 )
@@ -990,10 +925,9 @@ class PlanningNode(Node):
                 self.get_logger().info(
                     f"navigating: ground_dist_xy={target_dist_xy:.3f}m "
                     f"(threshold {self.target_reached_distance_m:.2f}m) "
+                    # One position now: planned-from and measured are the same thing
+                    # since the trajectory seed went away.
                     f"robot=[{init_p[0]:.2f},{init_p[1]:.2f},{init_p[2]:.2f}] "
-                    # Measured next to planned-from: a stall between them reads as arrival.
-                    f"measured=[{measured_center[0]:.2f},{measured_center[1]:.2f},{measured_center[2]:.2f}] "
-                    f"seed_err={self._seed_error_m:.2f}m "
                     f"target=[{target_pose[0]:.2f},{target_pose[1]:.2f},{target_pose[2]:.2f}]"
                 )
 
@@ -1039,7 +973,7 @@ class PlanningNode(Node):
 
             if self.target_pose is None:
                 self._publish_static_path(
-                    init_p, init_q, depth_msg.header, base_time, planning_base_stamp, len(trajectories[0]),
+                    init_p, init_q, depth_msg.header, base_time, len(trajectories[0]),
                     "No target pose"
                 )
                 return
@@ -1047,7 +981,7 @@ class PlanningNode(Node):
             n_blocked = int(sum(1 for s in scores if s == float('inf')))
             if n_blocked == len(scores):
                 self._publish_static_path(
-                    init_p, init_q, depth_msg.header, base_time, planning_base_stamp, len(trajectories[0]),
+                    init_p, init_q, depth_msg.header, base_time, len(trajectories[0]),
                     f"All {len(scores)} trajectories in collision "
                     f"(front_clearance={self._fmt_clearance(front_clearance)}, gate="
                     f"{'turn only' if front_blocked else 'forward only'}, "
@@ -1091,7 +1025,7 @@ class PlanningNode(Node):
             # banned reverse -- whenever every ungated option is in collision.
             if len(admissible) == 0 or (front_blocked and not turns):
                 self._publish_static_path(
-                    init_p, init_q, depth_msg.header, base_time, planning_base_stamp, len(trajectories[0]),
+                    init_p, init_q, depth_msg.header, base_time, len(trajectories[0]),
                     f"No admissible motion: {n_blocked}/{len(scores)} in collision and the rest "
                     f"gated (front_clearance={self._fmt_clearance(front_clearance)}, "
                     f"gate={'turn only' if front_blocked else 'forward only'}, "
@@ -1133,17 +1067,11 @@ class PlanningNode(Node):
                     # be read for whether the z band and dilation did what they claim.
                     f"obstacle_cells={int(np.count_nonzero(obstacle_mask))} "
                     f"esdf_at_robot={self._esdf_at(ESDF_map, init_p):.2f}m "
-                    f"seed={'used' if seed is not None else 'rejected'} seed_err={self._seed_error_m:.2f}m "
-                    f"seed_rel_t={self._seed_debug[0]:.2f}s idx={self._seed_debug[1]} "
-                    f"seed_ahead={self._seed_debug[2] - stamp:+.2f}s "
                     f"yaw={math.degrees(yaw_now):+.0f}deg to_target={math.degrees(yaw_to_target):+.0f}deg "
                     f"heading_err={math.degrees(self._wrap(yaw_to_target - yaw_now)):+.0f}deg "
                     f"cycle={cycle_s:.2f}s stamp_lag={(now_ns / 1e9 - stamp):.2f}s"
                 )
             self._last_cycle_ns = now_ns
-            self.last_planned_traj = trajectories[best_idx].copy()
-            self.last_planned_traj_base_stamp = planning_base_stamp
-            self.last_planned_traj_is_static = False
 
             for i in top_indices:
                 for j in range(0, len(trajectories[i]), 1):
