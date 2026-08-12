@@ -311,14 +311,6 @@ class PlanningNode(Node):
         # How far the forward probe looks. Past this it reports the
         # sentinel max+1.0, which is not a distance -- see _clearance_along.
         self.front_probe_max_m = 0.5
-        # One probe line per grid column across the hull, precomputed because
-        # _clearance_along runs once for the forward corridor and again for every escape
-        # turn candidate. See _clearance_along for what three lines missed.
-        _probe_fl, _probe_hw = self.robot.probe_geometry()
-        self._probe_lateral_offsets = np.linspace(
-            -_probe_hw, _probe_hw,
-            max(1, int(round(2.0 * _probe_hw / self.resolution))) + 1,
-        )
         self._last_loop_ns = 0
         self._loop_period_s = None
         # How long /control/target_pose must go quiet before proximity to it counts as
@@ -611,25 +603,46 @@ class PlanningNode(Node):
 
         Returns max_dist + 1.0 when the corridor is clear, which is a "nothing found"
         marker rather than a measured distance -- do not print it as one."""
-        lx, ly = -fy, fx
-        fl, _hw = self.robot.probe_geometry()
-        rows, cols = obstacle_mask.shape
-        steps = int(max_dist / self.resolution) + 1
-        # One line per grid column across the hull. Sampling only (-hw, 0, +hw) spaced the
-        # lines 0.20 m apart on a 0.10 m grid, so LeKiwi probed columns 48/50/52 of the
-        # five its own body covers: a cup one cell wide, 0.10 m off the centreline and
-        # 0.10 m clear of the hull, read as "clear" while the ESDF at the robot correctly
-        # reported 0.32 m. Reproduced 2026-08-12. The forward step already equals the
-        # resolution, so only the lateral axis had gaps.
-        for step in range(steps):
-            d_from_face = step * self.resolution
-            d_from_center = fl + d_from_face
-            for w in self._probe_lateral_offsets:
-                xi = int((center[0] + fx * d_from_center + lx * w - self.origin[0]) / self.resolution)
-                yi = int((center[1] + fy * d_from_center + ly * w - self.origin[1]) / self.resolution)
-                if 0 <= xi < rows and 0 <= yi < cols and obstacle_mask[xi, yi]:
-                    return d_from_face
-        return max_dist + 1.0
+        fl, hw = self.robot.probe_geometry()
+        # Project every obstacle cell onto the heading, rather than sampling points along
+        # it. Sampling cannot be made gap-free at any density: the sample lattice rotates
+        # with the robot while the grid does not, so at an oblique heading a step of one
+        # cell skips cells diagonally. Measured 2026-08-12 -- three lines at (-hw, 0, +hw)
+        # missed 40 placements inside the hull's own width even head-on, and one line per
+        # grid column still missed 4 of 20 in-corridor cells at 55 deg, the worst of them
+        # 0.03 m past the hull face. This has no sampling in it, so it cannot have holes.
+        #
+        # Windowed to what the corridor can reach first. Projecting is O(obstacle cells)
+        # where sampling was O(steps x lines), and on the X5 the whole 100x100 mask cost
+        # 3.4 ms when every cell was an obstacle against 0.19 ms for the sampled loop --
+        # times ~16 calls a cycle. The window is at most ~15x15 cells, so the cost stops
+        # depending on how cluttered the rest of the 10x10 m grid is.
+        reach = fl + max_dist
+        i0 = max(0, int((center[0] - reach - self.origin[0]) / self.resolution))
+        j0 = max(0, int((center[1] - reach - self.origin[1]) / self.resolution))
+        i1 = min(obstacle_mask.shape[0],
+                 int((center[0] + reach - self.origin[0]) / self.resolution) + 2)
+        j1 = min(obstacle_mask.shape[1],
+                 int((center[1] + reach - self.origin[1]) / self.resolution) + 2)
+        if i0 >= i1 or j0 >= j1:
+            return max_dist + 1.0
+        oi, oj = np.nonzero(obstacle_mask[i0:i1, j0:j1])
+        if oi.size == 0:
+            return max_dist + 1.0
+        dx = self.origin[0] + (oi + i0 + 0.5) * self.resolution - center[0]
+        dy = self.origin[1] + (oj + j0 + 0.5) * self.resolution - center[1]
+        along = dx * fx + dy * fy
+        lateral = dx * -fy + dy * fx
+        # Half a cell of slack on the width: `lateral` is measured to the cell's centre,
+        # and a cell whose centre sits just outside the corridor still overlaps it. The old
+        # code counted such cells too -- its +-hw sample point landed in them -- so this
+        # keeps the corridor the same width rather than quietly narrowing it, and leaves
+        # front_blocked_m meaning what it was tuned to mean.
+        in_corridor = (np.abs(lateral) <= hw + 0.5 * self.resolution) & (along >= fl)
+        if not np.any(in_corridor):
+            return max_dist + 1.0
+        d_from_face = float(np.min(along[in_corridor])) - fl
+        return d_from_face if d_from_face <= max_dist else max_dist + 1.0
 
     def _front_obstacle_dist(self, T, obstacle_mask, max_dist=0.5):
         """Clearance in the corridor the robot is currently facing."""
