@@ -247,6 +247,11 @@ def _bridge_argv(*, for_map_build: bool = False) -> list[str]:
         '--pose-topic', pose_topic,
         '--sync-queue-size', queue_size,
         '--sync-window-s', sync_window_s,
+        # Only build_map_node consumes /slam/keyframe_depth, and this process starts
+        # before it does, so the build gets 'always' and cannot lose a keyframe to the
+        # discovery window. Navigation gets 'auto', where nothing subscribes and the
+        # decode is skipped outright.
+        '--keyframe-depth', 'always' if for_map_build else 'auto',
     ]
 
 

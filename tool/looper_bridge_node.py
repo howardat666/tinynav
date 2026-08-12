@@ -182,6 +182,20 @@ class LooperBridgeNode(Node):
         )
         self.keyframe_image_pub = self.create_publisher(Image, "/slam/keyframe_image", 10)
         self.keyframe_depth_pub = self.create_publisher(Image, "/slam/keyframe_depth", 10)
+        # /slam/keyframe_depth has no navigation-time consumer: map_node deliberately does
+        # not subscribe (its keyframe_callback takes image and odom only) and build_map_node
+        # is not running during a drive. Producing it anyway costs a mono16 -> float32
+        # conversion over 544x640 plus a 1.39 MB message, per keyframe, in the callback
+        # whose latency decides whether map_node accepts the keyframe at all.
+        #
+        # 'always' for a map build and 'auto' for navigation, rather than the subscription
+        # count alone: node_manager launches this node *before* build_map_node, so during
+        # the discovery window the count is legitimately 0 while the bag is already
+        # playing, and every keyframe published without its depth partner is one that
+        # build_map_node's exact-stamp synchroniser can never match -- a silent hole at the
+        # start of every map. The count still gates 'auto', so attaching rviz mid-drive
+        # works.
+        self.keyframe_depth_mode = args.keyframe_depth
 
         self.get_logger().info(
             f"Bridging {args.pose_topic} + /camera/camera/depth/image_rect_raw + "
@@ -382,9 +396,16 @@ class LooperBridgeNode(Node):
         # hoisted for anything below to become conditional on it.
         is_keyframe = self.should_add_keyframe(T_world_camera, stamp)
 
+        # Checked before the decode, not just before the publish: the float32 conversion is
+        # the expensive half. See keyframe_depth_mode for why 'auto' is not the default.
+        want_keyframe_depth = is_keyframe and (
+            self.keyframe_depth_mode == 'always'
+            or self.keyframe_depth_pub.get_subscription_count() > 0
+        )
+
         # Decoded at most once per callback, and only when something will read it.
         depth_m = None
-        if is_keyframe or self.disparity_pub_vis is not None:
+        if want_keyframe_depth or self.disparity_pub_vis is not None:
             depth_m = self.decode_depth_meters(depth_msg)
 
         camera_info_out = copy.deepcopy(self.cached_camera_info)
@@ -409,7 +430,8 @@ class LooperBridgeNode(Node):
             image_out.header.frame_id = "camera"
             self.keyframe_pose_visual_pub.publish(self.make_odom_msg(T_world_camera, stamp))
             self.keyframe_image_pub.publish(image_out)
-            self.keyframe_depth_pub.publish(self.build_depth_msg(depth_m, stamp))
+            if want_keyframe_depth:
+                self.keyframe_depth_pub.publish(self.build_depth_msg(depth_m, stamp))
             self.last_keyframe_pose = T_world_camera.copy()
             self.last_keyframe_time = self.stamp_to_sec(stamp)
 
@@ -425,6 +447,13 @@ def parse_args():
     parser.add_argument("--keyframe-translation", type=float, default=0.03)
     parser.add_argument("--keyframe-rotation-deg", type=float, default=1.0)
     parser.add_argument("--keyframe-static-interval", type=float, default=1.0)
+    parser.add_argument(
+        "--keyframe-depth", choices=("always", "auto"), default="always",
+        help="Whether to produce /slam/keyframe_depth. 'auto' skips it -- decode "
+             "included -- while nothing is subscribed, which during navigation is "
+             "always. Defaults to 'always' so a hand-launched map build cannot lose "
+             "depth to a discovery race; see keyframe_depth_mode.",
+    )
     parser.add_argument(
         "--pose-topic",
         default="/camera/camera/vio_image",
