@@ -125,8 +125,11 @@ class DebugPanel extends ConsumerWidget {
     }
     final fc = d.frontClearanceM;
     return [
+      // "nothing within the probe" is not a distance; see _clearance_along.
       _Row('front obst',
-          fc == null ? '> probe range' : '${fc.toStringAsFixed(2)} m',
+          fc == null
+              ? 'clear (> ${d.frontProbeMaxM.toStringAsFixed(2)} m)'
+              : '${fc.toStringAsFixed(2)} m',
           color: d.frontBlocked ? _kBad : (fc != null && fc < 0.5 ? _kWarn : _kValue)),
       _Row('blocked at', '${d.frontBlockedAtM.toStringAsFixed(2)} m'
           '${d.frontBlocked ? '   BLOCKED' : ''}',

@@ -263,6 +263,7 @@ class PlanningDiag {
   final double? frontClearanceM;
   final bool frontBlocked;
   final double frontBlockedAtM;
+  final double frontProbeMaxM;
   final int obstacleCells;
   final double? esdfAtRobotM;
   final double? cycleS;
@@ -272,6 +273,7 @@ class PlanningDiag {
     this.frontClearanceM,
     required this.frontBlocked,
     required this.frontBlockedAtM,
+    required this.frontProbeMaxM,
     required this.obstacleCells,
     this.esdfAtRobotM,
     this.cycleS,
@@ -282,6 +284,7 @@ class PlanningDiag {
         frontClearanceM: (j['frontClearanceM'] as num?)?.toDouble(),
         frontBlocked: j['frontBlocked'] as bool? ?? false,
         frontBlockedAtM: (j['frontBlockedAtM'] as num?)?.toDouble() ?? 0.0,
+        frontProbeMaxM: (j['frontProbeMaxM'] as num?)?.toDouble() ?? 0.5,
         obstacleCells: (j['obstacleCells'] as num?)?.toInt() ?? 0,
         esdfAtRobotM: (j['esdfAtRobotM'] as num?)?.toDouble(),
         cycleS: (j['cycleS'] as num?)?.toDouble(),

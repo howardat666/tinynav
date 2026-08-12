@@ -306,6 +306,9 @@ class PlanningNode(Node):
         self._last_target_rx_ns = 0
         self._last_cycle_ns = 0
         self._last_diag_ns = 0
+        # How far the forward probe looks. Past this it reports the
+        # sentinel max+1.0, which is not a distance -- see _clearance_along.
+        self.front_probe_max_m = 0.5
         self._last_loop_ns = 0
         self._loop_period_s = None
         # How long /control/target_pose must go quiet before proximity to it counts as
@@ -714,10 +717,13 @@ class PlanningNode(Node):
         esdf_at_robot = self._esdf_at(esdf_map, centre)
         msg = String()
         msg.data = json.dumps({
-            # None rather than the sentinel: "no obstacle within the probe" is not a
-            # distance, and the UI should say so rather than print the probe length.
-            'frontClearanceM': (None if not np.isfinite(front_clearance)
+            # None rather than the sentinel. _clearance_along returns max+1.0 when it
+            # finds nothing, which is finite, so an isfinite() guard silently reports
+            # "1.50 m" for "nothing within 0.5 m" -- the exact misreading its docstring
+            # warns about, and the one this panel shipped with.
+            'frontClearanceM': (None if front_clearance > self.front_probe_max_m
                                 else round(float(front_clearance), 2)),
+            'frontProbeMaxM': round(float(self.front_probe_max_m), 2),
             'frontBlocked': bool(front_clearance <= self.robot.front_blocked_m),
             'frontBlockedAtM': round(float(self.robot.front_blocked_m), 2),
             'obstacleCells': int(np.count_nonzero(obstacle_mask)),
@@ -840,7 +846,8 @@ class PlanningNode(Node):
             # Before the no-target return below, so the UI keeps reading a clearance
             # while the robot is parked -- which is exactly when you want to know
             # whether it thinks something is in front of it.
-            front_clearance = self._front_obstacle_dist(T, obstacle_mask)
+            front_clearance = self._front_obstacle_dist(
+                T, obstacle_mask, self.front_probe_max_m)
             self._publish_diagnostics(front_clearance, obstacle_mask, ESDF_map, T, stamp)
 
         with Timer(name='vis', text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=_TIMER_LOGGER):
