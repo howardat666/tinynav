@@ -5,6 +5,17 @@
 > **代码基线**：分支 `x5/wheel-nav`，基于 [PR #136](https://github.com/UniflexAI/tinynav/pull/136)（junlinp）= **方案 1（ORB 全经典）**
 > **数据与实测记录**：见 [`x5.md`](x5.md) —— 硬件占用、算法延迟/内存、BPU 分析、九方案参数对比
 
+> ## ⚠️ 本文写于 2026-08-04，两处前提已变（2026-08-14）
+>
+> 1. 🔴 **底盘从 LeKiwi 三轮全向改为两轮差速** + 前万向轮，电机换有刷直流 + 驱动板，
+>    中间加一个 **ESP32** 经 ttyS3/GH1.25 转 GPIO。导航栈本来就是单车模型，影响很小 ——
+>    详见 [`nav_field_results.md`](nav_field_results.md) §7。
+> 2. 🟢 **「X5 不能做 USB host」是错的** —— 两个控制器都是 OTG，有运行时角色开关。
+>    详见 [`usb_host_mode.md`](usb_host_mode.md)。
+>
+> 08-05 之后的真机导航实测与 PC 端到端重定位基线，全部在
+> [`nav_field_results.md`](nav_field_results.md)。
+
 ---
 
 ## 索引

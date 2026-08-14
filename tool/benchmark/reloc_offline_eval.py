@@ -52,6 +52,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--max-queries", type=int, default=0, help="0 = all")
     p.add_argument("--top-k", type=int, default=0, help="Override MapNode.relocalization_loop_top_k (0 = keep default 3)")
     p.add_argument("--nfeatures", type=int, default=0, help="Override ORB nfeatures (0 = keep default 1024)")
+    p.add_argument("--matcher", choices=("flann", "bf"), default="flann",
+                   help="flann = LSH + Lowe ratio (shipping default); bf = BFMatcher Hamming + crossCheck")
+    p.add_argument("--ransac", action="store_true",
+                   help="Filter matches by findFundamentalMat before PnP (off in the shipping default)")
     p.add_argument("--pos-threshold-m", type=float, default=0.5)
     p.add_argument("--rot-threshold-deg", type=float, default=10.0)
     # One pass, several thresholds: 0.5 m is the retrieval literature's convention but the
@@ -128,7 +132,7 @@ def main() -> int:
 
     rclpy.init(args=None)
     extractor = ORBFeatureTRTCompatible(**({"nfeatures": args.nfeatures} if args.nfeatures else {}))
-    matcher = ORBMatcher()
+    matcher = ORBMatcher(mode=args.matcher, use_ransac=args.ransac)
 
     t_node0 = time.perf_counter()
     node = MapNode(
@@ -286,6 +290,8 @@ def main() -> int:
         "cross_session": cross_session,
         "vocabulary": args.vocab,
         "orb_nfeatures": int(extractor.nfeatures),
+        "matcher": args.matcher,
+        "ransac": bool(args.ransac),
         "top_k": int(node.relocalization_loop_top_k),
         "reference_keyframes": len(ref_poses),
         "queries_attempted": total_queries,

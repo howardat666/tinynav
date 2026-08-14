@@ -241,13 +241,31 @@ class ORBFeatureTRTCompatible:
 
 class ORBMatcher:
     """
-    ORB descriptor matcher using FLANN LSH for binary descriptors.
+    ORB descriptor matcher for binary descriptors, in either of two configurations.
 
     Output is LightGlue-compatible:
       - match_indices: (1, N0) int32, each value is matched index in keypoints1 or -1.
+
+    `mode` selects the correspondence search and `use_ransac` the geometric check.
+    They are separate because they reject different things: the ratio test and
+    crossCheck are descriptor-space filters that cannot see geometry, so neither
+    can reject a corridor's two identical doors -- only the epipolar RANSAC can.
+    Both were present until 3381b48 (2026-06-03) replaced BF+crossCheck+RANSAC
+    with FLANN LSH + ratio and dropped the RANSAC; keeping both paths selectable
+    is what lets that regression be measured rather than argued about.
     """
 
-    def __init__(self, ransac_reproj_threshold: float = 1.0, flann_ratio: float = 0.75):
+    def __init__(
+        self,
+        ransac_reproj_threshold: float = 1.0,
+        flann_ratio: float = 0.75,
+        mode: str = "flann",
+        use_ransac: bool = False,
+    ):
+        if mode not in ("flann", "bf"):
+            raise ValueError(f"ORBMatcher mode must be 'flann' or 'bf', got {mode!r}")
+        self.mode = mode
+        self.use_ransac = bool(use_ransac)
         flann_index_lsh = 6
         index_params = dict(
             algorithm=flann_index_lsh,
@@ -257,6 +275,10 @@ class ORBMatcher:
         )
         search_params = dict(checks=50)
         self.flann = cv2.FlannBasedMatcher(index_params, search_params)
+        # crossCheck already enforces mutual nearest, which is why the bf path needs
+        # no ratio test: the two are alternatives, and OpenCV refuses knnMatch(k=2)
+        # when crossCheck is on.
+        self.bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
         self.ransac_reproj_threshold = float(ransac_reproj_threshold)
         self.flann_ratio = float(flann_ratio)
 
@@ -330,35 +352,58 @@ class ORBMatcher:
         # with one keypoint cannot localize anything, so report no matches.
         if d1_u8.shape[0] < 2:
             logger.warning(
-                "ORBMatcher: train set has %d descriptor(s); the ratio test cannot "
-                "be evaluated, so no matches are reported",
+                "ORBMatcher: train set has %d descriptor(s), too few to localize; "
+                "no matches reported",
                 d1_u8.shape[0],
             )
             return out
 
-        raw_matches = self.flann.knnMatch(d0_u8, d1_u8, k=2)
-        good_matches = []
-        for pair in raw_matches:
-            if len(pair) < 2:
-                # LSH is approximate and can return a single neighbour even when
-                # the train set holds many. Accepting it would mean accepting a
-                # match that passed no quality test at all, and measurement says
-                # that costs more than it gains: keeping these matches drops
-                # night precision from 71.1% to 61.0% and day correct
-                # relocalizations from 1123 to 1120. Undecidable, so discard.
-                continue
-            m, n = pair[:2]
-            if m.distance < self.flann_ratio * n.distance:
-                good_matches.append(m)
+        if self.mode == "bf":
+            good_matches = sorted(self.bf.match(d0_u8, d1_u8), key=lambda m: m.distance)
+            n_raw = len(good_matches)
+        else:
+            raw_matches = self.flann.knnMatch(d0_u8, d1_u8, k=2)
+            n_raw = len(raw_matches)
+            good_matches = []
+            for pair in raw_matches:
+                if len(pair) < 2:
+                    # LSH is approximate and can return a single neighbour even when
+                    # the train set holds many. Accepting it would mean accepting a
+                    # match that passed no quality test at all, and measurement says
+                    # that costs more than it gains: keeping these matches drops
+                    # night precision from 71.1% to 61.0% and day correct
+                    # relocalizations from 1123 to 1120. Undecidable, so discard.
+                    continue
+                m, n = pair[:2]
+                if m.distance < self.flann_ratio * n.distance:
+                    good_matches.append(m)
 
         if len(good_matches) == 0:
             return out
 
+        n_before_ransac = len(good_matches)
+        # Eight correspondences is the fundamental matrix's minimum; below that the
+        # solve is meaningless and the matches pass through unfiltered.
+        if self.use_ransac and len(good_matches) >= 8:
+            pts0 = np.asarray([k0[idx0[m.queryIdx]] for m in good_matches], dtype=np.float32)
+            pts1 = np.asarray([k1[idx1[m.trainIdx]] for m in good_matches], dtype=np.float32)
+            _, inliers = cv2.findFundamentalMat(
+                pts0, pts1, cv2.FM_RANSAC, self.ransac_reproj_threshold, 0.99
+            )
+            if inliers is not None and inliers.size == len(good_matches):
+                mask = inliers.reshape(-1).astype(bool)
+                good_matches = [m for m, keep in zip(good_matches, mask) if keep]
+            if len(good_matches) == 0:
+                return out
+
         logger.info(
-            "ORBMatcher FLANN LSH: queries=%d train=%d raw_knn=%d ratio_matches=%d ransac=disabled",
+            "ORBMatcher %s: queries=%d train=%d raw=%d filtered=%d ransac=%s kept=%d",
+            self.mode,
             d0_u8.shape[0],
             d1_u8.shape[0],
-            len(raw_matches),
+            n_raw,
+            n_before_ransac,
+            "on" if self.use_ransac else "disabled",
             len(good_matches),
         )
 
