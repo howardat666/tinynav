@@ -56,6 +56,9 @@ def _parse_args() -> argparse.Namespace:
                    help="flann = LSH + Lowe ratio (shipping default); bf = BFMatcher Hamming + crossCheck")
     p.add_argument("--ransac", action="store_true",
                    help="Filter matches by findFundamentalMat before PnP (off in the shipping default)")
+    p.add_argument("--ransac-threshold-px", type=float, default=1.0,
+                   help="Epipolar reprojection threshold. 1.0 is what the pre-3381b48 code used, "
+                        "which is tight for ORB keypoints that localize to 1-2 px")
     p.add_argument("--pos-threshold-m", type=float, default=0.5)
     p.add_argument("--rot-threshold-deg", type=float, default=10.0)
     # One pass, several thresholds: 0.5 m is the retrieval literature's convention but the
@@ -132,7 +135,8 @@ def main() -> int:
 
     rclpy.init(args=None)
     extractor = ORBFeatureTRTCompatible(**({"nfeatures": args.nfeatures} if args.nfeatures else {}))
-    matcher = ORBMatcher(mode=args.matcher, use_ransac=args.ransac)
+    matcher = ORBMatcher(mode=args.matcher, use_ransac=args.ransac,
+                         ransac_reproj_threshold=args.ransac_threshold_px)
 
     t_node0 = time.perf_counter()
     node = MapNode(
@@ -292,6 +296,7 @@ def main() -> int:
         "orb_nfeatures": int(extractor.nfeatures),
         "matcher": args.matcher,
         "ransac": bool(args.ransac),
+        "ransac_threshold_px": args.ransac_threshold_px,
         "top_k": int(node.relocalization_loop_top_k),
         "reference_keyframes": len(ref_poses),
         "queries_attempted": total_queries,
