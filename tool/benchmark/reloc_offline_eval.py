@@ -244,7 +244,9 @@ def main() -> int:
     print(f"[info] reference map={map_dir} keyframes={len(ref_poses)}")
     print(f"[info] query map={query_dir} queries={total_queries} cross_session={cross_session}")
     print(f"[info] import_s={import_s:.2f} node_build_s={node_build_s:.2f} rss_after_load_mb={rss_after_load_mb:.0f}")
-    print(f"[info] vocab={args.vocab} top_k={node.relocalization_loop_top_k} orb_nfeatures={extractor.nfeatures}")
+    feat_desc = (f"orb nfeatures={orb_extractor.nfeatures}" if args.features == "orb"
+                 else f"superpoint threshold={args.sp_threshold:g} top_k_kpts={args.sp_top_k_keypoints or 'all'}")
+    print(f"[info] vocab={args.vocab} top_k={node.relocalization_loop_top_k} features: {feat_desc}")
 
     for i, ts in enumerate(query_ts):
         image = query_db.infra1_video_db.read(int(ts))
@@ -338,7 +340,7 @@ def main() -> int:
         "query_map": str(query_dir),
         "cross_session": cross_session,
         "vocabulary": args.vocab,
-        "orb_nfeatures": int(extractor.nfeatures),
+        "orb_nfeatures": int(orb_extractor.nfeatures),
         "features": args.features,
         "matcher": args.matcher if args.features == "orb" else f"BF-L2 {args.sp_matcher}",
         "sp_threshold": args.sp_threshold if args.features == "sp" else None,
