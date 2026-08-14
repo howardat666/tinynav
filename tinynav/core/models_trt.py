@@ -194,6 +194,175 @@ class SuperPointTRT(TRTBase):
         return results
 
 
+class SuperPointORT:
+    """SuperPoint through ONNX Runtime, output-identical to SuperPointTRT.
+
+    The X5 has no TensorRT, so the board runs SuperPoint on ONNX Runtime; evaluating
+    it on the PC through the TRT class would measure a different graph execution than
+    the one that ships. Same class here, same numbers there.
+
+    Measured 2026-08-14 on map_day / map_night, keypoints per frame:
+
+        threshold   day    night   night/day   ORB comparison
+        0.00005     489.5  420.9     86.0%     (day hits the graph's 512 slot cap)
+        0.0005      315.5  217.7     69.0%     the TRT default
+        0.005       166.9  107.6     64.5%
+        ORB 1024    913.3  320.4     35.1%     one night frame at zero
+
+    So SuperPoint's advantage is *stability*, not count: it finds fewer points than
+    ORB in daylight and cannot exceed 512, but keeps far more of them at night and
+    never returns an empty frame.
+    """
+
+    def __init__(
+        self,
+        model_path: str,
+        net_hw: tuple[int, int] = (320, 272),
+        threshold: float = 0.0005,
+        num_threads: int = 0,
+        top_k_keypoints: int = 0,
+    ):
+        import onnxruntime as ort  # local: the board has it, a TRT-only host may not
+
+        so = ort.SessionOptions()
+        # Arena and mem-pattern trade memory for speed and never return it to the OS.
+        # On a 1307 MB board that is the wrong trade -- measured on DINOv2 it cost
+        # 312 MB for no latency change.
+        so.enable_cpu_mem_arena = False
+        so.enable_mem_pattern = False
+        so.log_severity_level = 3
+        if num_threads:
+            so.intra_op_num_threads = int(num_threads)
+            so.inter_op_num_threads = 1
+        self.session = ort.InferenceSession(model_path, so, providers=["CPUExecutionProvider"])
+        self.output_names = [o.name for o in self.session.get_outputs()]
+        self.net_h, self.net_w = int(net_hw[0]), int(net_hw[1])
+        self.threshold = float(threshold)
+        self.top_k_keypoints = int(top_k_keypoints)
+
+    async def infer(self, input_image: np.ndarray, threshold: np.ndarray | None = None):
+        if input_image is None:
+            raise ValueError("input_image is None")
+        if input_image.ndim == 3:
+            input_image = cv2.cvtColor(input_image, cv2.COLOR_BGR2GRAY)
+        h_in, w_in = input_image.shape[:2]
+        image = cv2.resize(input_image, (self.net_w, self.net_h))
+        thr = (np.array([[self.threshold]], dtype=np.float32) if threshold is None
+               else np.asarray(threshold, dtype=np.float32).reshape(1, 1))
+
+        raw = self.session.run(
+            None,
+            {"image": np.ascontiguousarray(image[None, None], dtype=np.uint8),
+             "keypoint_threshold": thr},
+        )
+        res = dict(zip(self.output_names, raw))
+
+        # Network coords -> input image coords, per axis, matching SuperPointTRT.
+        scale_x = w_in / self.net_w
+        scale_y = h_in / self.net_h
+        k = np.array(res["kpts"], dtype=np.float32)
+        k[..., 0] = (k[..., 0] + 0.5) * scale_x - 0.5
+        k[..., 1] = (k[..., 1] + 0.5) * scale_y - 0.5
+
+        # The graph pads its outputs to a fixed slot count and marks the real
+        # detections in `mask`; downstream expects (1, N, 1) like the TRT path.
+        mask = np.asarray(res["mask"]).astype(bool)
+        desc = np.asarray(res["descps"], dtype=np.float32)
+        scores = np.asarray(res["scores"], dtype=np.float32)
+        if self.top_k_keypoints:
+            # Keep the strongest K by masking the rest off, rather than compacting the
+            # arrays: everything downstream already reads `mask` to find the real slots.
+            valid = np.flatnonzero(mask[0])
+            if valid.size > self.top_k_keypoints:
+                drop = valid[np.argsort(-scores[0][valid])[self.top_k_keypoints:]]
+                mask[0, drop] = False
+        return {
+            "kpts": k,
+            "descps": desc,
+            "scores": scores,
+            "mask": mask.astype(np.float32)[:, :, None],
+        }
+
+
+class SuperPointMatcher:
+    """Classical matching over SuperPoint's float descriptors, LightGlue-compatible out.
+
+    LightGlue costs 2870 ms on the X5 against 38.6 ms for cv2's brute-force L2, so the
+    learned matcher is not an option there; this is what replaces it. The filters are
+    the same three as ORBMatcher's and reject the same three different things, but the
+    distance is L2 over 256 floats rather than Hamming over 32 bytes.
+    """
+
+    def __init__(
+        self,
+        mode: str = "cross",
+        ratio: float = 0.8,
+        use_ransac: bool = True,
+        ransac_reproj_threshold: float = 2.0,
+    ):
+        if mode not in ("cross", "ratio"):
+            raise ValueError(f"SuperPointMatcher mode must be 'cross' or 'ratio', got {mode!r}")
+        self.mode = mode
+        self.ratio = float(ratio)
+        self.use_ransac = bool(use_ransac)
+        self.ransac_reproj_threshold = float(ransac_reproj_threshold)
+        self.bf_cross = cv2.BFMatcher(cv2.NORM_L2, crossCheck=True)
+        self.bf_plain = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+
+    async def infer(self, kpts0, kpts1, desc0, desc1, mask0, mask1,
+                    img_shape0=None, img_shape1=None, match_threshold=None):
+        k0 = np.asarray(kpts0[0], dtype=np.float32)
+        k1 = np.asarray(kpts1[0], dtype=np.float32)
+        d0 = np.asarray(desc0[0], dtype=np.float32)
+        d1 = np.asarray(desc1[0], dtype=np.float32)
+        n0 = int(min(k0.shape[0], d0.shape[0]))
+        n1 = int(min(k1.shape[0], d1.shape[0]))
+        out = {"match_indices": np.full((1, max(n0, 1)), -1, dtype=np.int32)}
+        if n0 == 0 or n1 == 0 or k0.ndim != 2 or k1.ndim != 2:
+            return out
+        k0, k1, d0, d1 = k0[:n0, :2], k1[:n1, :2], d0[:n0], d1[:n1]
+
+        def valid(mask, n):
+            if mask is None or np.asarray(mask).size == 0:
+                return np.ones((n,), dtype=bool)
+            m = np.asarray(mask)[0, :, 0] > 0
+            return m[:n] if m.shape[0] >= n else np.ones((n,), dtype=bool)
+
+        idx0 = np.where(valid(mask0, n0))[0]
+        idx1 = np.where(valid(mask1, n1))[0]
+        if idx0.size == 0 or idx1.size < 2:
+            return out
+        q, t = np.ascontiguousarray(d0[idx0]), np.ascontiguousarray(d1[idx1])
+
+        if self.mode == "cross":
+            good = sorted(self.bf_cross.match(q, t), key=lambda m: m.distance)
+        else:
+            good = []
+            for pair in self.bf_plain.knnMatch(q, t, k=2):
+                if len(pair) < 2:
+                    continue
+                m, n = pair[:2]
+                if m.distance < self.ratio * n.distance:
+                    good.append(m)
+        if not good:
+            return out
+
+        if self.use_ransac and len(good) >= 8:
+            p0 = np.asarray([k0[idx0[m.queryIdx]] for m in good], dtype=np.float32)
+            p1 = np.asarray([k1[idx1[m.trainIdx]] for m in good], dtype=np.float32)
+            _, inl = cv2.findFundamentalMat(
+                p0, p1, cv2.FM_RANSAC, self.ransac_reproj_threshold, 0.99
+            )
+            if inl is not None and inl.size == len(good):
+                good = [m for m, keep in zip(good, inl.reshape(-1).astype(bool)) if keep]
+            if not good:
+                return out
+
+        for m in good:
+            out["match_indices"][0, int(idx0[m.queryIdx])] = int(idx1[m.trainIdx])
+        return out
+
+
 class ORBFeatureTRTCompatible:
     """
     ORB feature extractor with a SuperPoint-compatible output interface.

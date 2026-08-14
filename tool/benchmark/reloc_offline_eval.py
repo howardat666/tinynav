@@ -52,6 +52,18 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--max-queries", type=int, default=0, help="0 = all")
     p.add_argument("--top-k", type=int, default=0, help="Override MapNode.relocalization_loop_top_k (0 = keep default 3)")
     p.add_argument("--nfeatures", type=int, default=0, help="Override ORB nfeatures (0 = keep default 1024)")
+    p.add_argument("--features", choices=("orb", "sp"), default="orb",
+                   help="Feature layer under test. 'sp' keeps retrieval on ORB+DBoW3 (the "
+                        "vocabulary is ORB-trained) and uses SuperPoint only for matching")
+    p.add_argument("--sp-model", default=None, help="superpoint onnx, required for --features sp")
+    p.add_argument("--sp-threshold", type=float, default=0.0005)
+    p.add_argument("--sp-map-features", default=None,
+                   help="npz from build_sp_features_for_map.py for the REFERENCE map")
+    p.add_argument("--sp-matcher", choices=("cross", "ratio"), default="cross",
+                   help="cross = BF-L2 + crossCheck; ratio = BF-L2 knn + Lowe ratio")
+    p.add_argument("--sp-top-k-keypoints", type=int, default=0,
+                   help="Cap query keypoints to the highest-scoring K (0 = all). Controls for "
+                        "count when comparing against ORB's fixed 1024")
     p.add_argument("--matcher", choices=("flann", "bf"), default="flann",
                    help="flann = LSH + Lowe ratio (shipping default); bf = BFMatcher Hamming + crossCheck")
     p.add_argument("--ransac", action="store_true",
@@ -134,9 +146,20 @@ def main() -> int:
     import_s = time.perf_counter() - t_import0
 
     rclpy.init(args=None)
-    extractor = ORBFeatureTRTCompatible(**({"nfeatures": args.nfeatures} if args.nfeatures else {}))
-    matcher = ORBMatcher(mode=args.matcher, use_ransac=args.ransac,
-                         ransac_reproj_threshold=args.ransac_threshold_px)
+    orb_extractor = ORBFeatureTRTCompatible(**({"nfeatures": args.nfeatures} if args.nfeatures else {}))
+    if args.features == "sp":
+        if not args.sp_model or not args.sp_map_features:
+            print("ERROR: --features sp needs --sp-model and --sp-map-features", file=sys.stderr)
+            return 2
+        from tinynav.core.models_trt import SuperPointORT, SuperPointMatcher
+        extractor = SuperPointORT(args.sp_model, threshold=args.sp_threshold,
+                                  top_k_keypoints=args.sp_top_k_keypoints)
+        matcher = SuperPointMatcher(mode=args.sp_matcher, use_ransac=args.ransac,
+                                    ransac_reproj_threshold=args.ransac_threshold_px)
+    else:
+        extractor = orb_extractor
+        matcher = ORBMatcher(mode=args.matcher, use_ransac=args.ransac,
+                             ransac_reproj_threshold=args.ransac_threshold_px)
 
     t_node0 = time.perf_counter()
     node = MapNode(
@@ -158,6 +181,28 @@ def main() -> int:
     node.K = node.map_K
     if args.top_k:
         node.relocalization_loop_top_k = int(args.top_k)
+
+    if args.features == "sp":
+        # Retrieval stays on ORB because the DBoW3 vocabulary is ORB-trained; only the
+        # matching layer changes, so any delta is attributable to the descriptor.
+        node.retrieval_extractor = orb_extractor
+        npz = np.load(args.sp_map_features)
+        alt: dict[int, dict] = {}
+        for key in npz.files:
+            if not key.endswith("_kpts"):
+                continue
+            ts = int(key[: -len("_kpts")])
+            kp = npz[key]
+            desc = npz[f"{ts}_descps"]
+            if kp.shape[0] == 0:
+                continue
+            alt[ts] = {
+                "kpts": kp[None, ...],
+                "descps": desc[None, ...],
+                "mask": np.ones((1, kp.shape[0], 1), dtype=np.float32),
+            }
+        node.alt_map_features = alt
+        print(f"[info] SuperPoint map features: {len(alt)} keyframes from {args.sp_map_features}")
 
     # --- queries -------------------------------------------------------------
     ref_poses = node.map_poses
@@ -294,7 +339,10 @@ def main() -> int:
         "cross_session": cross_session,
         "vocabulary": args.vocab,
         "orb_nfeatures": int(extractor.nfeatures),
-        "matcher": args.matcher,
+        "features": args.features,
+        "matcher": args.matcher if args.features == "orb" else f"BF-L2 {args.sp_matcher}",
+        "sp_threshold": args.sp_threshold if args.features == "sp" else None,
+        "sp_top_k_keypoints": args.sp_top_k_keypoints if args.features == "sp" else None,
         "ransac": bool(args.ransac),
         "ransac_threshold_px": args.ransac_threshold_px,
         "top_k": int(node.relocalization_loop_top_k),

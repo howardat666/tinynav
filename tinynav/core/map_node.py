@@ -403,6 +403,10 @@ class MapNode(Node):
         # for humans reading one case; offline evaluation aggregates thousands of queries,
         # and re-parsing that string is how the wrong 58% success rate got reported once.
         self.last_relocalization_stats = {}
+        # Optional evaluation hooks, both off in normal operation. See their use in
+        # relocalize_with_depth for why retrieval and matching may need to differ.
+        self.retrieval_extractor = None
+        self.alt_map_features = None
 
         self.T_from_map_to_odom = None
 
@@ -980,10 +984,19 @@ class MapNode(Node):
 
         query_kp = keyframe_features["kpts"][0] if keyframe_features["kpts"].ndim == 3 else keyframe_features["kpts"]
         query_desc = keyframe_features["descps"][0] if keyframe_features["descps"].ndim == 3 else keyframe_features["descps"]
+        # Retrieval and matching do not have to run on the same descriptor. The DBoW3
+        # vocabulary is trained on ORB, so a SuperPoint front end cannot query it, and
+        # retraining is a bigger change than it looks. Setting retrieval_extractor keeps
+        # retrieval on ORB while matching uses whatever self.extractor produced.
+        retrieval_kp, retrieval_desc = query_kp, query_desc
+        if self.retrieval_extractor is not None:
+            rf = asyncio.run(self.retrieval_extractor.infer(keyframe))
+            retrieval_kp = rf["kpts"][0] if rf["kpts"].ndim == 3 else rf["kpts"]
+            retrieval_desc = rf["descps"][0] if rf["descps"].ndim == 3 else rf["descps"]
         t0 = time.perf_counter()
         candidates = self.map_loop_closure.find_candidate_timestamps(
-            query_kp,
-            query_desc,
+            retrieval_kp,
+            retrieval_desc,
             query_embedding,
             top_k=self.relocalization_loop_top_k,
         )
@@ -1005,6 +1018,16 @@ class MapNode(Node):
                 reference_keyframe_pose = self.map_poses[timestamp_in_map]
                 t_db = time.perf_counter()
                 reference_depth, _, reference_features, _, _ = self.db.get_depth_embedding_features_images(timestamp_in_map)
+                # A map built with ORB has only ORB descriptors, so evaluating a
+                # different feature layer means supplying its descriptors for the same
+                # keyframes rather than rebuilding the map -- which also keeps the
+                # keyframe set and poses identical between the two, so the comparison
+                # measures the descriptor and nothing else. The depth stays the map's.
+                if self.alt_map_features is not None:
+                    alt = self.alt_map_features.get(timestamp_in_map)
+                    if alt is None:
+                        continue
+                    reference_features = alt
                 db_ms = (time.perf_counter() - t_db) * 1000.0
                 timings["db_load"] = timings.get("db_load", 0.0) + db_ms
                 t_match = time.perf_counter()
