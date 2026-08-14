@@ -325,7 +325,7 @@ the geometry need to be overridable from a launcher without editing code.
 
 | Parameter | Default | Notes |
 | --- | --- | --- |
-| `port` | `/dev/ttyACM0` | Feetech bus serial device. `/dev/ttyACM0` is the Waveshare adapter's USB-C seen by a laptop or Pi. Wired straight off the X5's UART it is `/dev/ttyS3` or `/dev/ttyS5` — run `tool/x5_board/servo_scan.py` to find out which, since the X5 **cannot act as a USB host** and has no ttyACM at all. |
+| `port` | `/dev/ttyACM0` | Feetech bus serial device. `/dev/ttyACM0` is the Waveshare adapter's USB-C seen by a laptop or Pi. Wired straight off the X5's UART it is `/dev/ttyS3` or `/dev/ttyS5` — run `tool/x5_board/servo_scan.py` to find out which, since the X5 has no ttyACM at all: both of its USB controllers are bound as gadgets, so nothing enumerates. (An earlier version of this line said the X5 *cannot* act as a host — corrected 2026-08-14, see `usb_host_mode.md`.) |
 | `baudrate` | `1000000` | Feetech factory default |
 | `wheel_motor_ids` | `[7, 8, 9]` | left, back, right. Order matters. |
 | `wheel_signs` | `[1.0, 1.0, 1.0]` | per-wheel +1/-1, absorbs reversed wiring |

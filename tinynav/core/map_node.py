@@ -399,6 +399,10 @@ class MapNode(Node):
         # distributions are comparable from one grep over the log.
         self.last_relocalization_detail = ""
         self.last_relocalization_timing = {}
+        # The same numbers last_relocalization_detail carries, kept numeric. The string is
+        # for humans reading one case; offline evaluation aggregates thousands of queries,
+        # and re-parsing that string is how the wrong 58% success rate got reported once.
+        self.last_relocalization_stats = {}
 
         self.T_from_map_to_odom = None
 
@@ -938,6 +942,7 @@ class MapNode(Node):
         # aggregatable while `reason` keeps the numbers that explain the individual case.
         self.last_relocalization_failure_reason = reason
         self._reloc_last_failure_code = code
+        self.last_relocalization_stats["fail_code"] = code
         self._reloc_tally('failure', code=code)
         return False, np.eye(4), -np.inf
 
@@ -957,6 +962,13 @@ class MapNode(Node):
             timings = {}
         self.last_relocalization_failure_reason = ""
         self.last_relocalization_detail = ""
+        # Mutated in place as the pipeline advances, so whichever return fires leaves the
+        # stats describing exactly how far it got.
+        stats = self.last_relocalization_stats = {
+            "query_kpts": 0, "candidates": 0, "top_sim": 0.0, "cand_ts": [],
+            "cand_sims": [], "cand_matches": [], "cand_valid_depth": [],
+            "landmarks": 0, "pnp_inliers": 0,
+        }
         if K is None:
             return self._relocalization_failed("camera intrinsics unavailable", "no_intrinsics")
         t0 = time.perf_counter()
@@ -977,6 +989,11 @@ class MapNode(Node):
         )
         timings["candidate_search"] = timings.get("candidate_search", 0.0) + (time.perf_counter() - t0) * 1000.0
         max_similarity = max([c["similarity"] for c in candidates]) if len(candidates) > 0 else 0
+        stats["query_kpts"] = int(len(query_kp))
+        stats["candidates"] = len(candidates)
+        stats["top_sim"] = float(max_similarity)
+        stats["cand_ts"] = [int(c["timestamp"]) for c in candidates]
+        stats["cand_sims"] = [float(c["similarity"]) for c in candidates]
         if len(candidates) > 0:
             point_3d_in_world_arrays = []
             point_2d_in_keyframe_arrays = []
@@ -1005,15 +1022,19 @@ class MapNode(Node):
                     candidate_summaries.append(
                         f"{timestamp_in_map}:sim={similarity:.3f},matches={len(matches)},valid_depth={int(np.count_nonzero(inliers))}"
                     )
+                    stats["cand_valid_depth"].append(int(np.count_nonzero(inliers)))
                 else:
                     candidate_summaries.append(
                         f"{timestamp_in_map}:sim={similarity:.3f},matches={len(matches)}<20"
                     )
+                    stats["cand_valid_depth"].append(0)
+                stats["cand_matches"].append(int(len(matches)))
                 candidate_timing_summaries.append(
                     f"{timestamp_in_map}:db={db_ms:.1f},match={match_ms:.1f},depth3d={depth_ms:.1f}"
                 )
 
             landmark_count = int(sum(points.shape[0] for points in point_3d_in_world_arrays))
+            stats["landmarks"] = landmark_count
             if landmark_count > 40:
                 point_3d_in_world_list = np.concatenate(point_3d_in_world_arrays, axis=0)
                 point_2d_in_keyframe_list = np.concatenate(point_2d_in_keyframe_arrays, axis=0)
@@ -1038,6 +1059,7 @@ class MapNode(Node):
                 t_pnp = time.perf_counter()
                 success, rvec, tvec, inliers = cv2.solvePnPRansac(point_3d_in_world_list, point_2d_in_keyframe_list, self.map_K, None)
                 timings["pnp"] = timings.get("pnp", 0.0) + (time.perf_counter() - t_pnp) * 1000.0
+                stats["pnp_inliers"] = 0 if inliers is None else int(len(inliers))
                 if success and len(inliers) >= 20:
                     R, _ = cv2.Rodrigues(rvec)
                     T = np.eye(4)
