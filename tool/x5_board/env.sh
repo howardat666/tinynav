@@ -33,7 +33,11 @@ ROS_ROOT="${ROS_ROOT:-/opt/ros/humble}"
 # --- ROS 2 core ---------------------------------------------------------------
 export ROS_VERSION=2
 export ROS_PYTHON_VERSION=3
-export ROS_LOCALHOST_ONLY=0
+# Loopback-only DDS. The office WiFi carries foreign ROS 2 discovery traffic on
+# domain 0; one malformed ParticipantEntitiesInfo makes FastCDR allocate ~1.5 GB
+# and OOM-kill whatever node received it -- including the camera firmware.
+# Must match /etc/init.d/looper/setting/ros2_env.conf or the firmware is invisible.
+export ROS_LOCALHOST_ONLY=1
 export ROS_DISTRO=humble                 # (3) name, not a path
 export AMENT_PREFIX_PATH="${ROS_ROOT}"   # (2) required by the ros2 CLI
 export ROS_LOG_DIR=/root/.ros/log

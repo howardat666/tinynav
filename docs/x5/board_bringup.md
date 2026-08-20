@@ -927,6 +927,67 @@ key_frame_state_estimator.cc:773] Image data is lost for a long time, vio will b
 
 ---
 
+## 7.5 🔴 外来的 DDS 发现报文会把板上任何进程 OOM 掉（2026-08-20 定案，已修）
+
+**症状**：任何 ROS 2 进程随机涨到约 1.5 GB 被 OOM 杀。表现极具误导性 —— "app 起来几十秒又
+消失"、"相机不发数据"、"planning_node 内存泄漏"。一天里发生 14+ 次，看不出规律。
+
+**根因**：办公室 WiFi（DEEP-RD）网段上有 **5 台别的机器**在往 DDS 发现多播地址
+`239.255.0.1:7400` 发包（`ROS_DOMAIN_ID` 默认 0）。其中的 `ParticipantEntitiesInfo`
+本板 FastDDS 解不开，长度字段被当成垃圾值，FastCDR 照着它申请约 1.5 GB：
+
+```
+Fast CDR exception deserializing message of type rmw_dds_common::msg::dds_::ParticipantEntitiesInfo_
+''Bad alloc' exception deserializing message of type ... ParticipantEntitiesInfo_
+```
+
+ion 扩容后 `MemAvailable` 正好约 1.4 GB，所以这个申请必然触发**全局** OOM。
+
+**逐步剥离实验**（每步都实测）：
+
+| 实验 | 结果 |
+|---|---|
+| 订阅 `camera_info`（几百字节） | 1.54 GB 被杀 |
+| **收到 0 条消息** | 照样被杀 → 与消息无关 |
+| 订阅一个不存在的话题 | 照样被杀 |
+| **完全不订阅**，只 `rclpy.spin_once()` | 照样被杀 |
+| 只 `rclpy.init()` + `time.sleep` | **41 MB，活着** |
+
+→ 凶手是 `spin_once` 处理发现报文，和话题/订阅/消息/发布者全都无关。
+
+**修法：两处都改成 `ROS_LOCALHOST_ONLY=1`**，少一处白改（固件和 tinynav 必须同域）：
+
+| 文件 | 归属 |
+|---|---|
+| `/etc/init.d/looper/setting/ros2_env.conf` | 固件（备份 `.bak.pre_localhost`） |
+| `tool/x5_board/env.sh` | tinynav（已提交） |
+
+代价：PC 端 `ros2 topic list` 看不到板上话题。web UI 走 HTTP，不受影响。
+另一个等效修法是 `ROS_DOMAIN_ID=42`（换多播端口），实测同样 0 报错，好处是仍能被 PC 看到。
+
+**修后验证**：连跑 11 次探针，RSS 恒 53→54 MB、每次收 240–241 条、0 报错；app 连续 125 s
+五个进程 RSS 完全不动。
+
+### 两个连带陷阱
+
+🔴 **`/userdata/x5/env.sh` 是会分叉的第二份拷贝。** `app_start.sh` 用的是**它**
+（`ENV_SH="${ENV_SH:-/userdata/x5/env.sh}"`），不是仓库里的 `tool/x5_board/env.sh`。
+只改仓库那份，app 照样 OOM。**板上已做成软链**指向仓库那份。
+
+🔴 **固件被 OOM 连杀 5 次后 systemd 彻底放弃拉起。** `S99all_run.service` 是
+`Restart=always` 但 `StartLimitBurst=5`，耗尽后变成
+`Start request repeated too quickly` + `failed (Result: oom-kill)`，**再也不自动重启**。
+判据是 `systemctl status S99all_run`，恢复要：
+
+```bash
+systemctl reset-failed S99all_run && systemctl start S99all_run
+```
+
+⚠️ **诊断纪律**：这个 bug 的全部线索都在 **stderr**。用 `2>&1 | tail -1` 看会崩的进程
+等于把唯一的证据扔了 —— 我因此编出过"每条消息涨 179 MB"和"BEST_EFFORT vs RELIABLE"
+两个错误解释。排查时先给探针加 `resource.setrlimit(RLIMIT_AS, ...)`，把 `bad_alloc` 变成
+本进程的 `MemoryError`，别把固件一起拖死。
+
 ## 8. 相关文件
 
 | 文件 | 作用 |
