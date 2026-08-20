@@ -10,11 +10,13 @@ import 'pages/setup_page.dart';
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final prefs = await SharedPreferences.getInstance();
-  // The backend serves this bundle itself, from the board, at
-  // http://169.254.10.1:8000/ -- so the page is already loaded from the very
-  // device it needs to talk to. Without a default, the user has to type that
-  // same address into SetupPage before anything works.
-  const defaultDeviceIp = '169.254.10.1';
+  // The backend serves this bundle itself, so the page's own origin already IS the
+  // device. Derive it rather than hardcoding: the USB address stopped resolving the
+  // moment the C port was switched to USB host for the WiFi dongle, and a hardcoded
+  // default then reports "device offline" while the page is being served by the very
+  // board it says is unreachable.
+  final defaultDeviceIp =
+      kIsWeb && Uri.base.host.isNotEmpty ? Uri.base.host : '169.254.10.1';
   final savedIp = prefs.getString('device_ip') ?? defaultDeviceIp;
 
   runApp(

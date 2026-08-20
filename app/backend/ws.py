@@ -281,7 +281,10 @@ async def ws_preview(ws: WebSocket, topic: str = Query(...)):
         await ws.close(code=1013)
         return
 
-    queue: asyncio.Queue = asyncio.Queue(maxsize=4)
+    # Depth 1, not 4: on WiFi the uplink is the bottleneck (~2.5 Mbit/s measured, see
+    # docs/x5/board_bringup.md 2.5), so a deeper queue only converts bandwidth shortage
+    # into latency -- the viewer ends up watching frames that are already stale.
+    queue: asyncio.Queue = asyncio.Queue(maxsize=1)
     loop = asyncio.get_event_loop()
 
     def _on_frame(frame: bytes):
@@ -306,7 +309,10 @@ async def ws_preview(ws: WebSocket, topic: str = Query(...)):
                 if not _connected(ws):
                     break
                 continue
-            await ws.send_text(base64.b64encode(frame).decode('ascii'))
+            # Binary, not base64 text: base64 costs a flat 33% on a link that is
+            # already the bottleneck. The frontend's decodeFrame has always accepted
+            # both, so this needs no coordinated release.
+            await ws.send_bytes(frame)
     except WebSocketDisconnect:
         pass
     finally:

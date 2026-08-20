@@ -69,8 +69,8 @@ _MAPPING_PERCENT_PREFIX = 'MAPPING_PERCENT:'
 # processes exist, and every one of them has to be fixed before the first node
 # starts. Set them in the unit file / launch wrapper, one config per run.
 #
-#   TINYNAV_ROBOT_TYPE    go2 | b2 | lekiwi   robot geometry (see robot_config.py)
-#   TINYNAV_ACTUATOR      unitree | wheel | none   what consumes /cmd_vel
+#   TINYNAV_ROBOT_TYPE    go2 | b2 | lekiwi | diffcar   geometry (see robot_config.py)
+#   TINYNAV_ACTUATOR      unitree | wheel | diffcar | none   what consumes /cmd_vel
 #   TINYNAV_ODOM_SOURCE   vio | wheel         what the pose consumers read
 #
 # TINYNAV_ACTUATOR is a separate knob from TINYNAV_ODOM_SOURCE on purpose: the
@@ -99,7 +99,7 @@ _MAP_ODOM_SOURCE = os.environ.get('TINYNAV_MAP_ODOM_SOURCE', _ODOM_SOURCE)
 # unitree_control does its own, so it stays off for a Unitree base; a wheel base
 # has no equivalent and needs it. Still overridable for bring-up.
 _ENABLE_CMD_VEL_NODE = os.environ.get(
-    'TINYNAV_ENABLE_CMD_VEL_NODE', '1' if _ACTUATOR == 'wheel' else '0'
+    'TINYNAV_ENABLE_CMD_VEL_NODE', '1' if _ACTUATOR in ('wheel', 'diffcar') else '0'
 ) == '1'
 
 # Pose sources. The camera stamps /camera/camera/vio_image with the image's own
@@ -287,6 +287,21 @@ def _wheel_odometry_argv() -> list[str]:
         '-p', 'cmd_vel_topic:=/cmd_vel',
     ]
 
+def _diffcar_control_argv() -> list[str]:
+    # Same sole-owner-of-the-serial-port role as _wheel_odometry_argv above, for the
+    # ESP32 car. Geometry comes from DIFFCAR_CONFIG so the node and the planner cannot
+    # disagree about where the control centre is.
+    cam_x = _ROBOT.camera_x - _ROBOT.control_x
+    return _node_argv('tinynav/platforms/diffcar_control.py') + [
+        '--ros-args',
+        '-p', f'port:={_WHEEL_PORT}',
+        '-p', f'camera_offset_xyz:=[{cam_x},{-_ROBOT.camera_y},0.183]',
+        '-p', f'max_vx:={_ROBOT.max_vx}',
+        '-p', f'max_yaw:={_ROBOT.max_yaw}',
+        '-p', 'cmd_vel_topic:=/cmd_vel',
+    ]
+
+
 _COLOR_TOPIC_REALSENSE = '/camera/camera/color/image_raw'
 _COLOR_TOPIC_LOOPER = '/camera/camera/color/image_rect_raw/compressed'
 
@@ -296,14 +311,41 @@ _IMAGE_TOPICS_REALSENSE = [
     '/camera/camera/infra2/image_rect_raw',
     '/slam/depth',
 ]
+# No infra2: in looper mode nothing reads the right eye (perception_node is the
+# realsense branch and never launches here), and previewing it costs the same 98% of
+# the board's measured 0.874 Mbit/s uplink that infra1 does.
 _IMAGE_TOPICS_LOOPER = [
     _COLOR_TOPIC_LOOPER,
     '/camera/camera/infra1/image_rect_raw',
-    '/camera/camera/infra2/image_rect_raw',
     '/slam/depth',
 ]
 _IMAGE_TOPICS_ALL = _IMAGE_TOPICS_REALSENSE  # fallback
-_PREVIEW_MIN_INTERVAL = 0.2  # 5 fps
+# 5 fps by default. infra1 needs 0.86 Mbit/s at that rate against a measured 0.874
+# uplink (docs/x5/board_bringup.md 2.5), which leaves nothing for ssh -- so the mono
+# topics get a slower cadence rather than being dropped. infra1 is the image
+# SuperPoint actually runs on, so it is the one worth keeping visible.
+_PREVIEW_MIN_INTERVAL = float(os.environ.get('TINYNAV_PREVIEW_INTERVAL', '0.2'))
+_PREVIEW_SLOW_INTERVAL = float(os.environ.get('TINYNAV_PREVIEW_SLOW_INTERVAL', '0.5'))
+_PREVIEW_SLOW_TOPICS = frozenset({
+    '/camera/camera/infra1/image_rect_raw',
+    '/camera/camera/infra2/image_rect_raw',
+})
+
+
+def _preview_interval(topic: str) -> float:
+    return _PREVIEW_SLOW_INTERVAL if topic in _PREVIEW_SLOW_TOPICS else _PREVIEW_MIN_INTERVAL
+
+# Colour preview needs 3.6 Mbit/s at 5 fps (67 kB/frame, +33% for base64) and the
+# board's WiFi transmit path caps out near 2.5 -- see docs/x5/board_bringup.md 2.5.
+_DISABLE_COLOR = os.environ.get('TINYNAV_DISABLE_COLOR', '0') == '1'
+
+
+def _image_topics(sensor_mode: str) -> list[str]:
+    topics = _IMAGE_TOPICS_LOOPER if sensor_mode == 'looper' else _IMAGE_TOPICS_REALSENSE
+    if _DISABLE_COLOR:
+        colour = {_COLOR_TOPIC_LOOPER, _COLOR_TOPIC_REALSENSE}
+        topics = [t for t in topics if t not in colour]
+    return topics
 
 
 class BackendNode(Ros2NodeManager):
@@ -958,7 +1000,7 @@ class BackendNode(Ros2NodeManager):
             self.get_logger().warn(f'Sensor detection failed: {e}')
             self._sensor_mode = 'unknown'
 
-        topics = _IMAGE_TOPICS_LOOPER if self._sensor_mode == 'looper' else _IMAGE_TOPICS_REALSENSE
+        topics = _image_topics(self._sensor_mode)
         for topic in topics:
             self._last_frame[topic] = b''
             self._last_frame_time[topic] = 0.0
@@ -1035,7 +1077,7 @@ class BackendNode(Ros2NodeManager):
         # backward jump makes this delta negative and freezes the preview stream until
         # the wall clock catches back up to the stored timestamp.
         now = time.monotonic()
-        if now - self._last_frame_time.get(topic, 0.0) < _PREVIEW_MIN_INTERVAL:
+        if now - self._last_frame_time.get(topic, 0.0) < _preview_interval(topic):
             return
         self._last_frame_time[topic] = now
         frame = bytes(msg.data)
@@ -1049,7 +1091,7 @@ class BackendNode(Ros2NodeManager):
 
     def _on_image(self, msg: Image, topic: str):
         now = time.monotonic()  # see _on_compressed_image: no RTC on this board
-        if now - self._last_frame_time.get(topic, 0.0) < _PREVIEW_MIN_INTERVAL:
+        if now - self._last_frame_time.get(topic, 0.0) < _preview_interval(topic):
             return
         self._last_frame_time[topic] = now
 
@@ -1221,7 +1263,7 @@ class BackendNode(Ros2NodeManager):
                 'wheelRadius': float(_WHEEL_RADIUS),
                 'baseRadius': float(_WHEEL_BASE_RADIUS),
                 'cameraOffsetForwardLeftUp': [float(v) for v in _WHEEL_CAMERA_OFFSET.split(',')],
-            } if _ACTUATOR == 'wheel' else None,
+            } if _ACTUATOR in ('wheel', 'diffcar') else None,
             # Reported for the same reason as the rest: a build that dies for lack
             # of memory looks like a build that failed for an unknown reason, and
             # the vocabulary path is the single most likely cause.
@@ -1235,9 +1277,7 @@ class BackendNode(Ros2NodeManager):
         }
 
     def get_image_topics(self) -> list[str]:
-        if self._sensor_mode == 'looper':
-            return _IMAGE_TOPICS_LOOPER
-        return _IMAGE_TOPICS_REALSENSE
+        return _image_topics(self._sensor_mode)
 
     def get_preview_frame(self, topic: str) -> bytes:
         with self._lock:
@@ -1509,15 +1549,19 @@ class BackendNode(Ros2NodeManager):
         So it behaves like a driver: started with the sensors, torn down only on
         full backend shutdown.
         """
-        if not self._manage_processes or _ACTUATOR != 'wheel':
+        if not self._manage_processes or _ACTUATOR not in ('wheel', 'diffcar'):
             return
         if self._proc_alive(getattr(self, '_wheel_odom_proc', None)):
             return
-        self._wheel_odom_proc = self._launch_proc(
-            'wheel_odometry', _wheel_odometry_argv(), env=env,
+        # Both are "the one process that owns the serial port and turns /cmd_vel into
+        # motion"; only the protocol on the far side differs.
+        name, argv = (
+            ('diffcar_control', _diffcar_control_argv()) if _ACTUATOR == 'diffcar'
+            else ('wheel_odometry', _wheel_odometry_argv())
         )
+        self._wheel_odom_proc = self._launch_proc(name, argv, env=env)
         self.get_logger().info(
-            f'wheel_odometry started (port={_WHEEL_PORT}, odom_source={_ODOM_SOURCE})'
+            f'{name} started (port={_WHEEL_PORT}, odom_source={_ODOM_SOURCE})'
         )
 
     def _stop_sensor_procs(self):
