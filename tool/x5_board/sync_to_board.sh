@@ -75,7 +75,7 @@ tar czf - \
     --exclude='__pycache__' \
     --exclude='*.plan' \
     --exclude='*.engine' \
-    --exclude='tinynav/models' \
+    --exclude='tinynav/models/*.onnx' \
     "${paths[@]}" \
 | sshpass -p "${BOARD_PASS}" ssh -o StrictHostKeyChecking=no "${BOARD}" \
     "mkdir -p '${BOARD_ROOT}' && tar xzf - -C '${BOARD_ROOT}'"

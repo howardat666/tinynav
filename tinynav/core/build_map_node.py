@@ -162,6 +162,14 @@ LOOP_CLOSURE_DEFAULTS = {
 }
 
 
+# The frozen vocabulary shipped with the repo. It is 256 KB and scene-independent
+# (an off-scene vocabulary measured within noise of a self-trained one), so vlad mode
+# defaults to it rather than making every caller pass a path.
+DEFAULT_VLAD_CENTRES = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models", "vlad_centres_k256.npy"
+)
+
+
 def load_vlad_centres(path: str | None) -> np.ndarray | None:
     """Load a frozen VLAD vocabulary from .npy or single-array .npz."""
     if not path:
@@ -1487,6 +1495,16 @@ def main(args=None):
         from tinynav.core.models_trt import ORBFeatureTRTCompatible, ORBMatcher
         extractor = ORBFeatureTRTCompatible()
         matcher = ORBMatcher()
+        embedding_extractor = DummyEmbeddingEngine()
+    elif parsed_args.loop_closure_mode == "vlad":
+        # VLAD shares one descriptor with retrieval, so the DINOv2 embedding has no
+        # consumer left -- which also stops patch_tokens.db being written (0.76 MB per
+        # keyframe). LightGlue is out for a different reason: 2.87 s on the X5 against
+        # 38.6 ms for brute-force L2 over the same descriptors.
+        from tinynav.core.models_trt import SuperPointMatcher, make_sp_extractor
+        parsed_args.vlad_centres = parsed_args.vlad_centres or DEFAULT_VLAD_CENTRES
+        extractor = make_sp_extractor()
+        matcher = SuperPointMatcher()
         embedding_extractor = DummyEmbeddingEngine()
     else:
         from tinynav.core.models_trt import Dinov2TRT, LightGlueTRT, SuperPointTRT

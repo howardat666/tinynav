@@ -16,6 +16,8 @@ except ImportError:
 import ctypes
 import einops
 import logging
+import os
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -282,6 +284,126 @@ class SuperPointORT:
             "scores": scores,
             "mask": mask.astype(np.float32)[:, :, None],
         }
+
+
+def _bpu_model_path() -> str:
+    return os.environ.get("TINYNAV_SP_BPU_MODEL") or str(
+        Path(__file__).resolve().parents[1] / "models" / "sp_backbone.bin"
+    )
+
+
+class SuperPointBPU:
+    """SuperPoint with its conv backbone on the X5 BPU, output-compatible with SuperPointTRT.
+
+    Everything from Softmax onward has shapes that depend on how many keypoints survive,
+    and the BPU needs static shapes -- so only the backbone is offloaded and the rest runs
+    on the CPU as pure numpy (`sp_post`). Board-measured: 39.4 ms backbone + 78.8 ms post
+    = 146.7 ms, against 3260 ms for the whole ONNX on the same CPU.
+    """
+
+    # Baked into sp_backbone.bin. The BPU input is static, so changing this needs a
+    # recompile -- see x5_work/bpu/README.md. 640x544 is the Looper infra native size,
+    # which means no resize and scale=1 in the deployed path.
+    NET_H, NET_W = 640, 544
+
+    def __init__(
+        self,
+        model_path: str | None = None,
+        threshold: float = 5e-4,
+        top_k: int = 512,
+        nms_mode: str = "fast",
+        priority: int | None = None,
+    ):
+        # Board-only deps: libdnn.so exists on the X5 and nowhere else, so import late
+        # to keep this module importable on a PC.
+        from tinynav.core import hbdnn, sp_post
+
+        self._post = sp_post
+        self.model_path = model_path or _bpu_model_path()
+        kwargs = {} if priority is None else {"priority": int(priority)}
+        self.model = hbdnn.BPUModel(self.model_path, **kwargs)
+        self.threshold = float(threshold)
+        self.top_k = int(top_k)
+        self.nms_mode = nms_mode
+        logger.info("SuperPointBPU: %s at %dx%d", self.model_path, self.NET_H, self.NET_W)
+
+    # No alru_cache_numpy here on purpose: the sibling TRT class caches 32 frames of
+    # results, which on a board with no swap costs more than the repeat inference saves.
+    async def infer(self, input_image: np.ndarray, threshold: np.ndarray | None = None):
+        if input_image is None:
+            raise ValueError("input_image is None")
+        if input_image.ndim == 3:
+            input_image = cv2.cvtColor(input_image, cv2.COLOR_BGR2GRAY)
+        h_in, w_in = input_image.shape[:2]
+        image = (input_image if (h_in, w_in) == (self.NET_H, self.NET_W)
+                 else cv2.resize(input_image, (self.NET_W, self.NET_H)))
+        thr = (self.threshold if threshold is None
+               else float(np.asarray(threshold, dtype=np.float32).reshape(-1)[0]))
+
+        x = np.ascontiguousarray(image, dtype=np.float32).reshape(1, 1, self.NET_H, self.NET_W)
+        x /= 255.0
+        outs = [np.asarray(o) for o in self.model.infer(x)]
+        # Identify by channel count, not output order: 65 = heatmap logits + dust bin,
+        # 256 = descriptor map. Output order is a property of the compiled .bin.
+        try:
+            logits = next(o for o in outs if o.shape[-3] == 65)
+            desc_map = next(o for o in outs if o.shape[-3] == 256)
+        except StopIteration:
+            raise RuntimeError(
+                f"unexpected BPU output shapes {[o.shape for o in outs]}; "
+                f"expected one 65-channel and one 256-channel tensor"
+            ) from None
+        logits = logits.reshape(logits.shape[-3:])
+        desc_map = desc_map.reshape(desc_map.shape[-3:])
+
+        kpts, scores, descs = self._post.postprocess(
+            logits, desc_map, thr, self.top_k, self.nms_mode
+        )
+
+        # Network coords -> input image coords, per axis, matching SuperPointTRT.
+        k = np.asarray(kpts, dtype=np.float32).reshape(-1, 2).copy()
+        if k.size:
+            k[:, 0] = (k[:, 0] + 0.5) * (w_in / self.NET_W) - 0.5
+            k[:, 1] = (k[:, 1] + 0.5) * (h_in / self.NET_H) - 0.5
+        n = k.shape[0]
+        descs = np.asarray(descs, dtype=np.float32).reshape(n, -1)
+        # sp_post already dropped the sub-threshold slots, so every row is real. An
+        # all-ones mask is the existing convention for variable-length features here
+        # (build_map_node.py builds one the same way for map-loaded descriptors).
+        return {
+            "kpts": k.reshape(1, n, 2),
+            "descps": descs.reshape(1, n, descs.shape[-1] if n else 256),
+            "scores": np.asarray(scores, dtype=np.float32).reshape(1, n),
+            "mask": np.ones((1, n, 1), dtype=np.float32),
+        }
+
+
+def make_sp_extractor(backend: str | None = None):
+    """Pick a SuperPoint backend: `bpu` on the X5, `trt` on a CUDA host, `ort` as fallback.
+
+    Default is auto -- BPU when both its runtime and the compiled model are present, TRT
+    otherwise. An explicit request that cannot be honoured raises instead of falling back:
+    a silent downgrade to the 3.3 s CPU path reads as a hang, not as an error.
+    """
+    want = (backend or os.environ.get("TINYNAV_SP_BACKEND") or "auto").lower()
+    model_path = _bpu_model_path()
+    have_model, have_runtime = os.path.exists(model_path), os.path.exists("/usr/lib/libdnn.so")
+    if want == "auto":
+        want = "bpu" if (have_model and have_runtime) else "trt"
+    if want == "bpu":
+        if not (have_model and have_runtime):
+            raise RuntimeError(
+                f"SuperPoint BPU backend requested but unavailable: {model_path} "
+                f"exists={have_model}, /usr/lib/libdnn.so exists={have_runtime}"
+            )
+        return SuperPointBPU(model_path)
+    if want == "trt":
+        return SuperPointTRT()
+    if want == "ort":
+        return SuperPointORT(
+            str(Path(__file__).resolve().parents[1] / "models" / "superpoint_fp16_dynamic.onnx")
+        )
+    raise ValueError(f"unknown SuperPoint backend {want!r}; want bpu, trt or ort")
 
 
 class SuperPointMatcher:

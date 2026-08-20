@@ -29,14 +29,16 @@ from tinynav.core.models_trt import (
     LightGlueTRT,
     ORBFeatureTRTCompatible,
     ORBMatcher,
+    SuperPointMatcher,
     SuperPointTRT,
+    make_sp_extractor,
 )
 import logging
 import asyncio
 import threading
 import time
 from tf2_ros import TransformBroadcaster
-from tinynav.core.build_map_node import LOOP_CLOSURE_DEFAULTS, load_vlad_centres, TinyNavDB
+from tinynav.core.build_map_node import DEFAULT_VLAD_CENTRES, LOOP_CLOSURE_DEFAULTS, load_vlad_centres, TinyNavDB
 from tinynav.core.build_map_node import solve_pose_graph
 import einops
 from tinynav.core.build_map_node import OdomPoseRecorder, LoopClosure
@@ -1712,6 +1714,14 @@ def main(args=None):
             )
         extractor = ORBFeatureTRTCompatible()
         matcher = ORBMatcher()
+        embedding_extractor = DummyEmbeddingEngine()
+    elif parsed_args.loop_closure_mode == "vlad":
+        # VLAD shares one descriptor with retrieval, so the DINOv2 embedding has no
+        # consumer left. LightGlue is out for a different reason: 2.87 s on the X5
+        # against 38.6 ms for brute-force L2 over the same descriptors.
+        parsed_args.vlad_centres = parsed_args.vlad_centres or DEFAULT_VLAD_CENTRES
+        extractor = make_sp_extractor()
+        matcher = SuperPointMatcher()
         embedding_extractor = DummyEmbeddingEngine()
     else:
         extractor = SuperPointTRT()
