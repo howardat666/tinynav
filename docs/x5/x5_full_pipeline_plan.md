@@ -408,6 +408,7 @@ PC 已验证（docker `uniflexai/tinynav:latest` + 假 BPU 打桩）：输出契
 | ~~A3~~ | ~~`SuperPointMatcher` 从没被选中~~ ✅ **2026-08-20 完成** |
 | ~~A5~~ | ~~模型和词典不在仓库里~~ ✅ **2026-08-20 完成** |
 | 🔴 **C1** | **端到端从来没跑过一次** | 「重定位单次 ~750 ms」是**分项相加**，其中 BPU 排队 ~35 ms 和 PnP ~50 ms 还是 **[估]**。A1–A3 做完必须在板上真跑一次完整重定位 |
+| 🔴 **C0** | **板上固件缺 `vio_enabled`** | 2026-08-20 实测：板上 `user_params.json` **没有这个 key**，跑的是 `d457ee0`(08-03) 之后、`54d4d7e`(08-11) 之前的版本 —— **现在关不掉 VIO**。本地 `LooperHub/tros_ws/install/lib/libinsight_full_plugin.so`(md5 `cb732ae8…`) 已编好，推上去 + 重启 `insight_full` 即可。⚠️ 会停相机 |
 | 🔴 **C2** | **`hbdnn` 在 ROS 节点里和 `insight_full` 并发未验证** | BPU 并发验证过，但那是独立 ctypes 脚本。在 rclpy 节点里（GIL、每帧 `asyncio.run(extractor.infer())`）没跑过 —— **最可能出意外的地方** |
 | ~~B1~~ | ~~固化 BPU 编译配方~~ | ✅ **2026-08-20 完成** —— 全部抢救到 `/home/dm/looper/x5_work/bpu/`（配方 `build.yaml`、产物 `sp_backbone.bin`、150 帧标定集、VLAD 词典 `centres_k256.npy`、11 个脚本、两步日志、重跑步骤）。🔴 原先它们全在 `$CLAUDE_JOB_DIR/tmp/` —— 会随 job 删除清空的临时目录 |
 | ~~B2~~ | ~~钉住工具链版本~~ | ✅ **2026-08-20 完成**，写进 `x5_work/bpu/README.md`：板上 hbDNN 1.23.10 / HBRT 3.15.54，固件模型 builder 1.24.3 / HBRT 3.15.55，别用更新的 OpenExplorer |
