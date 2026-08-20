@@ -651,10 +651,15 @@ class DBoW3Engine:
 
         if desc.ndim != 2:
             raise ValueError(f"Descriptor array must be 2D, got shape {desc.shape}")
-        if desc.shape[1] != 32:
-            raise ValueError(f"Expected ORB descriptor width 32, got {desc.shape[1]}")
         if desc.size == 0:
-            return np.zeros((0, 32), dtype=np.uint8)
+            return np.zeros((0, desc.shape[1] or 32), dtype=np.uint8)
+
+        # Width picks the metric: DBoW3 dispatches on cv::Mat type, CV_8U -> Hamming,
+        # CV_32F -> L2. Anything other than ORB's 32 bytes is a real-valued descriptor
+        # (SuperPoint is 256) and has to reach the shim as float32 -- the uint8 rounding
+        # below would quantize it to noise without raising.
+        if desc.shape[1] != 32:
+            return np.ascontiguousarray(desc, dtype=np.float32)
 
         if desc.dtype == np.uint8:
             return np.ascontiguousarray(desc)

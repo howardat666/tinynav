@@ -64,6 +64,18 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--sp-top-k-keypoints", type=int, default=0,
                    help="Cap query keypoints to the highest-scoring K (0 = all). Controls for "
                         "count when comparing against ORB's fixed 1024")
+    # Retrieval is the night bottleneck: matching already converts 99.4% of retrieval hits
+    # into correct poses, so success is capped by whatever the retrieval layer returns.
+    # These two backends replace the ORB-trained DBoW3 index that caps night at 32%.
+    p.add_argument("--retrieval-backend", choices=("orb_dbow3", "sp_dbow3", "sp_vlad"),
+                   default="orb_dbow3",
+                   help="orb_dbow3 = the shipping index; sp_dbow3 needs --sp-vocab; "
+                        "sp_vlad needs --sp-vlad-centres. Both SuperPoint backends require "
+                        "--features sp so the query descriptors exist")
+    p.add_argument("--sp-vocab", default=None,
+                   help="DBoW3 vocabulary trained on SuperPoint descriptors (train_sp_vocabulary.py)")
+    p.add_argument("--sp-vlad-centres", default=None,
+                   help="npz with 'centres' (K, 256) from train_sp_vlad.py")
     p.add_argument("--matcher", choices=("flann", "bf"), default="flann",
                    help="flann = LSH + Lowe ratio (shipping default); bf = BFMatcher Hamming + crossCheck")
     p.add_argument("--ransac", action="store_true",
@@ -183,9 +195,10 @@ def main() -> int:
         node.relocalization_loop_top_k = int(args.top_k)
 
     if args.features == "sp":
-        # Retrieval stays on ORB because the DBoW3 vocabulary is ORB-trained; only the
-        # matching layer changes, so any delta is attributable to the descriptor.
-        node.retrieval_extractor = orb_extractor
+        if args.retrieval_backend == "orb_dbow3":
+            # The vocabulary is ORB-trained, so retrieval must stay on ORB; only the
+            # matching layer changes and any delta is attributable to the descriptor.
+            node.retrieval_extractor = orb_extractor
         npz = np.load(args.sp_map_features)
         alt: dict[int, dict] = {}
         for key in npz.files:
@@ -203,6 +216,45 @@ def main() -> int:
             }
         node.alt_map_features = alt
         print(f"[info] SuperPoint map features: {len(alt)} keyframes from {args.sp_map_features}")
+
+    if args.retrieval_backend != "orb_dbow3":
+        if args.features != "sp":
+            print(f"ERROR: --retrieval-backend {args.retrieval_backend} needs --features sp",
+                  file=sys.stderr)
+            return 2
+        lc = node.map_loop_closure
+        # Rebuild the index over the SAME keyframe order LoopClosure already committed to,
+        # because find_candidate_timestamps maps result ids back through lc.timestamps.
+        map_ts = [int(ts) for ts in lc.timestamps]
+        missing = [ts for ts in map_ts if ts not in alt]
+        if missing:
+            print(f"ERROR: {len(missing)} map keyframes have no SuperPoint features "
+                  f"(first: {missing[0]}); rerun build_sp_features_for_map.py", file=sys.stderr)
+            return 2
+        t_idx0 = time.perf_counter()
+        if args.retrieval_backend == "sp_dbow3":
+            if not args.sp_vocab:
+                print("ERROR: --retrieval-backend sp_dbow3 needs --sp-vocab", file=sys.stderr)
+                return 2
+            from tinynav.core.models_trt import DBoW3Engine
+            lc.dbow3_engine = DBoW3Engine(args.sp_vocab)
+            for ts in map_ts:
+                lc.dbow3_engine.add(alt[ts])
+        else:
+            if not args.sp_vlad_centres:
+                print("ERROR: --retrieval-backend sp_vlad needs --sp-vlad-centres", file=sys.stderr)
+                return 2
+            from tinynav.core.vlad import compute_vlad
+            centres = np.load(args.sp_vlad_centres)["centres"].astype(np.float32)
+            # VLAD has no inverted index; ride the "embedding" path, which is a dense
+            # dot product against a (n_keyframes, K*C) matrix and already returns top_k.
+            lc.mode = "embedding"
+            lc.dbow3_engine = None
+            lc.embeddings = np.stack([compute_vlad(alt[ts]["descps"][0], centres) for ts in map_ts])
+            lc.embedding_similarity_threshold = -1.0
+            node.vlad_centres = centres
+        print(f"[info] {args.retrieval_backend} index built over {len(map_ts)} keyframes "
+              f"in {time.perf_counter() - t_idx0:.1f}s")
 
     # --- queries -------------------------------------------------------------
     ref_poses = node.map_poses
@@ -318,6 +370,16 @@ def main() -> int:
             "wall_ms": round(wall_ms, 2),
             "xy_err_m": None if not ok else round(xy_err, 4),
             "rot_err_deg": None if not ok else round(rot_err, 3),
+            # The solved pose and the transformed ground truth, not just their distance.
+            # A scalar error cannot distinguish random scatter from a systematic offset,
+            # and the SE(2) transform these are scored against was itself fitted from
+            # retrieval matches -- so it has to be checkable after the fact.
+            "solved_x": None if not ok else round(float(pose_in_world[0, 3]), 4),
+            "solved_y": None if not ok else round(float(pose_in_world[1, 3]), 4),
+            "gt_x": round(float(gt_in_ref[0, 3]), 4),
+            "gt_y": round(float(gt_in_ref[1, 3]), 4),
+            "query_x": round(float(query_poses[int(ts)][0, 3]), 4),
+            "query_y": round(float(query_poses[int(ts)][1, 3]), 4),
             "fail_code": "" if ok else stats.get("fail_code", ""),
             "retrieval_hit": int(retrieval_hit),
             "retrieval_best_m": None if not np.isfinite(retrieval_best_m) else round(retrieval_best_m, 4),

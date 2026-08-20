@@ -36,7 +36,7 @@ import asyncio
 import threading
 import time
 from tf2_ros import TransformBroadcaster
-from tinynav.core.build_map_node import TinyNavDB
+from tinynav.core.build_map_node import LOOP_CLOSURE_DEFAULTS, load_vlad_centres, TinyNavDB
 from tinynav.core.build_map_node import solve_pose_graph
 import einops
 from tinynav.core.build_map_node import OdomPoseRecorder, LoopClosure
@@ -202,6 +202,7 @@ class MapNode(Node):
         matcher,
         embedding_extractor,
         loop_closure_mode: str = "embedding",
+        vlad_centres_path: str | None = None,
         loop_closure_use_bow: bool = False,
         dbow3_vocabulary_path: str | None = None,
         verbose_timer: bool = True,
@@ -270,6 +271,9 @@ class MapNode(Node):
         self.embedding_extractor = embedding_extractor
         self.loop_closure_use_bow = bool(loop_closure_use_bow)
         self.loop_closure_mode = "bow" if self.loop_closure_use_bow else loop_closure_mode
+        # Distinct from self.vlad_centres below, which is an evaluation hook that
+        # overrides the query embedding while the index stays in embedding mode.
+        self.frozen_vlad_centres = load_vlad_centres(vlad_centres_path)
         self.dbow3_vocabulary_path = dbow3_vocabulary_path
         self.tinynav_db_path = tinynav_db_path
 
@@ -318,11 +322,9 @@ class MapNode(Node):
         self.relative_pose_constraint = []
         self.last_keyframe_timestamp = None
 
-        self.loop_similarity_threshold = 0.90
-        self.loop_top_k = 1
-
-        self.relocalization_threshold = 0.85
-        self.relocalization_loop_top_k = 3
+        (self.loop_similarity_threshold, self.loop_top_k,
+         self.relocalization_threshold, self.relocalization_loop_top_k) = \
+            LOOP_CLOSURE_DEFAULTS[self.loop_closure_mode]
         # Straight-line pursuit radius for /control/target_pose. 2.0 m sits at the
         # 1.82 m median the old arc-length walk was actually producing, so a healthy
         # path aims where it always did; the change is that a folded one no longer
@@ -355,6 +357,7 @@ class MapNode(Node):
             embedding_similarity_threshold=self.loop_similarity_threshold,
             embedding_top_k=self.loop_top_k,
             dbow3_vocabulary=shared_dbow3_vocabulary,
+            vlad_centres=self.frozen_vlad_centres,
         )
         self.map_poses = np.load(f"{tinynav_map_path}/poses.npy", allow_pickle=True).item()
         self.map_K = np.load(f"{tinynav_map_path}/intrinsics.npy")
@@ -367,6 +370,7 @@ class MapNode(Node):
             embedding_similarity_threshold=self.relocalization_threshold,
             embedding_top_k=self.relocalization_loop_top_k,
             dbow3_vocabulary=shared_dbow3_vocabulary,
+            vlad_centres=self.frozen_vlad_centres,
         )
         # Both databases hold their own copy now; release ours.
         del shared_dbow3_vocabulary
@@ -407,6 +411,9 @@ class MapNode(Node):
         # relocalize_with_depth for why retrieval and matching may need to differ.
         self.retrieval_extractor = None
         self.alt_map_features = None
+        # VLAD ranks by dense descriptor, not by an inverted index, so it needs the query
+        # encoded the same way the map was rather than the embedding engine's output.
+        self.vlad_centres = None
 
         self.T_from_map_to_odom = None
 
@@ -994,6 +1001,9 @@ class MapNode(Node):
             retrieval_kp = rf["kpts"][0] if rf["kpts"].ndim == 3 else rf["kpts"]
             retrieval_desc = rf["descps"][0] if rf["descps"].ndim == 3 else rf["descps"]
         t0 = time.perf_counter()
+        if self.vlad_centres is not None:
+            from tinynav.core.vlad import compute_vlad
+            query_embedding = compute_vlad(retrieval_desc, self.vlad_centres)
         candidates = self.map_loop_closure.find_candidate_timestamps(
             retrieval_kp,
             retrieval_desc,
@@ -1680,7 +1690,10 @@ def main(args=None):
     # into an unrotated file on the board's eMMC, and these fire per keyframe.
     parser.add_argument("--verbose_timer", action="store_true", default=False, help="Enable verbose timer output")
     parser.add_argument("--no_verbose_timer", dest="verbose_timer", action="store_false", help="Disable verbose timer output")
-    parser.add_argument("--loop-closure-mode", type=str, default="embedding", choices=["embedding", "bow"])
+    parser.add_argument("--loop-closure-mode", type=str, default="embedding",
+                        choices=["embedding", "bow", "vlad"])
+    parser.add_argument("--vlad-centres", type=str, default=None,
+                        help="npz/npy holding the frozen VLAD vocabulary; required by --loop-closure-mode vlad")
     parser.add_argument("--loop-closure-use-bow", action="store_true", help="Use ORB+BF and DBoW3 for loop closure")
     parser.add_argument(
         "--dbow3-vocabulary-path",
@@ -1712,6 +1725,7 @@ def main(args=None):
         matcher=matcher,
         embedding_extractor=embedding_extractor,
         loop_closure_mode=parsed_args.loop_closure_mode,
+        vlad_centres_path=parsed_args.vlad_centres,
         loop_closure_use_bow=use_bow,
         dbow3_vocabulary_path=parsed_args.dbow3_vocabulary_path,
         verbose_timer=parsed_args.verbose_timer,

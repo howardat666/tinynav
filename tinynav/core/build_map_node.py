@@ -143,13 +143,43 @@ def solve_pose_graph(pose_graph_used_pose:dict, relative_pose_constraint:list, m
     optimized_camera_poses = pose_graph_solve(pose_graph_used_pose, relative_pose_constraint, constant_pose_index_dict, max_iteration_num)
     return {t: optimized_camera_poses[t] for t in sorted(optimized_camera_poses.keys())}
 
+
+
+# Similarity scales are backend-specific and must not be shared. Calibrated on map_gt
+# (63 true loops vs all >5 m pairs) and map_gt<-map_night for relocalization:
+#   DINOv2 CLS cosine  true loop ~0.9
+#   VLAD cosine        true loop 0.37-0.43, unrelated pairs peak at 0.43 -> 0.35 keeps
+#                      100% recall at ~1 false candidate per frame, and PnP's
+#                      inliers>=100 gate is what actually accepts a loop.
+# Relocalization is cross-session and its two populations overlap heavily (correct pairs
+# p5=0.22 vs wrong pairs p95=0.29), so no threshold separates them; rank by top-k and let
+# PnP decide, with the threshold only dropping hopeless candidates.
+LOOP_CLOSURE_DEFAULTS = {
+    #                  loop_thr, loop_top_k, reloc_thr, reloc_top_k
+    "embedding": (0.90, 1, 0.85, 3),
+    "bow":       (0.90, 1, 0.85, 3),   # DBoW3 scores are not calibrated here
+    "vlad":      (0.35, 5, 0.10, 3),
+}
+
+
+def load_vlad_centres(path: str | None) -> np.ndarray | None:
+    """Load a frozen VLAD vocabulary from .npy or single-array .npz."""
+    if not path:
+        return None
+    data = np.load(path)
+    if hasattr(data, "files"):
+        data = data[data.files[0]]
+    return np.ascontiguousarray(data, dtype=np.float32)
+
+
 class LoopClosure:
     """
     Loop-closure candidate search over TinyNavDB keyframes.
 
     Input query is (kp, desc, embedding). Candidates are ranked by:
-      1) embedding cosine similarity (embedding mode), or
-      2) DBoW3 score (bow mode).
+      1) embedding cosine similarity (embedding mode),
+      2) DBoW3 score (bow mode), or
+      3) SuperPoint VLAD cosine similarity (vlad mode).
     """
 
     def __init__(
@@ -161,6 +191,7 @@ class LoopClosure:
         embedding_similarity_threshold: float = 0.90,
         embedding_top_k: int = 20,
         dbow3_vocabulary=None,
+        vlad_centres: np.ndarray | None = None,
     ):
         """
         Args:
@@ -168,6 +199,9 @@ class LoopClosure:
                 instead of re-reading dbow3_vocabulary_path from disk. Pass this
                 when several LoopClosure instances share one vocabulary; see
                 DBoW3Engine.load_vocabulary().
+            vlad_centres: (K, C) frozen VLAD vocabulary for mode='vlad'. Frozen, so a
+                descriptor exists from the first keyframe -- unlike a per-map vocabulary,
+                which cannot be trained until mapping has already finished.
         """
         self.db = db
         self.timestamps = list(timestamps)
@@ -176,11 +210,22 @@ class LoopClosure:
         self.embedding_top_k = int(embedding_top_k)
         self.timestamp_to_idx = {ts: i for i, ts in enumerate(self.timestamps)}
         self.dbow3_engine = None
+        self.vlad_centres = None
 
-        if self.mode not in ("embedding", "bow"):
+        if self.mode not in ("embedding", "bow", "vlad"):
             raise ValueError(f"Unsupported LoopClosure mode: {self.mode}")
 
-        if self.mode == "embedding":
+        if self.mode == "vlad":
+            if vlad_centres is None:
+                raise ValueError("vlad_centres is required when mode='vlad'")
+            self.vlad_centres = np.ascontiguousarray(vlad_centres, dtype=np.float32)
+            self.embeddings = np.zeros((0, self.vlad_centres.size), dtype=np.float32)
+            rows = [self._vlad_for(ts) for ts in self.timestamps]
+            if rows:
+                # float32 on purpose: the A55 has no usable float16/int8 matmul, so a
+                # narrower index costs 2-7x the search time to save memory.
+                self.embeddings = np.ascontiguousarray(np.stack(rows, axis=0), dtype=np.float32)
+        elif self.mode == "embedding":
             if len(self.timestamps) == 0:
                 self.embeddings = np.zeros((0, 1), dtype=np.float32)
             else:
@@ -218,16 +263,23 @@ class LoopClosure:
             return
         self.timestamp_to_idx[ts] = len(self.timestamps)
         self.timestamps.append(ts)
-        if self.mode == "embedding":
-            emb = self._normalize_embedding(self.db.get_embedding(ts))
-            emb = emb[None, :]
+        if self.mode in ("embedding", "vlad"):
+            row = (self._vlad_for(ts) if self.mode == "vlad"
+                   else self._normalize_embedding(self.db.get_embedding(ts)))[None, :]
             if self.embeddings.shape[0] == 0:
-                self.embeddings = emb
+                self.embeddings = row
             else:
-                self.embeddings = np.concatenate([self.embeddings, emb], axis=0)
+                self.embeddings = np.concatenate([self.embeddings, row], axis=0)
         else:
             cand_features = self.db.get_features(ts)
             self.dbow3_engine.add(cand_features)
+
+    def _vlad_for(self, timestamp: int) -> np.ndarray:
+        from tinynav.core.bow_retrieval import valid_superpoint_descriptors
+        from tinynav.core.vlad import compute_vlad
+
+        return compute_vlad(valid_superpoint_descriptors(self.db.get_features(int(timestamp))),
+                            self.vlad_centres)
 
     @staticmethod
     def _normalize_embedding(embedding: np.ndarray) -> np.ndarray:
@@ -243,10 +295,15 @@ class LoopClosure:
         top_k: int | None = None,
         allowed_timestamps: set[int] | None = None,
     ) -> list[dict]:
-        if self.mode == "embedding":
+        if self.mode in ("embedding", "vlad"):
             if self.embeddings.shape[0] == 0:
                 return []
-            emb = self._normalize_embedding(embedding)
+            if self.mode == "vlad":
+                from tinynav.core.vlad import compute_vlad
+                emb = compute_vlad(np.asarray(desc, dtype=np.float32).reshape(-1, self.vlad_centres.shape[1]),
+                                   self.vlad_centres)
+            else:
+                emb = self._normalize_embedding(embedding)
             similarities = self.embeddings @ emb
             sorted_idx = np.argsort(similarities)[::-1]
             k = self.embedding_top_k if top_k is None else int(top_k)
@@ -378,9 +435,16 @@ def generate_occupancy_map(poses, db, K, baseline, resolution = 0.1, step = 100,
 
 class IntKeyShelf:
     def __init__(self, filename):
-        # Force dbm.dumb backend so map DB files are portable across host/device runtimes.
-        self._raw_db = dbm.dumb.open(filename, "c")
-        self.db = shelve.Shelf(self._raw_db, protocol=pickle.HIGHEST_PROTOCOL)
+        # Prefer dbm.dumb so new maps stay portable across host/device runtimes (the board's
+        # Python has no gdbm/ndbm at all). Maps built by upstream main use shelve's default
+        # backend instead, so fall back to it when a non-empty .db is what is on disk --
+        # note dumb.open(..., "c") would silently create an empty store next to it.
+        db_path = f"{filename}.db"
+        if os.path.exists(db_path) and os.path.getsize(db_path) > 0:
+            self.db = shelve.open(filename)
+        else:
+            self._raw_db = dbm.dumb.open(filename, "c")
+            self.db = shelve.Shelf(self._raw_db, protocol=pickle.HIGHEST_PROTOCOL)
 
     def __getitem__(self, key: int):
         return self.db[str(key)]
@@ -815,6 +879,7 @@ class BuildMapNode(Node):
         matcher,
         embedding_extractor,
         loop_closure_mode: str = "embedding",
+        vlad_centres_path: str | None = None,
         loop_closure_use_bow: bool = False,
         dbow3_vocabulary_path: str | None = None,
         verbose_timer: bool = True,
@@ -848,6 +913,7 @@ class BuildMapNode(Node):
         self.embedding_extractor = embedding_extractor
         self.loop_closure_use_bow = bool(loop_closure_use_bow)
         self.loop_closure_mode = "bow" if self.loop_closure_use_bow else loop_closure_mode
+        self.vlad_centres = load_vlad_centres(vlad_centres_path)
         self.dbow3_vocabulary_path = dbow3_vocabulary_path
 
         self.bridge = CvBridge()
@@ -914,8 +980,8 @@ class BuildMapNode(Node):
 
         self.marker_id = 0
 
-        self.loop_similarity_threshold = 0.90
-        self.loop_top_k = 1
+        self.loop_similarity_threshold, self.loop_top_k = \
+            LOOP_CLOSURE_DEFAULTS[self.loop_closure_mode][:2]
         # Only built when loop closure is actually reachable. Every call site is
         # commented out ("temp disabled" at the add_timestamp and
         # find_loop_and_pose_graph lines below), so on this branch the object had zero
@@ -935,6 +1001,7 @@ class BuildMapNode(Node):
             dbow3_vocabulary_path=self.dbow3_vocabulary_path,
             embedding_similarity_threshold=self.loop_similarity_threshold,
             embedding_top_k=self.loop_top_k,
+            vlad_centres=self.vlad_centres,
         ) if self.loop_closure_enabled else None
 
         self.map_save_path = map_save_path
@@ -1397,7 +1464,10 @@ def main(args=None):
              "in the saved map depends on them and they dominated the per-keyframe "
              "cost on the X5.",
     )
-    parser.add_argument("--loop-closure-mode", type=str, default="embedding", choices=["embedding", "bow"])
+    parser.add_argument("--loop-closure-mode", type=str, default="embedding",
+                        choices=["embedding", "bow", "vlad"])
+    parser.add_argument("--vlad-centres", type=str, default=None,
+                        help="npz/npy holding the frozen VLAD vocabulary; required by --loop-closure-mode vlad")
     parser.add_argument("--loop-closure-use-bow", action="store_true", help="Use ORB+BF and DBoW3 for loop closure")
     parser.add_argument(
         "--dbow3-vocabulary-path",
@@ -1435,6 +1505,7 @@ def main(args=None):
         matcher=matcher,
         embedding_extractor=embedding_extractor,
         loop_closure_mode=parsed_args.loop_closure_mode,
+        vlad_centres_path=parsed_args.vlad_centres,
         loop_closure_use_bow=use_bow,
         dbow3_vocabulary_path=parsed_args.dbow3_vocabulary_path,
         verbose_timer=parsed_args.verbose_timer,
