@@ -115,6 +115,50 @@ ORT 代理（per-channel）的 0.9567 —— 代理实验是保守下界。
 关键参数（从 ONNX 图里挖出，改动必须对齐）：NMS 半径 4、simple_nms 迭代 2 次、TopK=512 固定、
 `GridSample align_corners=1`、采样前 desc_map 先做通道 L2。
 
+## 🟢 2026-08-20 板上真机复测（新代码路径，`insight_full` 在跑）
+
+代码已同步到板上（`/userdata/x5/tinynav`），`make_sp_extractor()` 正确选中 `SuperPointBPU`，
+`sp_backbone.bin` md5 与本地一致。**这是第一次用接线后的代码在真机上跑，不再是手写命令。**
+
+```
+[BPU_PLAT] BPU Platform Version(1.3.6)  soc info(x5)
+[DNN] Runtime version = 1.23.10_(3.15.54 HBRT)   model builder version = 1.24.3
+加载 0.14 s   输出 (1,65,80,68) + (1,256,80,68) float32
+```
+
+⚠️ 版本不一致告警照旧出现（hbrt 3.15.54 vs model build 3.15.55），已知、无害，见 `x5_work/bpu/README.md`。
+
+| 阶段 | 记录值（08-17） | **08-20 实测（真实 infra1 帧）** | 差异 |
+|---|---|---|---|
+| BPU `hbDNNInfer` | 39.4 ms | **40.9** | ✅ 吻合 |
+| heatmap | 21.9 | **25.3** | ✅ 接近 |
+| NMS | 32.9 | **35.8** | ✅ 接近 |
+| **描述子采样** | **24.0** | 🔴 **58.1** | **慢 2.4×** |
+| 四项合计 | 146.7 | **160.0** | |
+| **端到端（含封装）** | — | 🔴 **201.0**（min 158.8 / max 214.4） | 比合计多 **41 ms** |
+
+🔴 **两个新发现：**
+
+1. **`sample_descriptors` 比记录慢 2.4 倍**（58.1 vs 24.0 ms），是唯一偏离的一项。
+   候选原因未区分：板上 numpy 已从 1.21.5 升到 **1.26.1**、`OPENBLAS_NUM_THREADS=2` 限制了
+   grid-sample 的矩阵乘、或与 `insight_full` 抢 CPU。**要查先固定这三个变量。**
+2. **封装层有约 41 ms 开销**，记录的 146.7 ms 不含它。主要是
+   `ascontiguousarray(float32).reshape()` + `/= 255.0` 在 640×544 上产生一个 1.4 MB 的新数组，
+   加上每帧一次 `asyncio.run()` 新建事件循环。⚠️ 导航代码本来就是这么调的
+   （`asyncio.run(self.extractor.infer(...))`），**所以 201 ms 才是部署会看到的数**。
+   可用预分配缓冲省掉一次分配，但先量清楚再改。
+
+**对时延预算的影响**：SuperPoint 从 146.7 → **201 ms**，重定位单次从约 750 → **约 805 ms**，
+预算 5 s，**仍然宽裕**。下面那张表的 SuperPoint 一行按 201 读。
+
+⚠️ **不要用随机噪声图测这条链** —— 阈值 5e-4 下噪声图的 NMS 候选爆炸，端到端量到 **506 ms**，
+是病态输入不是真实性能。我先踩过一次。
+
+其余同时验证通过的：`SuperPointMatcher` 直接吃 BPU 输出（自匹配 512/512）、
+打包词典可加载 `(256, 256) float32`、`compute_vlad` 板上 **19.4 ms**、
+移动后的旧路径 `tool/x5_board/{hbdnn,sp_post}.py` 在板上不存在（无残留副本）。
+板上依赖齐全：numpy **1.26.1**、cv2 4.11.0、einops 0.8.2、codetiming 1.4.0、scipy 1.15.3、numba 0.61.2。
+
 ## 重定位单次成本
 
 | 步骤 | 1120 帧地图 | 来源 |
