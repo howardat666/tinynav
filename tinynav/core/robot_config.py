@@ -187,7 +187,56 @@ LEKIWI_CONFIG = RobotConfig(
     allow_reverse=True,
 )
 
-ROBOT_CONFIGS = {cfg.name: cfg for cfg in (GO2_CONFIG, B2_CONFIG, LEKIWI_CONFIG)}
+# ESP32-S3 + TB6612 differential-drive car carrying a Looper. Measured 2026-08-18:
+# bounding box 240x120x210 mm, wheel diameter 70 mm, wheel separation 110 mm,
+# camera optical centre 183 mm off the floor and laterally centred.
+#
+# Body origin is the bounding-box centre, because that is the frame the two measured
+# offsets share: the camera sits 100 mm ahead of it and the drive axle 70 mm behind.
+# control_x is the drive axle, not the box centre -- on a differential drive that is
+# the only point with no lateral velocity, so it is what the trajectory rollout has
+# to be about. footprint_from_control() then gives front 195 mm / rear 55 mm, i.e. the
+# hull reaches 3.8x further ahead of the control centre than behind it.
+#
+# Rectangular rather than circular: a 240x120 box inscribed in a circle about the
+# drive axle would need r = 190 mm, more than three times the true 60 mm half-width,
+# and would refuse every real doorway.
+#
+# The third contact is a caster 80 mm ahead of the box centre. It needs no config field
+# -- it is well inside the hull -- but it is why an in-place turn scrubs rather than
+# pivoting cleanly about the drive axle, so measured yaw will lag the commanded one.
+DIFFCAR_CONFIG = RobotConfig(
+    name='diffcar', shape='square',
+    length=0.24, width=0.12,
+    camera_x=0.10, camera_y=0.0,
+    control_x=-0.07, control_y=0.0,
+    # A rectangle takes its geometry from the sample offsets, so safety_radius is
+    # only the soft-cost margin here (hard_clearance is 1e-3). LeKiwi uses 0.1 on a
+    # 300 mm base; 0.08 keeps the same relative slack on a 150 mm one.
+    safety_radius=0.08,
+    # Camera is level, optical centre 0.183 m up. Widened downward rather than
+    # tightened to the hull: the grid is 0.1 m per voxel and build_obstacle_map's span
+    # test needs spare z layers to distinguish a wall from floor noise, so a narrow
+    # band turns the floor into a wall (see docs/x5/diffcar.md).
+    obstacle_z_bottom=-0.3,
+    obstacle_z_top=0.2,
+    dilation_cells=0,
+    # Deliberately below what the base can do, not a measured ceiling: the firmware
+    # accepts up to 0.8 m/s. Capped here so the planner's predictions stay inside what
+    # the chassis delivers even loaded, which is the failure LeKiwi shipped once.
+    max_vx=0.5,
+    max_reverse_vx=0.2,
+    max_yaw=0.8,
+    # 110 mm wheel separation turns in place freely, and the firmware's `u <v> <w>`
+    # takes reverse directly.
+    allow_reverse=True,
+    front_blocked_m=0.2,
+)
+
+ROBOT_CONFIGS = {
+    cfg.name: cfg
+    for cfg in (GO2_CONFIG, B2_CONFIG, LEKIWI_CONFIG, DIFFCAR_CONFIG)
+}
 
 
 def robot_config(name: str) -> RobotConfig:

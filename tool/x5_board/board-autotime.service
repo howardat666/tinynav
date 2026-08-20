@@ -1,0 +1,18 @@
+[Unit]
+Description=Sync board clock over WiFi (X5 has no RTC)
+# WiFi 是 system_init.sh 里 insmod + wifi-connect.sh 起来的，不是 systemd 管的网络，
+# 所以这里不能 After=network-online.target —— 脚本自己轮询等 IP。
+After=S99auto_startup.service
+Wants=S99auto_startup.service
+
+[Service]
+Type=oneshot
+ExecStart=/userdata/x5/board_autotime.sh
+RemainAfterExit=no
+# 开机时 AP 可能还没就绪，失败就隔 60s 再来，最多 5 次
+Restart=on-failure
+RestartSec=60
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target

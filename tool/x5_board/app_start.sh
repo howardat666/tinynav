@@ -11,7 +11,7 @@ set -uo pipefail
 #     bash tool/x5_board/app_start.sh log
 #     bash tool/x5_board/app_start.sh stop
 #
-# Then, from the laptop's browser:  http://169.254.10.1:8000/
+# Then, from the laptop's browser:  http://<board-ip>:8000/ (printed by `status`)
 #
 # WHY A SCHEME LETTER AND NOT A CONFIG FILE
 #   The three schemes are the comparison. Each one is a fixed combination of
@@ -94,8 +94,13 @@ do_start() {
     # a broken one because the logs go somewhere nobody thinks to look.
     export TINYNAV_LOG_DIR="${TINYNAV_LOG_DIR:-${LOG_DIR}/nodes}"
     mkdir -p "${TINYNAV_LOG_DIR}"
-    export TINYNAV_ROBOT_TYPE=lekiwi
-    export TINYNAV_ACTUATOR=wheel
+    # Pinned so they never fall back to node_manager's go2/unitree defaults, but
+    # overridable: this chassis is not always LeKiwi. Getting the actuator wrong is
+    # not merely useless -- with the diff-drive car, wheel_odometry writes Feetech
+    # packets into the ESP32's single-character command parser (0x66 is 'f',
+    # forward), so a wrong actuator can drive the robot. Observed 2026-08-18.
+    export TINYNAV_ROBOT_TYPE="${TINYNAV_ROBOT_TYPE:-lekiwi}"
+    export TINYNAV_ACTUATOR="${TINYNAV_ACTUATOR:-wheel}"
     # Pinned for the same reason as the two above. Auto-detection greps `ros2 node
     # list` for /insight_full, and a successful call proves nothing about
     # completeness: DDS discovery is asynchronous and this board's ros2 daemon has
@@ -106,6 +111,11 @@ do_start() {
     export TINYNAV_SENSOR_MODE="${TINYNAV_SENSOR_MODE:-looper}"
     export TINYNAV_ODOM_SOURCE="${nav_src}"
     export TINYNAV_MAP_ODOM_SOURCE="${map_src}"
+
+    # Colour preview alone wants 3.6 Mbit/s at 5 fps and the board's WiFi transmit
+    # path caps near 2.5 (docs/x5/board_bringup.md 2.5). Drops it from the UI's topic
+    # list entirely, so nothing subscribes to it either.
+    export TINYNAV_DISABLE_COLOR="${TINYNAV_DISABLE_COLOR:-1}"
 
     # Offline map build limits. Without all four the build is OOM-killed on this
     # board: measured rc=137 at 0.5% progress, 645 MiB resident.
@@ -247,7 +257,11 @@ do_status() {
     # netstat, not ss: this board's busybox userland has no ss at all, and
     # `ss ... | grep -c` on an empty stream cheerfully reports 0 listeners.
     echo "port     : $(netstat -tln 2>/dev/null | grep -c ":${PORT}[[:space:]]") listener(s) on ${PORT}"
-    echo "web UI   : http://169.254.10.1:${PORT}/"
+    # Derived, not hardcoded: the USB address died when the C port became USB host for
+    # the WiFi dongle, and printing it sends you to a page that never loads.
+    ip=$(route -n | awk '$1=="0.0.0.0"{print $8; exit}')
+    ip=$(ifconfig "${ip:-lo}" 2>/dev/null | awk '/inet /{sub("addr:","",$2); print $2; exit}')
+    echo "web UI   : http://${ip:-<board-ip>}:${PORT}/"
     echo "nodes    :"
     pgrep -af 'looper_bridge_node|planning_node|cmd_vel_control|wheel_odometry_node|map_node|unitree' \
         | sed 's/^/  /' || echo "  (none)"
