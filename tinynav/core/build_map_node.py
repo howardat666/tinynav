@@ -14,6 +14,7 @@ from message_filters import Subscriber, ApproximateTimeSynchronizer
 from cv_bridge import CvBridge
 import cv2
 from codetiming import Timer
+import datetime
 import os
 import argparse
 import sys
@@ -642,6 +643,24 @@ class TinyNavDB():
         if self.rgb_video_db is not None and hasattr(self.rgb_video_db, "sync"):
             self.rgb_video_db.sync()
 
+def _as_nanoseconds(value) -> int:
+    """Nanoseconds from whatever rosbag2_py hands back for a time or a duration.
+
+    The board's rosbag2 returns datetime/timedelta here while other builds return
+    rclpy Time and Duration. Assuming `.nanoseconds` made the fast path throw on the
+    board, so every build silently fell back to a full sequential pass over the bag --
+    2.0 GB off eMMC to recover two integers.
+    """
+    ns = getattr(value, "nanoseconds", None)
+    if ns is not None:
+        return int(ns)
+    if isinstance(value, datetime.timedelta):
+        return int(value.total_seconds() * 1e9)
+    if isinstance(value, datetime.datetime):
+        return int(value.timestamp() * 1e9)
+    return int(value)
+
+
 class BagPlayer(Node):
     def __init__(self, bag_uri: str, storage_id: str = "sqlite3", serialization_format: str = "cdr",
                  play_rate: float = 0.0, skip_topics: set[str] | None = None,
@@ -748,8 +767,8 @@ class BagPlayer(Node):
             # bag_0.db3 file inside it (node_manager does the latter).
             meta_dir = bag_uri if os.path.isdir(bag_uri) else os.path.dirname(bag_uri)
             metadata = Info().read_metadata(meta_dir, storage_id)
-            first_ns = int(metadata.starting_time.nanoseconds)
-            last_ns = first_ns + int(metadata.duration.nanoseconds)
+            first_ns = _as_nanoseconds(metadata.starting_time)
+            last_ns = first_ns + _as_nanoseconds(metadata.duration)
             if metadata.message_count > 0 and last_ns > first_ns:
                 self.get_logger().info(
                     f"bag time range from metadata: {metadata.message_count} messages, "
