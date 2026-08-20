@@ -152,6 +152,19 @@ _MAP_VISUALIZATION = os.environ.get('TINYNAV_MAP_VISUALIZATION', '0') == '1'
 # See _build_map_argv: 114 s of h264 per build, for videos only PC-side tools read.
 _MAP_SAVE_VIDEOS = os.environ.get('TINYNAV_MAP_SAVE_VIDEOS', '0') == '1'
 
+# Retrieval scheme. 'bow' is DBoW3 over ORB, the scheme the maps on the board were
+# built with. 'vlad' is VLAD over BPU SuperPoint: no 407 MB vocabulary and no
+# patch_tokens.db, but the map and the relocalization must use the same value or
+# every query misses -- so one variable feeds the build and both map_node launches.
+_LOOP_CLOSURE_MODE = os.environ.get('TINYNAV_LOOP_CLOSURE_MODE', 'bow')
+
+
+def _retrieval_argv() -> list[str]:
+    if _LOOP_CLOSURE_MODE == 'vlad':
+        return ['--loop-closure-mode', 'vlad']
+    return ['--loop-closure-mode', 'bow', '--loop-closure-use-bow',
+            '--dbow3-vocabulary-path', _DBOW3_VOCAB]
+
 
 # Bag topics with no consumer in a *looper* offline build, and only there.
 #
@@ -180,10 +193,7 @@ def _build_map_argv(map_save_path: str, bag_file: str, skip_topics: tuple = ()) 
         'python3', os.path.join(_TINYNAV_ROOT, 'tinynav/core/build_map_node.py'),
         '--map_save_path', map_save_path,
         '--bag_file', bag_file,
-        '--loop-closure-mode', 'bow',
-        '--loop-closure-use-bow',
-        '--dbow3-vocabulary-path', _DBOW3_VOCAB,
-    ]
+    ] + _retrieval_argv()
     if _MAP_PLAY_RATE:
         argv += ['--play-rate', _MAP_PLAY_RATE]
     if _MAP_SYNC_QUEUE:
@@ -1762,13 +1772,7 @@ class BackendNode(Ros2NodeManager):
             [
                 'python3', os.path.join(_TINYNAV_ROOT, 'tinynav/core/map_node.py'),
                 '--tinynav_map_path', self.map_path,
-                '--loop-closure-mode', 'bow',
-                '--loop-closure-use-bow',
-                # Same vocabulary as the build, and for the same reason: relocalization
-                # has to query the descriptors the map was indexed with, and ORBvoc.txt
-                # would OOM the board here exactly as it does there.
-                '--dbow3-vocabulary-path', _DBOW3_VOCAB,
-            ],
+            ] + _retrieval_argv(),
             env=_env,
         )
         if _ENABLE_CMD_VEL_NODE:
@@ -1818,12 +1822,7 @@ class BackendNode(Ros2NodeManager):
             'map_node',
             ['python3', os.path.join(_TINYNAV_ROOT, 'tinynav/core/map_node.py'),
              '--tinynav_map_path', self.map_path,
-             '--loop-closure-mode', 'bow',
-             '--loop-closure-use-bow',
-             # _DBOW3_VOCAB, not a literal. cmd_start_nav_nodes uses it; this path did
-             # not, so a nav *restart* loaded ORBvoc.txt -- 1735 MB on a 1307 MB board --
-             # and map_node was OOM-killed where a nav *start* had worked.
-             '--dbow3-vocabulary-path', _DBOW3_VOCAB],
+             ] + _retrieval_argv(),
             env=_env,
         )
         if _ENABLE_CMD_VEL_NODE:

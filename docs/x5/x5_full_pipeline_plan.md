@@ -476,3 +476,121 @@ cv2 4.6.0 在 `/userdata/tmp/pylibs`，**没有 scipy**，onnxruntime 1.18.0（�
 
 ⚠️ 在板上分配大数组会触发 OOM killer（实测 786 MB 就被杀，`insight_full` 未受影响）。
 写板上基准脚本要设内存上限。
+
+## 2026-08-20 SP+VLAD 板上首次端到端实测
+
+同一天先修掉了一个把所有实验都拖垮的根因,见 `board_bringup.md § 7.5`(外来 DDS 发现报文 →
+1.5 GB 分配 → 全局 OOM;修法是固件和 tinynav 两处都设 `ROS_LOCALHOST_ONLY=1`)。
+
+### 建图(`bag_2026_08_11_13_51_48`,90.4 s → 345 关键帧,墙上 368 s)
+
+| 阶段 | 次数 | 均值 | 占比 |
+|---|---|---|---|
+| `mapping_loop` | 345 | 218.9 ms | 44.2% |
+| **`feature_extractor`(SuperPoint@BPU)** | 345 | **175.2 ms**(123–242) | 35.4% |
+| **`occupancy_raycast`** | **1** | **19167 ms** | 11.2% |
+| `tf_publish` | 44 | 171.9 ms | 4.4% |
+| `msg_decode` | 345 | 8.8 ms | 1.8% |
+| `save_image_and_depth` | 345 | 8.0 ms | 1.6% |
+| `get_embeddings` | 345 | 4.4 ms | 0.9% |
+
+🟢 SuperPoint 在真实建图里 **175.2 ms**,比单独微基准的 201 ms **快 13%**。
+🟢 `get_embeddings` 4.4 ms 是 `DummyEmbeddingEngine` 返回零 —— **VLAD 在建图阶段不算**,
+描述子在加载地图时从 `features` 现算,所以 vlad 模式的建图成本就等于 SuperPoint。
+🔴 `occupancy_raycast` 一次 19.2 秒是固定尾部开销,和关键帧数无关的部分很大。
+
+**`--play-rate` 的实际行为**:实测播放 **0.246×**(比实时慢 4.07 倍),低于 0.3 也低于 1.0,
+所以**两个值一次都没触发过 sleep,行为完全等价**。它只在消费端快过设定值时才起作用。
+⚠️ 它保护的是 `looper_bridge_node`(另一个进程,跨 DDS,**无反压**),不是 `build_map_node`
+(同进程,`spin_once` 阻塞,天然逐帧等待)。这次 bridge 只用 34% CPU,没丢帧。
+
+### 与 BoW/ORB 的对照 —— 同 bag、同路线、同位姿源
+
+`map_n1_wheel`(08-11 建,bow)vs 新图(08-20 建,vlad),轨迹范围逐位相同:
+
+| | BoW/ORB | SP+VLAD |
+|---|---|---|
+| 关键帧 | 342 | 345 |
+| `features.dat` | **37.6 MB**(110 KB/帧) | **164.6 MB**(477 KB/帧) |
+| 地图总计 | 494.8 MB | 625.8 MB |
+| 外部词典 | `voc_office_k10L5.dbow3` **53 MB** | `vlad_centres_k256.npy` **256 KB** |
+
+差别全在描述子:ORB 32 字节 uint8 vs SuperPoint 256×float32 = 1024 字节,单个差 32 倍。
+
+🔴 **"vlad 省空间"要说清对谁省**:对 `map_day` 的 DINOv2 embedding 方案省 39%(省掉
+`patch_tokens`);**对 BoW 反而大 26%**。SP+VLAD 的真实优势是①运行时内存 —— DBoW3 的
+k10L5 词典加载要 407 MB,VLAD 只要 256 KB 中心 + 262 KB×关键帧数的索引(`map_node`
+实测 394 MB);②召回率 R@3 68.4% → 70.0%。
+
+### 重定位(752 次,948.9 s)
+
+| | |
+|---|---|
+| 成功率 | **728/752 = 96.8%**(`few_landmarks` 13 + `pnp_inliers` 11) |
+| 尝试频率 | **0.79 Hz**,每关键帧一次,`skipped_rate_limit=0` |
+| 单次 p50 | **876 ms**(min 540,max 1096),对 5 s 预算 |
+| `dropped_stale` | 7/760 = 0.9% |
+| 质量 | inlier p50 56.1%,landmarks p50 208,候选 sim p50 0.386 |
+
+阶段 p50:**`match` 533 ms(61%)** > `feature_extract` 186 ms > `candidate_search` 61 ms
+> `pnp` 31 > `db_load` 20 > `depth3d` 15 > `embedding` 3.1。
+
+🔴 **`match` 是唯一值得优化的地方**:3 个候选各约 178 ms,而 `cv2.BFMatcher(NORM_L2,
+crossCheck)` 对 512×256 描述子实测只要 **38.6 ms**,慢 4.6 倍。怀疑 `OPENBLAS_NUM_THREADS=2`
+加上满负载争抢。砍下来能把 876 ms 压到 500 ms 以下。
+
+**关键帧频率不是算力决定的**:间隔实测全部 ≥ 1040 ms、p50 1207 ms,是 bridge 的
+`--keyframe-static-interval 1.0` 在兜底(车基本静止)。真跑起来关键帧最高到 5 Hz,
+那时 876 ms 才会成为瓶颈(上限约 1.14 Hz)。
+
+⚠️ **web 的 "last ok" 会涨到 10 s 再跳回,是显示假象**:`map_node._RELOC_STATS_INTERVAL_S
+= 10.0`,`lastSuccessEpoch` 只在发布时刷新,后端每次 `/device/status` 用当前墙钟重新计龄
+→ 锯齿 1→11 s。真实频率看 `window.successHz`。同一时刻实测:窗口内 10.7 s 成功 9 次,
+而该字段显示 8.0 s。
+
+### 🔴 CPU 已经饱和,导航还没真开始
+
+⚠️ **`ps -o pcpu` 是进程自启动以来的平均值,不能用来量瞬时占用** —— 我用它得出过
+"5.1 核 / 8,还有余量"的错误结论。要用 `/proc/stat` 差分。工具:`tool/x5_board/` 外的
+`/userdata/x5/cpu_bpu.py`。
+
+12 秒窗口实测(重定位在跑,导航未启动):
+
+| 进程 | CPU |
+|---|---|
+| **`insight_full`** | **276.2%** |
+| `map_node` | 151.0% |
+| `looper_bridge` | 117.7% |
+| `uvicorn` | 74.5% |
+| `planning_node` | 67.8% |
+| `cmd_vel_control` | 40.1% |
+| `diffcar_control` | 39.8% |
+| **合计** | **767.2% = 7.67 / 8 核** |
+
+整机 CPU **85.9%**(单核 74–92%),**iowait 0.0%**,load 16 就是 16 个线程抢 8 个核。
+BPU ratio p50 **43%**、mean 48%、**max 98%**。温度 CPU 93.8 / DDR 92.8 / BPU 92.0 °C,
+**8 个核一个都没降频,dmesg 零热告警** —— 贴着上限但没被限速。
+
+🔑 **只剩 0.33 个核,而 `map_node` 的 A* 路径搜索一次都还没跑过**(全程
+`result=skip_no_poi`,16.7 ms)。导航一开,`planning_node` 要按周期评轨迹库、
+`cmd_vel_control` 要跟踪轨迹、`map_node` 要跑 `search_within_sdf_map_numba`
+(记录过 14.3 s 的离群),这些都要从这 0.33 个核里出。可预期的失效链是:
+重定位延迟 > 关键帧间隔 → `dropped_stale` 涨 → 重定位停摆(这个失效模式已经发生过一次),
+以及轨迹过期 → 车中途停(见 `nav_field_results.md`)。
+
+**最大的一块是 `insight_full` 的 276%,其中 VIO 线程占 98.8%(静止;运动时 2.11 核)。**
+方案 c 用轮速里程计,**没有任何东西订阅 VIO 话题**,所以它是纯浪费。
+🔴 **但板上现在关不掉**:`user_params.json` 没有 `vio_enabled` key,板上
+`libinsight_full_plugin.so`(md5 `fb0ac60a09fbbf1dc69f89d8c2e91ef7`)里也 grep 不到这个
+字符串。带开关的本地构建产物在
+`/home/dm/looper/LooperHub/tros_ws/install/lib/libinsight_full_plugin.so`
+(md5 `cb732ae809c416d232b088de1ce5f400`,含 `vio_enabled`),**部署它是导航前的第一优先级**。
+
+### 待查(2026-08-21)
+
+🔴 **20:24 整机重启一次,原因未确认。** 用户当时移动过板子,**接触/供电是首要怀疑**。
+反证热的证据:`dmesg` 零 thermal/throttle 告警、重启前 8 核全部满频未降频。
+⚠️ journal 不跨重启(`--list-boots` 只有一条),**看不到重启前的日志** —— 要查得先开
+persistent journal(`/etc/systemd/journald.conf` 的 `Storage=persistent`),否则下次重启
+同样什么都留不下。
+
