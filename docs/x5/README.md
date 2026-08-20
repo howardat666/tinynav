@@ -1,20 +1,44 @@
 # Looper X5 轮式导航 —— 任务框架
 
-> **目标**：Looper 相机（内含 D-Robotics X5）+ LeKiwi 轮式底盘，在**办公室室内**正常导航，**白天和夜晚都要能稳定重定位**。
+> **目标**：Looper 相机（内含 D-Robotics X5）+ 轮式底盘，在**办公室室内**正常导航，
+> **白天和夜晚都要能稳定重定位**。
 > **算力约束**：全部计算跑在相机内的单颗 X5 上，不外接算力。PC 只做离线建图。
-> **代码基线**：分支 `x5/wheel-nav`，基于 [PR #136](https://github.com/UniflexAI/tinynav/pull/136)（junlinp）= **方案 1（ORB 全经典）**
-> **数据与实测记录**：见 [`x5.md`](x5.md) —— 硬件占用、算法延迟/内存、BPU 分析、九方案参数对比
 
-> ## ⚠️ 本文写于 2026-08-04，两处前提已变（2026-08-14）
+> # 🔴 先读这个：本目录里并存两套方案，别搞混
 >
-> 1. 🔴 **底盘从 LeKiwi 三轮全向改为两轮差速** + 前万向轮，电机换有刷直流 + 驱动板，
->    中间加一个 **ESP32** 经 ttyS3/GH1.25 转 GPIO。导航栈本来就是单车模型，影响很小 ——
->    详见 [`nav_field_results.md`](nav_field_results.md) §7。
-> 2. 🟢 **「X5 不能做 USB host」是错的** —— 两个控制器都是 OTG，有运行时角色开关。
->    详见 [`usb_host_mode.md`](usb_host_mode.md)。
+> 本文和 `x5.md` 写于 **2026-08-04**，通篇是**旧方案**（LeKiwi 三轮全向 + ORB + DBoW3）的语境。
+> 项目在 08-14 变更方向，但**代码和大部分文档仍然是旧方案的**，所以读任何一句都要先确认它属于哪一套。
 >
-> 08-05 之后的真机导航实测与 PC 端到端重定位基线，全部在
-> [`nav_field_results.md`](nav_field_results.md)。
+> | 维度 | 旧方案（2026-08-04 立项） | **新方案（当前）** |
+> |---|---|---|
+> | 底盘 | LeKiwi 三轮**全向** | **两轮差速 + 单脚轮**（仿扫地机三轮） |
+> | 布局 | — | 相机 + **驱动轮前置**，脚轮后置，重心前移 |
+> | 电机 | Feetech STS3215 **总线舵机** —— 3 线**串联菊花链**接驱动板，X5 经 `ttyS3` 直连总线 | **有刷直流 + PWM**（TB6612 双 H 桥）—— 每个电机**单独**接驱动板，中间加 **ESP32-S3**，`ttyS3` @115200 转 GPIO<br>🔑 **接线方式就是最快的判据** |
+> | 执行器代码 | `TINYNAV_ACTUATOR=wheel` + `wheel_odometry_node` | `TINYNAV_ACTUATOR=diffcar` + `tinynav/platforms/diffcar_control.py` |
+> | 特征/描述子 | **ORB** | **SuperPoint** INT8，跑 BPU（39.4 ms/帧） |
+> | 检索 | **DBoW3** 自训练层次词典（约 300 MB 固定开销） | **VLAD** K=256（词典 256 KB，冻结、跨地图共享） |
+> | 里程计 | 相机 VIO | **轮速里程计**（ESP32 固件积分，实测航向漂移 **< 0.05°/m**）；VIO 待评估后关闭 |
+> | 通信 | USB-C 直连 `169.254.10.1` | **WiFi**（type-C 接网卡 = host 模式）；调试期切 device 模式走 USB |
+> | 深度帧率 | 12.8 Hz（固件默认 `depth_frame_skip=1`） | **5 Hz**（`depth_frame_skip: 4`，BPU 89%→38%） |
+> | 板上内存 | `MemTotal` 1307 MiB | **1787 MiB**（`ion_cma` 512→32 MiB，已持久化） |
+>
+> ## 文档归属
+>
+> | 属于**旧方案**，按上表换算后再读 | 属于**新方案** / 与方案无关（持续更新） |
+> |---|---|
+> | 本文（`README.md`）—— 九方案对比、里程计三变体、路线图 | [`x5_full_pipeline_plan.md`](x5_full_pipeline_plan.md) ⭐ **新方案的权威方案书** |
+> | [`x5.md`](x5.md) —— 九方案参数表、ORB/DBoW3 recall 数据 | [`diffcar.md`](diffcar.md) —— 差速车接入、ESP32 协议 |
+> | [`wheel_odometry.md`](wheel_odometry.md) —— LeKiwi **三轮全向**运动学 | [`board_bringup.md`](board_bringup.md) —— 板上环境、时钟、内存、USB 角色 |
+> | [`servo_bus.md`](servo_bus.md) —— Feetech 总线丢包排查<br>⚠️ 但它的 **UART 拓扑表和 `ttyS3` 独占性结论仍然有效** | [`depth_frame_skip.md`](depth_frame_skip.md) —— 12.8→5 Hz |
+> | [`odometry_comparison.md`](odometry_comparison.md) | [`nav_field_results.md`](nav_field_results.md) §7 —— 方向变更记录 |
+>
+> ## 两处曾经写错、现已推翻的结论
+>
+> 1. 🟢 **「X5 不能做 USB host」是错的** —— 两个控制器都是 OTG，有运行时角色开关。
+>    详见 [`usb_host_mode.md`](usb_host_mode.md)、[`board_bringup.md`](board_bringup.md) § 2.6。
+> 2. 🟢 **「固件没有关 VIO 的开关」是错的** —— LooperHub `54d4d7e` 已加 `vio_enabled` 启动开关
+>    （2026-08-11）。同理 `depth_frame_skip` 是**固件侧**的 StereoNet 分频器（`d457ee0`），
+>    不是订阅端丢帧，所以它确实省 BPU。详见 [`x5.md`](x5.md) § 3。
 
 ---
 
