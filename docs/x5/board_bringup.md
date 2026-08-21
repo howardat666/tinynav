@@ -1036,3 +1036,28 @@ systemd 把单元标成 failed —— 而"不需要顶"恰恰是最常见的正�
 | `x5_work/reloc_pc_baseline.md` | PC 侧基线，含更大样本量的成功率 |
 | [`depth_frame_skip.md`](depth_frame_skip.md) | depth 降到 5 Hz |
 | [`fix_64gb_mipi.md`](fix_64gb_mipi.md) | 64GB 相机 MIPI 修复 |
+
+## 🔴 持久日志和时钟保存:两个"看着装好了其实没生效"的坑
+
+**2026-08-21 板子掉线过一次,想查原因时发现日志根本不在。** 两个独立的失败:
+
+**① `/var/log/journal` 建好了,但当次启动 journald 还在往 `/run/log/journal`(内存)写。**
+`Storage=persistent` + 建目录**不足以让正在跑的 journald 切过去** —— 要么重启 journald,
+要么 `journalctl --flush`。所以持久日志是从**下一次启动**才真正生效的,而故障就发生在这之前。
+判据:`journalctl` 各时段行数出现空洞(实测 15:00–16:00 有 194 行、**16:00–18:50 零行**、
+18:50 之后 5909 行),而且 `/var/log/journal` 里只有一个 `system.journal`、创建时间等于
+本次启动的早期时刻。
+
+**② `board-savetime.timer` 每次启动只触发一次。**
+`board-savetime.service` 原来是 `Type=oneshot` + `ExecStop=`(为了关机存一次)+
+**`RemainAfterExit=yes`**,于是单元常驻 active,而 **`OnUnitActiveSec` 对一个从不退出 active
+的单元不会再排下一次** —— 实测 `LAST=开机+2min, NEXT=n/a`,存档永远停在"上次开机时刻"。
+后果:2026-08-21 那次重启 `board-restoretime` 恢复出来的时间**慢了 3 小时 35 分**,
+journal 早期条目被打上 3.5 小时前的时间戳,`--list-boots` 因此看起来只有一个横跨 4 小时的启动。
+
+修法是**拆成两个单元**:定时那个是纯 `oneshot`(绝不能有 `RemainAfterExit`),关机那个单独一个
+`board-savetime-shutdown.service`(必须有 `RemainAfterExit=yes`,否则 `ExecStop` 没机会跑)。
+⚠️ **改完必须 `systemctl stop board-savetime.service`** —— `daemon-reload` 不会把已经处于
+active 的单元拽回来,不停掉的话 `NEXT` 依旧是 `n/a`(我第一次就是这样,以为没修好)。
+验收判据:`systemctl list-timers board-savetime.timer` 的 `NEXT` 有具体时刻、
+`systemctl is-active board-savetime.service` 跑完是 `inactive`、`/var/lib/board-lasttime` 每 5 分钟变。

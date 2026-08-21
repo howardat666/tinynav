@@ -1,15 +1,10 @@
 [Unit]
 Description=Save current clock for the next boot
-# 关机时也存一次，否则最后 5 分钟的时间白丢。
-DefaultDependencies=no
-Before=shutdown.target
-Conflicts=shutdown.target
 
 [Service]
+# 🔴 绝对不能加 RemainAfterExit=yes。加了这个单元就常驻 active，而 timer 的
+# OnUnitActiveSec 对一个从不退出 active 的单元不会再触发 —— 实测每次开机只存一次
+# (LAST=开机+2min, NEXT=n/a)，于是存档永远是"上次开机时刻"，2026-08-21 那次重启
+# 恢复出来的时间慢了 3 小时 35 分。关机时的那一次由 board-savetime-shutdown 负责。
 Type=oneshot
-ExecStart=/userdata/x5/board_savetime.sh save
-ExecStop=/userdata/x5/board_savetime.sh save
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
+ExecStart=/usr/local/sbin/board_savetime.sh save

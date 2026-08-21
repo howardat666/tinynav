@@ -1,0 +1,16 @@
+[Unit]
+Description=Save the clock one last time on shutdown
+# 关机那一次必须单独一个单元：它需要 RemainAfterExit=yes 才能让 ExecStop 有机会跑，
+# 而那个标志会让定时那一路失效（见 board-savetime.service 里的说明）。
+DefaultDependencies=no
+Before=shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=/usr/local/sbin/board_savetime.sh save
+
+[Install]
+WantedBy=multi-user.target
