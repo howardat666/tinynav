@@ -313,7 +313,7 @@ def _actuator_geometry() -> dict | None:
             'lengthWidthM': [_ROBOT.length, _ROBOT.width],
             # Offsets relative to the control point, which is what the node is given.
             'cameraOffsetForwardLeftUp': [
-                round(_ROBOT.camera_x - _ROBOT.control_x, 4), -_ROBOT.camera_y, 0.183],
+                round(_ROBOT.camera_x - _ROBOT.control_x, 4), _ROBOT.camera_y, 0.18],
             'maxVx': _ROBOT.max_vx,
             'maxYaw': _ROBOT.max_yaw,
         }
@@ -328,7 +328,12 @@ def _diffcar_control_argv() -> list[str]:
     return _node_argv('tinynav/platforms/diffcar_control.py') + [
         '--ros-args',
         '-p', f'port:={_WHEEL_PORT}',
-        '-p', f'camera_offset_xyz:=[{cam_x},{-_ROBOT.camera_y},0.183]',
+        # camera_y, not -camera_y: RobotConfig documents it as a body-frame *left*
+        # offset and base_pose_to_camera_pose wants [forward, left, up], so the two
+        # agree already. The negation was harmless only while diffcar's camera_y was 0;
+        # the trinocular's infra1 -- the image the whole stack runs on -- sits 50 mm
+        # left of the middle lens, and a flipped sign puts every obstacle 100 mm off.
+        '-p', f'camera_offset_xyz:=[{cam_x},{_ROBOT.camera_y},0.18]',
         '-p', f'max_vx:={_ROBOT.max_vx}',
         '-p', f'max_yaw:={_ROBOT.max_yaw}',
         '-p', 'cmd_vel_topic:=/cmd_vel',

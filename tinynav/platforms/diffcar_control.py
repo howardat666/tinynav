@@ -92,10 +92,13 @@ class DiffCarControlNode(Node):
         super().__init__("diffcar_control")
         p = self.declare_parameter
         p("port", "/dev/ttyS3")
-        # base_link -> camera as [forward, left, up]. base_link is the drive axle;
-        # the camera sits 100 mm ahead of the box centre and the axle 70 mm behind it,
-        # hence 0.17 forward. 0.183 is the measured optical-centre height.
-        p("camera_offset_xyz", [0.17, 0.0, 0.183])
+        # base_link -> camera as [forward, left, up]. base_link is the drive axle.
+        # After the 2026-08-21 front-drive rebuild the camera sits 90 mm ahead of the
+        # box centre and the axle 40 mm ahead, so only 50 mm separates them -- it was
+        # 170 mm when the axle was at the back. Height 0.18 is the measured optical
+        # centre. node_manager overrides all three from DIFFCAR_CONFIG; this default
+        # only applies to a hand-launched node.
+        p("camera_offset_xyz", [0.05, 0.05, 0.18])
         p("cmd_vel_topic", "/cmd_vel")
         p("odom_topic", "/wheel/odometry")
         p("camera_pose_topic", "/wheel/camera_pose")

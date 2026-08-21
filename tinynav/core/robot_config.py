@@ -202,22 +202,30 @@ LEKIWI_CONFIG = RobotConfig(
 # drive axle would need r = 190 mm, more than three times the true 60 mm half-width,
 # and would refuse every real doorway.
 #
-# The third contact is a caster 80 mm ahead of the box centre. It needs no config field
-# -- it is well inside the hull -- but it is why an in-place turn scrubs rather than
-# pivoting cleanly about the drive axle, so measured yaw will lag the commanded one.
+# Rebuilt 2026-08-21 as front-wheel drive: the drive axle moved from 70 mm behind the
+# box centre to 40 mm ahead of it, and the caster now trails 110 mm behind. Every
+# number below is from that rebuild; the previous set described a 240x120 mm box with
+# the axle at the back and is wrong in every field.
+#
+# The caster trails rather than leads now, which is the stable arrangement going
+# forward, but an in-place turn still scrubs it sideways, so measured yaw lags the
+# commanded one.
 DIFFCAR_CONFIG = RobotConfig(
     name='diffcar', shape='square',
-    length=0.24, width=0.12,
-    camera_x=0.10, camera_y=0.0,
-    control_x=-0.07, control_y=0.0,
-    # A rectangle takes its geometry from the sample offsets, so safety_radius is
-    # only the soft-cost margin here (hard_clearance is 1e-3). LeKiwi uses 0.1 on a
-    # 300 mm base; 0.08 keeps the same relative slack on a 150 mm one.
-    safety_radius=0.08,
-    # Camera is level, optical centre 0.183 m up. Widened downward rather than
-    # tightened to the hull: the grid is 0.1 m per voxel and build_obstacle_map's span
-    # test needs spare z layers to distinguish a wall from floor noise, so a narrow
-    # band turns the floor into a wall (see docs/x5/diffcar.md).
+    # Wider than it is long: 350 mm across the body, 280 mm front to back. The 320 mm
+    # drive-wheel track sits inside that, so the body is what the planner must clear.
+    length=0.28, width=0.35,
+    camera_x=0.09, camera_y=0.05,
+    # The drive axle, which is what a differential base actually rotates about.
+    control_x=0.04, control_y=0.0,
+    # A rectangle takes its geometry from the sample offsets, so safety_radius is only
+    # the soft-cost margin here (hard_clearance is 1e-3). LeKiwi uses 0.1 on a 300 mm
+    # base; 0.1 keeps the same relative slack on a 350 mm one.
+    safety_radius=0.1,
+    # Camera is level, optical centre 0.18 m up. Widened downward rather than tightened
+    # to the hull: the grid is 0.1 m per voxel and build_obstacle_map's span test needs
+    # spare z layers to distinguish a wall from floor noise, so a narrow band turns the
+    # floor into a wall (see docs/x5/diffcar.md).
     obstacle_z_bottom=-0.3,
     obstacle_z_top=0.2,
     dilation_cells=0,
@@ -226,9 +234,10 @@ DIFFCAR_CONFIG = RobotConfig(
     # the chassis delivers even loaded, which is the failure LeKiwi shipped once.
     max_vx=0.5,
     max_reverse_vx=0.2,
+    # An in-place turn at this rate needs 0.128 m/s at each wheel on the 320 mm track,
+    # against 0.044 on the old 110 mm one -- the wider base costs wheel speed for the
+    # same yaw, so this is no longer nearly free.
     max_yaw=0.8,
-    # 110 mm wheel separation turns in place freely, and the firmware's `u <v> <w>`
-    # takes reverse directly.
     allow_reverse=True,
     front_blocked_m=0.2,
 )
