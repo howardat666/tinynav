@@ -148,7 +148,10 @@ class DiffCarControlNode(Node):
         self._pc_ok = None
         self._pc_sent = None
         self._pc_sent_at = 0.0
-        self.batt_pub = self.create_publisher(Float32, "/battery", 10)
+        # 伏特发到 /battery_voltage，不是 /battery。/battery 是四足 unitree_control 的
+        # 百分比契约，前端直接当 "%" 渲染 —— 把电压发进去会显示成 "10%"，而 3S 锂电
+        # 9.98V 的真实余量恰好也是 5~10%，于是错数看着像对的，比明显错的更危险。
+        self.batt_pub = self.create_publisher(Float32, "/battery_voltage", 10)
         self._batt_period = float(g("battery_period_s").value)
         self._batt_warn = float(g("battery_warn_v").value)
         self._batt_at = 0.0

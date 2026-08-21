@@ -160,7 +160,12 @@ def _jetson_gpu_percent() -> float | None:
 
 @router.get('/sysinfo')
 def device_sysinfo():
-    cpu = psutil.cpu_percent(interval=0.2)
+    # 一次阻塞采样同时给出合计和每核，两个数必须来自同一个时间窗。
+    # 以前合计用 interval=0.2（真实窗口）而每核用 interval=0.0（距上次调用的增量，
+    # 也就是距上次刷新这个面板的整段时间），后端刚起时那一次更是"开机至今的平均" ——
+    # 于是面板上"合计"和"每核"天生对不上，而且第一眼看到的每核值是历史平均。
+    per_core = psutil.cpu_percent(interval=0.2, percpu=True)
+    cpu = sum(per_core) / max(1, len(per_core))
     mem = psutil.virtual_memory()
     storage = _storage_entries()
     # Kept so an older frontend keeps working: the first row, now the data volume.
@@ -169,7 +174,7 @@ def device_sysinfo():
               {'disk_percent': 0.0, 'disk_used_gb': 0.0, 'disk_total_gb': 0.0})
     return {
         'cpu_percent': round(cpu, 1),
-        'cpu_per_core': [round(x, 1) for x in psutil.cpu_percent(interval=0.0, percpu=True)],
+        'cpu_per_core': [round(x, 1) for x in per_core],
         'load_1m': round(psutil.getloadavg()[0], 2),
         'mem_percent': round(mem.percent, 1),
         'mem_used_gb': round(mem.used / 1024 ** 3, 1),

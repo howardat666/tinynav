@@ -581,8 +581,13 @@ class BackendNode(Ros2NodeManager):
         # Long-lived, see _launch_wheel_odometry_if_configured.
         self._wheel_odom_proc: subprocess.Popen | None = None
 
-        # Battery level from /battery topic (published by unitree_control)
+        # Two different quantities on purpose. /battery is a percentage (unitree_control's
+        # contract, and what the UI renders with a "%"); /battery_voltage is volts from the
+        # diff car's ESP32. Publishing volts into the percentage field showed "10%" for a
+        # 9.98 V pack -- and a 3S pack at 9.98 V really is near 10%, so the wrong number
+        # looked right, which is worse than an obviously wrong one.
         self._battery: float | None = None
+        self._battery_volts: float | None = None
 
         # Path to the last successfully verified bag (after stop + ros2 bag info check)
         self._last_verified_bag: str | None = self._find_latest_bag()
@@ -596,6 +601,7 @@ class BackendNode(Ros2NodeManager):
 
         if self._manage_processes:
             self.create_subscription(Float32, '/battery', self._on_battery, 10)
+            self.create_subscription(Float32, '/battery_voltage', self._on_battery_volts, 10)
         self._detect_and_init_sensor()
         if self._manage_processes:
             self._start_unitree_if_configured()
@@ -611,6 +617,10 @@ class BackendNode(Ros2NodeManager):
     def _on_battery(self, msg: Float32):
         with self._lock:
             self._battery = float(msg.data)
+
+    def _on_battery_volts(self, msg: Float32):
+        with self._lock:
+            self._battery_volts = float(msg.data)
 
     def _on_mapping_percent(self, msg: Float32):
         with self._lock:
@@ -1435,6 +1445,7 @@ class BackendNode(Ros2NodeManager):
             raw = self.state
             pct = self.mapping_percent
             battery = self._battery
+            battery_volts = self._battery_volts
             nav_nodes = self._nav_nodes_running
             nav_paused = self._nav_paused
             reloc_stats = self._relocalization_stats
@@ -1447,6 +1458,7 @@ class BackendNode(Ros2NodeManager):
         map_files_exist = os.path.exists(os.path.join(self.map_path, 'occupancy_grid.npy'))
         return {
             'battery': battery,
+            'batteryVolts': battery_volts,
             'bagStatus': 'recording' if bag_recording else 'idle',
             'bagFileReady': bag_files_exist,
             'mapStatus': self._derive_map_status(raw, pct, map_files_exist),

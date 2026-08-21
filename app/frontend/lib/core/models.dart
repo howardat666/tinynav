@@ -103,6 +103,11 @@ class RelocStats {
 class DeviceStatus {
   final bool online;
   final double? battery;
+  /// Volts, from the diff car's ESP32. Separate from [battery], which is a
+  /// percentage (unitree_control's contract) -- volts rendered as "%" showed a
+  /// 9.98 V pack as "10%", and a 3S pack there really is near 10%, so the wrong
+  /// number looked right.
+  final double? batteryVolts;
   final String bagStatus;
   final bool bagFileReady;
   final String mapStatus;
@@ -116,6 +121,7 @@ class DeviceStatus {
   const DeviceStatus({
     required this.online,
     this.battery,
+    this.batteryVolts,
     required this.bagStatus,
     required this.bagFileReady,
     required this.mapStatus,
@@ -130,6 +136,7 @@ class DeviceStatus {
   factory DeviceStatus.fromJson(Map<String, dynamic> json) => DeviceStatus(
         online: json['online'] as bool? ?? false,
         battery: (json['battery'] as num?)?.toDouble(),
+        batteryVolts: (json['batteryVolts'] as num?)?.toDouble(),
         bagStatus: json['bagStatus'] as String? ?? 'idle',
         bagFileReady: json['bagFileReady'] as bool? ?? false,
         mapStatus: json['mapStatus'] as String? ?? 'idle',

@@ -65,13 +65,24 @@ class DeviceTab extends ConsumerWidget {
             title: 'System',
             children: [
               statusAsync.when(
-                data: (s) => s.battery != null
+                // Volts win when present: on the diff car that is the real reading,
+                // and the firmware cuts the motors at 9.6 V, so the number people need
+                // is the distance to that, not a percentage guessed from it.
+                data: (s) => s.batteryVolts != null
                     ? _InfoRow(
                         'Battery',
-                        '${s.battery!.toStringAsFixed(0)}%',
-                        valueColor: s.battery! < 20 ? Colors.red : null,
+                        '${s.batteryVolts!.toStringAsFixed(2)} V',
+                        valueColor: s.batteryVolts! < 10.2
+                            ? Colors.red
+                            : (s.batteryVolts! < 10.8 ? Colors.orange : null),
                       )
-                    : const _InfoRow('Battery', '—'),
+                    : s.battery != null
+                        ? _InfoRow(
+                            'Battery',
+                            '${s.battery!.toStringAsFixed(0)}%',
+                            valueColor: s.battery! < 20 ? Colors.red : null,
+                          )
+                        : const _InfoRow('Battery', '—'),
                 loading: () => const _LoadingRow(),
                 error: (_, __) => const _InfoRow('Battery', '—'),
               ),
