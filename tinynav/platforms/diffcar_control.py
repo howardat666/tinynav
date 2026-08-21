@@ -147,7 +147,7 @@ class DiffCarControlNode(Node):
             f"diffcar_control up on {g('port').value}, cam_offset={self.offset.tolist()}"
         )
 
-    def _icmp_echo(self, timeout: float = 1.0) -> bool:
+    def _icmp_echo(self, timeout: float = 2.5) -> bool:
         """One ICMP echo, raw socket. The board has no `ping` binary -- busybox is
         stripped -- and shelling out raised FileNotFoundError, which killed this thread
         silently on the first attempt. Root on the X5, so SOCK_RAW is available."""
@@ -188,10 +188,12 @@ class DiffCarControlNode(Node):
         heartbeat mid-line. Never lets an exception out -- a dead probe thread would
         leave the LED claiming everything is fine."""
         period = max(1.0, float(self.get_parameter("link_probe_period_s").value))
-        # Two consecutive misses before calling it unreachable: the very first probe
-        # after start-up loses to ARP resolution, and a single dropped packet on this
-        # WiFi is normal. One success is enough to clear it -- a false "fine" is worse
-        # than a late warning, so recovery is not debounced.
+        # Both numbers are measured, not guessed. 180 probes at 1 Hz over this WiFi:
+        # 17.2 percent "lost" at a 1.0 s timeout while p95 RTT was 839 ms and the max
+        # 991 ms -- so most of those were slow, not lost, hence the 2.5 s timeout above.
+        # Real loss bursts were never longer than 2 (seen 7 times in 3 minutes), so 2
+        # misses would false-positive; 3 leaves margin. One success clears it -- a false
+        # "fine" is worse than a late warning, so recovery is not debounced.
         misses = 0
         while True:
             try:
@@ -200,7 +202,7 @@ class DiffCarControlNode(Node):
                     self._pc_ok = True
                 else:
                     misses += 1
-                    if misses >= 2:
+                    if misses >= 3:
                         self._pc_ok = False
             except Exception as e:                       # noqa: BLE001
                 self.get_logger().warning(f"link probe failed, giving up on it: {e}")
