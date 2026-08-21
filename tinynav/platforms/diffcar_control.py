@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import os
 import re
+import socket
+import struct
 import termios
 import threading
 import time
@@ -107,6 +109,9 @@ class DiffCarControlNode(Node):
         # duplicated rather than imported so this node stays free of the planning stack.
         p("max_vx", 0.3)
         p("max_yaw", 0.8)
+        # Host that "the PC is reachable" means. Empty disables the heartbeat.
+        p("link_probe_host", "192.168.19.51")
+        p("link_probe_period_s", 3.0)
 
         g = self.get_parameter
         self.offset = np.asarray([float(v) for v in g("camera_offset_xyz").value], dtype=float)
@@ -126,9 +131,82 @@ class DiffCarControlNode(Node):
         self._cmd_stamp = 0.0
         self._pose = None
         self.create_timer(1.0 / TICK_HZ, self._tick)
+
+        # The ESP32 has no network, so it cannot tell whether the PC is reachable -- it
+        # can only be told, and only by whoever owns the serial port, which is this node.
+        # /dev/ttyS3 takes exactly one owner, so a separate daemon could not write here
+        # while we run. When this node is down nobody writes at all and the firmware's
+        # own "UART silent" detector lights amber, which is the honest signal.
+        self._probe_host = str(g("link_probe_host").value).strip()
+        self._pc_ok = None
+        self._pc_sent = None
+        self._pc_sent_at = 0.0
+        if self._probe_host:
+            threading.Thread(target=self._probe_loop, daemon=True).start()
         self.get_logger().info(
             f"diffcar_control up on {g('port').value}, cam_offset={self.offset.tolist()}"
         )
+
+    def _icmp_echo(self, timeout: float = 1.0) -> bool:
+        """One ICMP echo, raw socket. The board has no `ping` binary -- busybox is
+        stripped -- and shelling out raised FileNotFoundError, which killed this thread
+        silently on the first attempt. Root on the X5, so SOCK_RAW is available."""
+        pid = os.getpid() & 0xFFFF
+        hdr = struct.pack("!BBHHH", 8, 0, 0, pid, 1)
+        payload = b"tinynav-link"
+        chk = self._checksum(hdr + payload)
+        pkt = struct.pack("!BBHHH", 8, 0, chk, pid, 1) + payload
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+            sock.settimeout(timeout)
+            sock.sendto(pkt, (self._probe_host, 0))
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                data, _ = sock.recvfrom(1024)
+                # 20-byte IPv4 header, then type 0 = echo reply; match our id
+                if len(data) >= 28 and data[20] == 0 and data[24:26] == struct.pack("!H", pid):
+                    return True
+            return False
+        except (OSError, socket.timeout):
+            return False
+        finally:
+            if sock is not None:
+                sock.close()
+
+    @staticmethod
+    def _checksum(data: bytes) -> int:
+        if len(data) % 2:
+            data += b"\x00"
+        total = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+        total = (total & 0xFFFF) + (total >> 16)
+        return ~((total & 0xFFFF) + (total >> 16)) & 0xFFFF
+
+    def _probe_loop(self) -> None:
+        """Reachability verdict for _tick. Does not touch the serial port itself: every
+        write goes through _tick, so the 20 Hz command stream never interleaves with a
+        heartbeat mid-line. Never lets an exception out -- a dead probe thread would
+        leave the LED claiming everything is fine."""
+        period = max(1.0, float(self.get_parameter("link_probe_period_s").value))
+        # Two consecutive misses before calling it unreachable: the very first probe
+        # after start-up loses to ARP resolution, and a single dropped packet on this
+        # WiFi is normal. One success is enough to clear it -- a false "fine" is worse
+        # than a late warning, so recovery is not debounced.
+        misses = 0
+        while True:
+            try:
+                if self._icmp_echo():
+                    misses = 0
+                    self._pc_ok = True
+                else:
+                    misses += 1
+                    if misses >= 2:
+                        self._pc_ok = False
+            except Exception as e:                       # noqa: BLE001
+                self.get_logger().warning(f"link probe failed, giving up on it: {e}")
+                self._pc_ok = None
+                return
+            time.sleep(period)
 
     def _on_cmd(self, msg: Twist) -> None:
         self._cmd = (
@@ -147,6 +225,7 @@ class DiffCarControlNode(Node):
         # Poll rather than wait for a reply: the firmware's `y` telemetry carries wheel
         # speeds but not the pose, and a blocking read would stall this timer.
         self.link.send("p")
+        self._send_link_state()
 
         for line in self.link.drain():
             m = _POSE_RE.search(line)
@@ -156,6 +235,23 @@ class DiffCarControlNode(Node):
         if self._pose is None:
             return
         self._publish(*self._pose)
+
+    def _send_link_state(self) -> None:
+        """Tell the firmware whether the PC answers, so its LED can show it. Resent
+        every few seconds because the firmware ages the report out (a stale verdict is
+        worse than none) -- and immediately on any change."""
+        if self._pc_ok is None:
+            return
+        now = time.monotonic()
+        if self._pc_ok == self._pc_sent and now - self._pc_sent_at < 3.0:
+            return
+        self.link.send(f"K {1 if self._pc_ok else 0}")
+        if self._pc_ok != self._pc_sent:
+            self.get_logger().warning(
+                f"PC {self._probe_host} "
+                + ("reachable again" if self._pc_ok else "unreachable -- LED goes cyan")
+            )
+        self._pc_sent, self._pc_sent_at = self._pc_ok, now
 
     def _publish(self, x: float, y: float, theta: float) -> None:
         stamp = self.get_clock().now().to_msg()
