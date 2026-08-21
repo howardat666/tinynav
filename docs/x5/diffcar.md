@@ -108,6 +108,23 @@ constexpr float WHEEL_BASE = 0.320f;       //            旧: 0.110
 5. calib.py sweep            落地重标 kff/截距(顺带自动打开掉压补偿)
 ```
 
+### 🔑 `dist` / `spin` 的真值可以用 VIO 代替人
+
+`tool/x5_board/diffcar_calib_vio.py`(板上跑)把卷尺和数圈数换成 Looper 的 VIO ——
+它的米制标度来自出厂标定的 **0.1002 m 立体基线**,是独立于轮速的参考,而且不需要人在现场:
+
+```sh
+python3 /userdata/x5/tinynav/tool/x5_board/diffcar_calib_vio.py dist 2.0
+python3 /userdata/x5/tinynav/tool/x5_board/diffcar_calib_vio.py spin 5
+```
+
+- `dist`:VIO 首末位移当真值 → `k = VIO/固件` → **新 ppr = 旧/k**。`ppr` 和轮周长在里程计里
+  只以比值出现,所以调 `ppr` 等价于调轮周长,但**不用重烧固件**。
+- `spin`:**逐帧累加旋转向量**,不能取首末四元数(转过 180° 就绕回去了);固件那边也用两轮
+  计数差重算而不是读 `theta`(同样会绕回)。→ `轮距_真 = 轮距_固件 × θ_固件/θ_VIO`。
+  转速取 **0.8 rad/s = 导航的 `max_yaw`**:有效轮距要吸收原地转的打滑,而打滑跟转速有关。
+- 会在 VIO 位姿单帧跳变 > 0.15 m(重定位)或电压 < 9.9 V 时**中止而不是给一个错数**。
+
 **顺序不能换:** `kff` 的单位是 PWM/(m/s),而 m/s 由 `计数/ppr*轮周长` 算出来 —— `dist` 会改
 `ppr`,所以 **`sweep` 必须在 `dist` 之后**。`spin` 反推轮距也用到 `ppr` 和轮周长,同理在
 `dist` 之后。轮距只进偏航和 `theta`,不影响单轮 m/s,所以第 4 步重烧不会作废第 3 步。
