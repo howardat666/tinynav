@@ -1061,3 +1061,31 @@ journal 早期条目被打上 3.5 小时前的时间戳,`--list-boots` 因此看
 active 的单元拽回来,不停掉的话 `NEXT` 依旧是 `n/a`(我第一次就是这样,以为没修好)。
 验收判据:`systemctl list-timers board-savetime.timer` 的 `NEXT` 有具体时刻、
 `systemctl is-active board-savetime.service` 跑完是 `inactive`、`/var/lib/board-lasttime` 每 5 分钟变。
+
+## 掉线要能事后分析,需要三层,现在都装上了
+
+2026-08-21 那次掉线**没有任何可用证据**:journal 里只有 systemd 和内核消息,
+既没有"当时链路什么样"也没有"当时电压什么样"的时间序列 —— 而那正是唯一能区分
+「WiFi 掉了」和「板子死了」的东西。补了三层:
+
+| 层 | 装了什么 | 覆盖什么 |
+|---|---|---|
+| 内核崩溃 | **pstore 本来就是开的**(`pstore: success mode=2`,挂在 `/sys/fs/pstore`) | panic / oops 能跨硬复位留下 |
+| 链路与热 | `board-health.service`(`tool/x5_board/board_health.py`),每 10 s 一行进 journal | RSSI / 误报警 / IGI / rx_rate / link / 温度 / 负载 / 可用内存 / 到 PC 的 RTT |
+| 电压 | `diffcar_control` 每 2 s 发 `e`,发布 `/battery`,并在最低值 < 10.0 V 时告警 | 电池带载塌压 —— 只有 ESP32 知道,而串口只有它持有 |
+
+**健康行写 stdout 交给 journald**,不写自己的文件:这样它和内核/驱动消息**按时间穿插在一起**,
+排查时不用对两份时间戳,轮转也由 journald 的 64MB 上限负责。
+
+**下次掉线的判据速查:**
+
+| 现象 | 结论 |
+|---|---|
+| `rssi` 骤降 / `link=0` / `rx_rate` 掉档 | 空口/射频 |
+| WiFi 各项正常但 `pc=MISS` 连续多行 | 上游(AP/PC)问题,板子自己还活着 |
+| 健康行整段断裂,下一行就是开机 | 板子重启了(掉电或 panic;panic 看 `/sys/fs/pstore`) |
+| 断裂前 `/battery` 告警在下探 | 掉压 |
+| `temp` 接近 95 度 | 降频。不是掉线,但会把一切拖慢 |
+
+🔑 **它上线一分钟内就抓到一件事**:空载电压已经 9.79–9.92 V,而固件闭锁线是 9.60 V,
+只剩 0.2 V 余量(当天下午还是 10.6–10.9 V)。**这种状态下做任何带载标定都会拟合出垃圾。**

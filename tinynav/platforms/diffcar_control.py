@@ -29,6 +29,7 @@ import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry
+from std_msgs.msg import Float32
 from rclpy.node import Node
 
 # Not omni-specific despite the module name: a generic planar-base -> camera-optical
@@ -37,6 +38,9 @@ from tinynav.platforms.omni3_kinematics import base_pose_to_camera_pose
 
 TICK_HZ = 20.0
 _POSE_RE = re.compile(r"x=(-?[\d.]+)\s+y=(-?[\d.]+)\s+theta=(-?[\d.]+)")
+# 电压只有 ESP32 知道，而串口只有本节点持有 —— 不采就没有任何电压时间序列，
+# 而"电池带载塌下去"正是 2026-08-21 掉线唯一的可疑线索却又无法证实的东西。
+_BATT_RE = re.compile(r"当前=([\d.]+)V 最低=([\d.]+)V")
 
 
 class DiffCarLink:
@@ -112,6 +116,9 @@ class DiffCarControlNode(Node):
         # Host that "the PC is reachable" means. Empty disables the heartbeat.
         p("link_probe_host", "192.168.19.51")
         p("link_probe_period_s", 3.0)
+        p("battery_period_s", 2.0)
+        # 固件的低压闭锁是 9.60 V；这里早一点叫，好在日志里留下"塌之前"的样子
+        p("battery_warn_v", 10.0)
 
         g = self.get_parameter
         self.offset = np.asarray([float(v) for v in g("camera_offset_xyz").value], dtype=float)
@@ -141,6 +148,11 @@ class DiffCarControlNode(Node):
         self._pc_ok = None
         self._pc_sent = None
         self._pc_sent_at = 0.0
+        self.batt_pub = self.create_publisher(Float32, "/battery", 10)
+        self._batt_period = float(g("battery_period_s").value)
+        self._batt_warn = float(g("battery_warn_v").value)
+        self._batt_at = 0.0
+        self._batt_warned = False
         if self._probe_host:
             threading.Thread(target=self._probe_loop, daemon=True).start()
         self.get_logger().info(
@@ -228,15 +240,38 @@ class DiffCarControlNode(Node):
         # speeds but not the pose, and a blocking read would stall this timer.
         self.link.send("p")
         self._send_link_state()
+        now = time.monotonic()
+        if now - self._batt_at > self._batt_period:
+            self._batt_at = now
+            self.link.send("e")          # 回复里带电压；下面的解析只挑自己认识的行
 
         for line in self.link.drain():
             m = _POSE_RE.search(line)
             if m:
                 x, y, theta_deg = (float(s) for s in m.groups())
                 self._pose = (x, y, np.deg2rad(theta_deg))
+                continue
+            b = _BATT_RE.search(line)
+            if b:
+                self._on_battery(float(b.group(1)), float(b.group(2)))
         if self._pose is None:
             return
         self._publish(*self._pose)
+
+    def _on_battery(self, now_v: float, min_v: float) -> None:
+        """min_v is the lowest since the firmware was last asked, so it catches a sag
+        between two polls -- the instantaneous reading would miss exactly the dip that
+        matters. The firmware clears it on every read, so each value is one interval."""
+        self.batt_pub.publish(Float32(data=now_v))
+        if min_v < self._batt_warn:
+            self.get_logger().warning(
+                f"battery sagged to {min_v:.2f} V (now {now_v:.2f}); "
+                f"firmware cuts out at 9.60"
+            )
+            self._batt_warned = True
+        elif self._batt_warned and now_v > self._batt_warn + 0.4:
+            self.get_logger().info(f"battery back to {now_v:.2f} V")
+            self._batt_warned = False
 
     def _send_link_state(self) -> None:
         """Tell the firmware whether the PC answers, so its LED can show it. Resent

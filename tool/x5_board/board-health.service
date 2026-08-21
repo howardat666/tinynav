@@ -1,0 +1,15 @@
+[Unit]
+Description=Record board link and thermal health into the journal
+After=network.target
+
+[Service]
+# 目的是"下次掉线时有时间序列可查"。写 stdout 让 journald 收，这样它和内核/驱动消息
+# 按时间穿插在一起，排查时不用对两份时间戳；轮转也交给 journald 的 64MB 上限。
+Type=simple
+ExecStart=/usr/local/sbin/board_health.py
+Restart=always
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
