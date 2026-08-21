@@ -406,13 +406,26 @@ def make_sp_extractor(backend: str | None = None):
     raise ValueError(f"unknown SuperPoint backend {want!r}; want bpu, trt or ort")
 
 
+def _l2_normalize_rows(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float32)
+    n = np.linalg.norm(x, axis=1, keepdims=True)
+    return x / np.maximum(n, 1e-8)
+
+
 class SuperPointMatcher:
     """Classical matching over SuperPoint's float descriptors, LightGlue-compatible out.
 
-    LightGlue costs 2870 ms on the X5 against 38.6 ms for cv2's brute-force L2, so the
-    learned matcher is not an option there; this is what replaces it. The filters are
-    the same three as ORBMatcher's and reject the same three different things, but the
-    distance is L2 over 256 floats rather than Hamming over 32 bytes.
+    LightGlue costs 2870 ms on the X5, so the learned matcher is not an option there;
+    this is what replaces it. The filters are the same three as ORBMatcher's and reject
+    the same three different things, but the distance is L2 over 256 floats rather than
+    Hamming over 32 bytes.
+
+    Matching is one matmul, not cv2.BFMatcher. For L2-normalised descriptors the nearest
+    neighbour by L2 distance and the nearest by inner product are the same neighbour, so
+    this is an identity rather than an approximation -- measured on the board, both
+    return byte-identical match sets, at 34.6 ms against 85.7 ms for near frames and
+    41.8 against 75.1 for far ones. It also drops the two Python loops the DMatch
+    objects forced (2.4 ms) by staying in index arrays throughout.
     """
 
     def __init__(
@@ -428,8 +441,11 @@ class SuperPointMatcher:
         self.ratio = float(ratio)
         self.use_ransac = bool(use_ransac)
         self.ransac_reproj_threshold = float(ransac_reproj_threshold)
-        self.bf_cross = cv2.BFMatcher(cv2.NORM_L2, crossCheck=True)
-        self.bf_plain = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+        # RANSAC iterations scale with 1/inlier_ratio^k, so an uncapped call is
+        # unbounded in exactly the case that needs it most: measured 9.4 ms at a 68%
+        # inlier ratio and 77.5 ms at 10%, for the same inlier count either way. The cap
+        # halves the tail (77.5 -> 39.9 ms) and changed no inlier in the measurement.
+        self.ransac_max_iters = 500
 
     async def infer(self, kpts0, kpts1, desc0, desc1, mask0, mask1,
                     img_shape0=None, img_shape1=None, match_threshold=None):
@@ -456,32 +472,55 @@ class SuperPointMatcher:
             return out
         q, t = np.ascontiguousarray(d0[idx0]), np.ascontiguousarray(d1[idx1])
 
-        if self.mode == "cross":
-            good = sorted(self.bf_cross.match(q, t), key=lambda m: m.distance)
-        else:
-            good = []
-            for pair in self.bf_plain.knnMatch(q, t, k=2):
-                if len(pair) < 2:
-                    continue
-                m, n = pair[:2]
-                if m.distance < self.ratio * n.distance:
-                    good.append(m)
-        if not good:
-            return out
+        # Normalised here rather than trusted: the identity below only holds for unit
+        # vectors, and it costs 0.1 ms to stop being a silent assumption about whoever
+        # produced the descriptors.
+        q = _l2_normalize_rows(np.ascontiguousarray(d0[idx0]))
+        t = _l2_normalize_rows(np.ascontiguousarray(d1[idx1]))
+        sim = q @ t.T                                   # higher is closer
 
-        if self.use_ransac and len(good) >= 8:
-            p0 = np.asarray([k0[idx0[m.queryIdx]] for m in good], dtype=np.float32)
-            p1 = np.asarray([k1[idx1[m.trainIdx]] for m in good], dtype=np.float32)
+        nn = np.argmax(sim, axis=1)
+        if self.mode == "cross":
+            # A second GEMM, not argmax(sim, axis=0). Reducing down the columns of a
+            # C-contiguous 512x512 float32 misses cache on every step: measured 25.7 ms,
+            # more than the 10.0 ms matmul that produced the matrix. Transposing first
+            # does not help -- the copy carries the same strided access (23.6-24.2 ms).
+            # Recomputing the product the other way round is 10.7 ms and bit-identical,
+            # because a tuned GEMM beats a naive strided reduction on this A55.
+            back = np.argmax(t @ q.T, axis=1)
+            keep = back[nn] == np.arange(nn.shape[0])   # mutual nearest neighbour
+        else:
+            if sim.shape[1] < 2:
+                return out
+            # Second best per row, without a full sort: Lowe's ratio on L2 distance,
+            # which for unit vectors is d = sqrt(2 - 2*sim).
+            part = np.partition(sim, -2, axis=1)
+            best, second = part[:, -1], part[:, -2]
+            d1_ = np.sqrt(np.maximum(0.0, 2.0 - 2.0 * best))
+            d2_ = np.sqrt(np.maximum(0.0, 2.0 - 2.0 * second))
+            keep = d1_ < self.ratio * d2_
+        qi = np.where(keep)[0]
+        if qi.size == 0:
+            return out
+        ti = nn[qi]
+        # Best first, so a downstream cap on the match count keeps the good ones.
+        order = np.argsort(-sim[qi, ti])
+        qi, ti = qi[order], ti[order]
+
+        if self.use_ransac and qi.size >= 8:
+            p0 = np.ascontiguousarray(k0[idx0[qi]])
+            p1 = np.ascontiguousarray(k1[idx1[ti]])
             _, inl = cv2.findFundamentalMat(
-                p0, p1, cv2.FM_RANSAC, self.ransac_reproj_threshold, 0.99
+                p0, p1, cv2.FM_RANSAC, self.ransac_reproj_threshold, 0.99,
+                self.ransac_max_iters,
             )
-            if inl is not None and inl.size == len(good):
-                good = [m for m, keep in zip(good, inl.reshape(-1).astype(bool)) if keep]
-            if not good:
+            if inl is not None and inl.size == qi.size:
+                m = inl.reshape(-1).astype(bool)
+                qi, ti = qi[m], ti[m]
+            if qi.size == 0:
                 return out
 
-        for m in good:
-            out["match_indices"][0, int(idx0[m.queryIdx])] = int(idx1[m.trainIdx])
+        out["match_indices"][0, idx0[qi]] = idx1[ti].astype(np.int32)
         return out
 
 
