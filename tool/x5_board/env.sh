@@ -85,3 +85,10 @@ mkdir -p "${NUMBA_CACHE_DIR}" 2>/dev/null || true
 # OpenBLAS/numpy would otherwise spawn one thread per core and thrash.
 export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-2}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
+
+# --- which chassis is bolted on ------------------------------------------------
+# The board is dedicated to the ESP32 diff-drive car; app_start.sh still defaults to
+# `wheel` (the LeKiwi servo bus), which silently draws a round 300 mm robot in the UI
+# and hands the planner LeKiwi's kinematics. Set here rather than in app_start.sh
+# because it is a property of this board's hardware, not of the code.
+export TINYNAV_ACTUATOR="${TINYNAV_ACTUATOR:-diffcar}"

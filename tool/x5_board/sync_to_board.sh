@@ -37,7 +37,9 @@ set -euo pipefail
 #              including the decord shim and the vocabularies.
 #   env.sh     belongs to the board.
 
-BOARD="${BOARD:-root@169.254.10.1}"
+# WiFi, not the 169.254.10.1 USB link: the type-C port runs as host now (it drives the
+# WiFi dongle), so the gadget side has an IP but no carrier and this script just hung.
+BOARD="${BOARD:-root@192.168.19.218}"
 BOARD_PASS="${BOARD_PASS:-looper@0731}"
 BOARD_ROOT="${BOARD_ROOT:-/userdata/x5/tinynav}"
 with_app=0

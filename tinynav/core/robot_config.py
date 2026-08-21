@@ -66,8 +66,10 @@ class RobotConfig:
         down, ``+z`` forward.  ``camera_y`` is a body-frame *left* offset, so it
         enters the right-handed ``x`` slot negated.  Both previously shipped
         configs have ``camera_y = 0``, which is why the missing sign never showed
-        up; ``LEKIWI_CONFIG`` has the camera 50 mm off-centre and would otherwise
-        pick up a 100 mm lateral bias.
+        up.  Both ``LEKIWI_CONFIG`` and ``DIFFCAR_CONFIG`` now have the camera 50 mm
+        off-centre -- on the diff car because the stack runs on ``infra1``, the
+        rectified pair's left camera, not the centred colour lens -- and either
+        would otherwise pick up a 100 mm lateral bias.
         """
         return np.array(
             [-(self.camera_y - self.control_y), 0.0, self.camera_x - self.control_x],
@@ -187,29 +189,18 @@ LEKIWI_CONFIG = RobotConfig(
     allow_reverse=True,
 )
 
-# ESP32-S3 + TB6612 differential-drive car carrying a Looper. Measured 2026-08-18:
-# bounding box 240x120x210 mm, wheel diameter 70 mm, wheel separation 110 mm,
-# camera optical centre 183 mm off the floor and laterally centred.
+# ESP32-S3 + TB6612 differential-drive car carrying a Looper. Re-measured 2026-08-21
+# after the rebuild to front-wheel drive; every number the first version carried (a
+# 240x120 mm box, a 110 mm track, an axle behind the centre) is wrong now, not stale.
 #
-# Body origin is the bounding-box centre, because that is the frame the two measured
-# offsets share: the camera sits 100 mm ahead of it and the drive axle 70 mm behind.
-# control_x is the drive axle, not the box centre -- on a differential drive that is
-# the only point with no lateral velocity, so it is what the trajectory rollout has
-# to be about. footprint_from_control() then gives front 195 mm / rear 55 mm, i.e. the
-# hull reaches 3.8x further ahead of the control centre than behind it.
+# Body origin is the bounding-box centre, the frame the measured offsets share. control_x
+# is the drive axle, not the box centre -- on a differential drive that is the only point
+# with no lateral velocity, so it is what the rollout has to be about. The caster now
+# trails 110 mm behind instead of leading, which is the stable arrangement going forward,
+# but an in-place turn still scrubs it sideways so measured yaw lags the commanded one.
 #
-# Rectangular rather than circular: a 240x120 box inscribed in a circle about the
-# drive axle would need r = 190 mm, more than three times the true 60 mm half-width,
-# and would refuse every real doorway.
-#
-# Rebuilt 2026-08-21 as front-wheel drive: the drive axle moved from 70 mm behind the
-# box centre to 40 mm ahead of it, and the caster now trails 110 mm behind. Every
-# number below is from that rebuild; the previous set described a 240x120 mm box with
-# the axle at the back and is wrong in every field.
-#
-# The caster trails rather than leads now, which is the stable arrangement going
-# forward, but an in-place turn still scrubs it sideways, so measured yaw lags the
-# commanded one.
+# Rectangular, not circular: a circle about the axle enclosing a 350 mm wide body needs
+# r = 0.25 m against a true half-width of 0.175, and would refuse every real doorway.
 DIFFCAR_CONFIG = RobotConfig(
     name='diffcar', shape='square',
     # Wider than it is long: 350 mm across the body, 280 mm front to back. The 320 mm
@@ -229,17 +220,24 @@ DIFFCAR_CONFIG = RobotConfig(
     obstacle_z_bottom=-0.3,
     obstacle_z_top=0.2,
     dilation_cells=0,
-    # Deliberately below what the base can do, not a measured ceiling: the firmware
-    # accepts up to 0.8 m/s. Capped here so the planner's predictions stay inside what
-    # the chassis delivers even loaded, which is the failure LeKiwi shipped once.
-    max_vx=0.5,
+    # Reaction-budget limited, not chassis limited: the firmware takes 0.8 m/s, but the
+    # planner republishes at p50 1.17 s, so 0.5 m/s commits 0.58 m -- ~3x the
+    # front_blocked gate -- before anything newly seen can change the plan. 0.3 puts one
+    # period at 0.35 m, about the gate. Raise it once the loop is measured on the floor.
+    max_vx=0.3,
     max_reverse_vx=0.2,
     # An in-place turn at this rate needs 0.128 m/s at each wheel on the 320 mm track,
     # against 0.044 on the old 110 mm one -- the wider base costs wheel speed for the
     # same yaw, so this is no longer nearly free.
     max_yaw=0.8,
     allow_reverse=True,
-    front_blocked_m=0.2,
+    # Default 0.3, not the 0.2 the 240x120 mm car shipped with -- that value was chosen
+    # because a 110 mm track "turns in place freely", and it does not any more. Measured
+    # from the hull edge, so it guarantees 0.4 m about the axle, against the 0.251 m the
+    # rear corner now sweeps in an in-place turn (the old car swept 0.078). At 0.2 the
+    # gate would open with 0.049 m of slack, i.e. the pivot gets collision-refused before
+    # the gate has bought anything, and the escape hatch runs instead.
+    front_blocked_m=0.3,
 )
 
 ROBOT_CONFIGS = {

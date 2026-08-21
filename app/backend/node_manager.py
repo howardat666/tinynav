@@ -324,7 +324,7 @@ def _diffcar_control_argv() -> list[str]:
     # Same sole-owner-of-the-serial-port role as _wheel_odometry_argv above, for the
     # ESP32 car. Geometry comes from DIFFCAR_CONFIG so the node and the planner cannot
     # disagree about where the control centre is.
-    cam_x = _ROBOT.camera_x - _ROBOT.control_x
+    cam_x = round(_ROBOT.camera_x - _ROBOT.control_x, 4)  # 0.09-0.04 is 0.049999... unrounded
     return _node_argv('tinynav/platforms/diffcar_control.py') + [
         '--ros-args',
         '-p', f'port:={_WHEEL_PORT}',

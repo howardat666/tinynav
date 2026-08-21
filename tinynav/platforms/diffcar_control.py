@@ -103,7 +103,9 @@ class DiffCarControlNode(Node):
         p("odom_topic", "/wheel/odometry")
         p("camera_pose_topic", "/wheel/camera_pose")
         p("cmd_timeout_s", 0.5)
-        p("max_vx", 0.5)
+        # Same values as DIFFCAR_CONFIG, which node_manager overrides these with anyway;
+        # duplicated rather than imported so this node stays free of the planning stack.
+        p("max_vx", 0.3)
         p("max_yaw", 0.8)
 
         g = self.get_parameter
