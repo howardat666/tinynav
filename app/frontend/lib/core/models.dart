@@ -380,35 +380,117 @@ class PlanningState {
   }
 }
 
+class StorageEntry {
+  final String label;
+  final String path;
+  final double percent;
+  final double usedGb;
+  final double totalGb;
+
+  const StorageEntry({
+    required this.label,
+    required this.path,
+    required this.percent,
+    required this.usedGb,
+    required this.totalGb,
+  });
+
+  factory StorageEntry.fromJson(Map<String, dynamic> j) => StorageEntry(
+        label: j['label'] as String? ?? '?',
+        path: j['path'] as String? ?? '',
+        percent: (j['percent'] as num?)?.toDouble() ?? 0,
+        usedGb: (j['used_gb'] as num?)?.toDouble() ?? 0,
+        totalGb: (j['total_gb'] as num?)?.toDouble() ?? 0,
+      );
+}
+
+class MemBreakdown {
+  final double availableMb;
+  final double freeMb;
+  final double cachedMb;
+  final double shmemMb;
+  final double swapTotalMb;
+  final double swapFreeMb;
+  final double? cmaTotalMb;
+  final double? cmaFreeMb;
+
+  const MemBreakdown({
+    required this.availableMb,
+    required this.freeMb,
+    required this.cachedMb,
+    required this.shmemMb,
+    required this.swapTotalMb,
+    required this.swapFreeMb,
+    this.cmaTotalMb,
+    this.cmaFreeMb,
+  });
+
+  factory MemBreakdown.fromJson(Map<String, dynamic> j) => MemBreakdown(
+        availableMb: (j['available_mb'] as num?)?.toDouble() ?? 0,
+        freeMb: (j['free_mb'] as num?)?.toDouble() ?? 0,
+        cachedMb: (j['cached_mb'] as num?)?.toDouble() ?? 0,
+        shmemMb: (j['shmem_mb'] as num?)?.toDouble() ?? 0,
+        swapTotalMb: (j['swap_total_mb'] as num?)?.toDouble() ?? 0,
+        swapFreeMb: (j['swap_free_mb'] as num?)?.toDouble() ?? 0,
+        cmaTotalMb: (j['cma_total_mb'] as num?)?.toDouble(),
+        cmaFreeMb: (j['cma_free_mb'] as num?)?.toDouble(),
+      );
+}
+
 class SysInfo {
   final double cpuPercent;
+  final List<double> cpuPerCore;
+  final double? load1m;
   final double memPercent;
   final double memUsedGb;
   final double memTotalGb;
+  final MemBreakdown? memBreakdown;
+  final List<StorageEntry> storage;
   final double diskPercent;
   final double diskUsedGb;
   final double diskTotalGb;
+  final double? bpuPercent;
+  final Map<String, double> tempsC;
   final double? gpuPercent;
 
   const SysInfo({
     required this.cpuPercent,
+    this.cpuPerCore = const [],
+    this.load1m,
     required this.memPercent,
     required this.memUsedGb,
     required this.memTotalGb,
+    this.memBreakdown,
+    this.storage = const [],
     required this.diskPercent,
     required this.diskUsedGb,
     required this.diskTotalGb,
+    this.bpuPercent,
+    this.tempsC = const {},
     this.gpuPercent,
   });
 
   factory SysInfo.fromJson(Map<String, dynamic> j) => SysInfo(
         cpuPercent: (j['cpu_percent'] as num).toDouble(),
+        cpuPerCore: ((j['cpu_per_core'] as List?) ?? const [])
+            .map((e) => (e as num).toDouble())
+            .toList(),
+        load1m: (j['load_1m'] as num?)?.toDouble(),
         memPercent: (j['mem_percent'] as num).toDouble(),
         memUsedGb: (j['mem_used_gb'] as num).toDouble(),
         memTotalGb: (j['mem_total_gb'] as num).toDouble(),
+        memBreakdown: j['mem_breakdown'] == null
+            ? null
+            : MemBreakdown.fromJson(j['mem_breakdown'] as Map<String, dynamic>),
+        storage: ((j['storage'] as List?) ?? const [])
+            .map((e) => StorageEntry.fromJson(e as Map<String, dynamic>))
+            .toList(),
         diskPercent: (j['disk_percent'] as num).toDouble(),
         diskUsedGb: (j['disk_used_gb'] as num).toDouble(),
         diskTotalGb: (j['disk_total_gb'] as num).toDouble(),
+        bpuPercent: (j['bpu_percent'] as num?)?.toDouble(),
+        tempsC: ((j['temps_c'] as Map?) ?? const {}).map(
+            (k, v) => MapEntry(k as String, (v as num).toDouble())),
         gpuPercent: (j['gpu_percent'] as num?)?.toDouble(),
       );
 }

@@ -249,6 +249,7 @@ class MapNode(Node):
         # monotonic throughout: this board has no RTC, so a wall-clock span would jump.
         self._reloc_start_monotonic = time.monotonic()
         self._reloc_window_t0 = self._reloc_start_monotonic
+        self._reloc_last_window = None
         self._reloc_last_success_monotonic = None
         # Paired wall clock for the same event, for the status panel only: monotonic
         # cannot be aged by another process, and the panel wants a live "N s ago".
@@ -620,7 +621,7 @@ class MapNode(Node):
         stamp_ns = int(keyframe_image_msg.header.stamp.sec * 1e9) + int(keyframe_image_msg.header.stamp.nanosec)
         age_s = (now_ns - stamp_ns) / 1e9
         self._reloc_tally('keyframes')
-        self._maybe_report_reloc_stats()
+        self._report_reloc_stats()
         if self.max_keyframe_age_s > 0.0 and age_s > self.max_keyframe_age_s:
             self._reloc_tally('dropped_stale')
             # Logged as a running count rather than per drop: a message per
@@ -845,29 +846,36 @@ class MapNode(Node):
             if code is not None:
                 bucket['by_code'][code] = bucket['by_code'].get(code, 0) + 1
 
+    @staticmethod
+    def _reloc_rates(bucket: dict, span_s: float) -> dict:
+        attempts = bucket['attempts']
+        return {
+            **{k: v for k, v in bucket.items() if k != 'by_code'},
+            'byCode': dict(bucket['by_code']),
+            # Two different frequencies, and conflating them is how a healthy stack
+            # looks broken: attemptHz is how often relocalization runs at all (capped
+            # by min_relocalization_interval_s), successHz is how often it produces a
+            # pose. successRate relates the two.
+            'attemptHz': round(attempts / span_s, 3),
+            'successHz': round(bucket['success'] / span_s, 3),
+            'successRate': round(bucket['success'] / attempts, 3) if attempts else None,
+            'spanS': round(span_s, 1),
+        }
+
     def _reloc_stats_snapshot(self) -> dict:
         """Both windows plus the derived rates, as the backend and the log both want."""
         now = time.monotonic()
-        window_s = max(1e-6, now - self._reloc_window_t0)
-
-        def rates(bucket: dict, span_s: float) -> dict:
-            attempts = bucket['attempts']
-            return {
-                **{k: v for k, v in bucket.items() if k != 'by_code'},
-                'byCode': dict(bucket['by_code']),
-                # Two different frequencies, and conflating them is how a healthy stack
-                # looks broken: attemptHz is how often relocalization runs at all (capped
-                # by min_relocalization_interval_s), successHz is how often it produces a
-                # pose. successRate relates the two.
-                'attemptHz': round(attempts / span_s, 3),
-                'successHz': round(bucket['success'] / span_s, 3),
-                'successRate': round(bucket['success'] / attempts, 3) if attempts else None,
-                'spanS': round(span_s, 1),
-            }
+        rates = self._reloc_rates
+        # The last *completed* window, not the one filling up: this snapshot goes out on
+        # every keyframe now, and a partial window would make attemptHz swing from 0 to
+        # several Hz between publishes. Falls back to the partial one before the first
+        # window closes, so the panel is not blank for the first 10 s.
+        window = self._reloc_last_window or rates(
+            self._reloc_window, max(1e-6, now - self._reloc_window_t0))
 
         uptime_s = max(1e-6, now - self._reloc_start_monotonic)
         return {
-            'window': rates(self._reloc_window, window_s),
+            'window': window,
             'total': rates(self._reloc_totals, uptime_s),
             'lastFailureCode': self._reloc_last_failure_code or None,
             # The numbers behind the code, minus the candidate dump: that part runs to
@@ -883,12 +891,29 @@ class MapNode(Node):
             'lastSuccessEpoch': self._reloc_last_success_epoch,
         }
 
-    def _maybe_report_reloc_stats(self) -> None:
+    def _report_reloc_stats(self) -> None:
+        """Publish on every keyframe; log and roll the window every _RELOC_STATS_INTERVAL_S.
+
+        These were one operation, and that made lastSuccessEpoch as stale as the 10 s
+        publish period: the backend re-ages it against the current wall clock on every
+        /device/status, so a frozen epoch showed up as "last ok" sawtoothing from 1 s
+        to 11 s and back while relocalization was in fact succeeding at 0.8 Hz.
+        """
         now = time.monotonic()
-        if now - self._reloc_window_t0 < self._RELOC_STATS_INTERVAL_S:
-            return
-        snap = self._reloc_stats_snapshot()
-        w = snap['window']
+        if now - self._reloc_window_t0 >= self._RELOC_STATS_INTERVAL_S:
+            self._reloc_last_window = self._reloc_rates(
+                self._reloc_window, max(1e-6, now - self._reloc_window_t0))
+            self._log_reloc_window(self._reloc_last_window)
+            self._reloc_window = self._new_reloc_bucket()
+            self._reloc_window_t0 = now
+        try:
+            msg = String()
+            msg.data = json.dumps(self._reloc_stats_snapshot(), separators=(',', ':'))
+            self._reloc_stats_pub.publish(msg)
+        except Exception as e:
+            self.get_logger().warn(f"could not publish relocalization stats: {e}")
+
+    def _log_reloc_window(self, w: dict) -> None:
         codes = ', '.join(f'{k}={v}' for k, v in sorted(w['byCode'].items())) or 'none'
         rate = 'n/a' if w['successRate'] is None else f"{100.0 * w['successRate']:.0f}%"
         self.get_logger().info(
@@ -898,14 +923,6 @@ class MapNode(Node):
             f"skipped_rate_limit={w['skipped_rate_limit']}, dropped_stale={w['dropped_stale']}; "
             f"failures: {codes}"
         )
-        try:
-            msg = String()
-            msg.data = json.dumps(snap, separators=(',', ':'))
-            self._reloc_stats_pub.publish(msg)
-        except Exception as e:
-            self.get_logger().warn(f"could not publish relocalization stats: {e}")
-        self._reloc_window = self._new_reloc_bucket()
-        self._reloc_window_t0 = now
 
     # Arrival is decided here and was reported nowhere. The advance below is the only
     # place that knows the robot reached a POI, and its one output was
