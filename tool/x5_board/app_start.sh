@@ -99,8 +99,19 @@ do_start() {
     # not merely useless -- with the diff-drive car, wheel_odometry writes Feetech
     # packets into the ESP32's single-character command parser (0x66 is 'f',
     # forward), so a wrong actuator can drive the robot. Observed 2026-08-18.
-    export TINYNAV_ROBOT_TYPE="${TINYNAV_ROBOT_TYPE:-lekiwi}"
     export TINYNAV_ACTUATOR="${TINYNAV_ACTUATOR:-wheel}"
+    # Geometry follows the actuator unless asked otherwise. They were independent
+    # defaults, and the pair diffcar/lekiwi is what actually ran: the planner treated a
+    # 240x120 mm rectangle as a 300 mm circle with a 400 mm collision hull, put the
+    # camera 40 mm behind and 50 mm beside where it is, and tracked a control point
+    # 70 mm off the drive axle. None of that fails loudly -- it refuses gaps the car
+    # fits through and steers about the wrong point.
+    case "${TINYNAV_ACTUATOR}" in
+        diffcar) _default_robot=diffcar ;;
+        wheel)   _default_robot=lekiwi ;;
+        *)       _default_robot=go2 ;;
+    esac
+    export TINYNAV_ROBOT_TYPE="${TINYNAV_ROBOT_TYPE:-${_default_robot}}"
     # Pinned for the same reason as the two above. Auto-detection greps `ros2 node
     # list` for /insight_full, and a successful call proves nothing about
     # completeness: DDS discovery is asynchronous and this board's ros2 daemon has
@@ -224,8 +235,15 @@ do_stop() {
     # Sweeping by name is the honest fix here rather than removing the setsid: the nodes
     # want their own groups so that killing one does not take down its siblings. Names
     # use the [x] trick so the pattern cannot match this script's own pgrep/pkill.
+    #
+    # diffcar_control was missing from this list and leaked exactly as predicted: an
+    # instance from 43 minutes earlier at ppid 1, still holding /dev/ttyS3 and still
+    # driving the ESP32 with the previous run's geometry, next to its replacement.
+    # It is the one node where a leak commands motors. build_map_node is here for a
+    # quieter reason: an orphan keeps writing into the map directory the next build is
+    # about to create.
     local leftovers=0
-    for pat in 'map_[n]ode\.py' 'planning_[n]ode\.py' 'cmd_vel_[c]ontrol\.py' 'looper_[b]ridge_node\.py'; do
+    for pat in 'map_[n]ode\.py' 'planning_[n]ode\.py' 'cmd_vel_[c]ontrol\.py' 'looper_[b]ridge_node\.py' 'diffcar_[c]ontrol\.py' 'build_map_[n]ode\.py'; do
         if pgrep -f "${pat}" >/dev/null 2>&1; then
             pkill -TERM -f "${pat}" 2>/dev/null
             leftovers=$((leftovers + 1))
@@ -233,7 +251,7 @@ do_stop() {
     done
     if [[ ${leftovers} -gt 0 ]]; then
         sleep 2
-        for pat in 'map_[n]ode\.py' 'planning_[n]ode\.py' 'cmd_vel_[c]ontrol\.py' 'looper_[b]ridge_node\.py'; do
+        for pat in 'map_[n]ode\.py' 'planning_[n]ode\.py' 'cmd_vel_[c]ontrol\.py' 'looper_[b]ridge_node\.py' 'diffcar_[c]ontrol\.py' 'build_map_[n]ode\.py'; do
             pgrep -f "${pat}" >/dev/null 2>&1 && pkill -KILL -f "${pat}" 2>/dev/null
         done
         echo "swept ${leftovers} orphaned node group(s)"

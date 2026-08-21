@@ -297,6 +297,29 @@ def _wheel_odometry_argv() -> list[str]:
         '-p', 'cmd_vel_topic:=/cmd_vel',
     ]
 
+def _actuator_geometry() -> dict | None:
+    if _ACTUATOR == 'wheel':
+        return {
+            'port': _WHEEL_PORT,
+            'wheelRadius': float(_WHEEL_RADIUS),
+            'baseRadius': float(_WHEEL_BASE_RADIUS),
+            'cameraOffsetForwardLeftUp': [float(v) for v in _WHEEL_CAMERA_OFFSET.split(',')],
+        }
+    if _ACTUATOR == 'diffcar':
+        return {
+            'port': _WHEEL_PORT,
+            'robotType': _ROBOT.name,
+            'shape': _ROBOT.shape,
+            'lengthWidthM': [_ROBOT.length, _ROBOT.width],
+            # Offsets relative to the control point, which is what the node is given.
+            'cameraOffsetForwardLeftUp': [
+                round(_ROBOT.camera_x - _ROBOT.control_x, 4), -_ROBOT.camera_y, 0.183],
+            'maxVx': _ROBOT.max_vx,
+            'maxYaw': _ROBOT.max_yaw,
+        }
+    return None
+
+
 def _diffcar_control_argv() -> list[str]:
     # Same sole-owner-of-the-serial-port role as _wheel_odometry_argv above, for the
     # ESP32 car. Geometry comes from DIFFCAR_CONFIG so the node and the planner cannot
@@ -1268,12 +1291,12 @@ class BackendNode(Ros2NodeManager):
             'cmdVelNodeEnabled': _ENABLE_CMD_VEL_NODE,
             'sensorMode': self._sensor_mode,
             'wheelOdometryRunning': self._proc_alive(getattr(self, '_wheel_odom_proc', None)),
-            'wheel': {
-                'port': _WHEEL_PORT,
-                'wheelRadius': float(_WHEEL_RADIUS),
-                'baseRadius': float(_WHEEL_BASE_RADIUS),
-                'cameraOffsetForwardLeftUp': [float(v) for v in _WHEEL_CAMERA_OFFSET.split(',')],
-            } if _ACTUATOR in ('wheel', 'diffcar') else None,
+            # Per actuator, because the two share only the serial port. Reporting
+            # LeKiwi's wheel and base radii under diffcar was actively misleading:
+            # diffcar_control takes neither -- the ESP32 integrates its own odometry --
+            # and the camera offset it does take is derived from DIFFCAR_CONFIG, not
+            # from TINYNAV_WHEEL_CAMERA_OFFSET.
+            'wheel': _actuator_geometry(),
             # Reported for the same reason as the rest: a build that dies for lack
             # of memory looks like a build that failed for an unknown reason, and
             # the vocabulary path is the single most likely cause.
