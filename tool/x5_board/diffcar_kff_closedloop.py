@@ -16,8 +16,10 @@ import time
 sys.path.insert(0, '/root/car')
 import carlib  # noqa: E402
 
-HOLD_S = 1.6          # 保持时间。悬空实测 c 0.30 约 1.5 s 收敛，取样只用最后 0.6 s
-SAMPLE_S = 0.6
+# 1.6/0.6 试过一次，不够：相邻点算出的斜率在 100~298 之间乱跳，R2 只有 0.994、残差 2.5 PWM
+# (空载那次是 0.99988 / 0.75)。原因是环还在收敛就开始取样，而且 0.6s 只能取到 3 个样本。
+HOLD_S = 2.6
+SAMPLE_S = 1.3
 V_ABORT = 9.9         # 低压保护 9.60，留余量
 
 
@@ -88,7 +90,7 @@ def main():
         sys.exit('电压 %s 低于 %.2fV 的中止线' % (v0, V_ABORT))
     print('电压 %.2fV，最高速度 %.2f m/s，单向行程 %.2f m' % (v0, vmax, vmax * HOLD_S))
 
-    speeds = [round(vmax * f, 4) for f in (0.15, 0.25, 0.4, 0.55, 0.7, 0.85, 1.0)]
+    speeds = [round(vmax * f, 4) for f in (0.12, 0.2, 0.3, 0.42, 0.55, 0.7, 0.85, 1.0)]
     rows = []
     print('\n  目标   左实测  左PWM   右实测  右PWM   电压   样本')
     for v in speeds:
@@ -118,10 +120,19 @@ def main():
     if len(use) < 4:
         car.kill()
         sys.exit('可用点不足 %d 个' % len(use))
-    al, bl, sl, el = fit([r[1] for r in use], [r[2] for r in use])
-    ar, br, sr, er = fit([r[3] for r in use], [r[4] for r in use])
-    print('\n左轮: kff=%.1f 截距=%.2f  R2=%.5f 最大残差 %.2f PWM' % (al, bl, sl, el))
-    print('右轮: kff=%.1f 截距=%.2f  R2=%.5f 最大残差 %.2f PWM' % (ar, br, sr, er))
+    def report(rows, tag):
+        a, b, ss, e = fit([r[1] for r in rows], [r[2] for r in rows])
+        c, d, ss2, e2 = fit([r[3] for r in rows], [r[4] for r in rows])
+        print('\n%s (%d 点)' % (tag, len(rows)))
+        print('  左轮: kff=%.1f 截距=%.2f  R2=%.5f 最大残差 %.2f PWM' % (a, b, ss, e))
+        print('  右轮: kff=%.1f 截距=%.2f  R2=%.5f 最大残差 %.2f PWM' % (c, d, ss2, e2))
+        return a, b, c, d
+
+    al, bl, ar, br = report(use, '全量拟合')
+    # 最低两点通常压在静摩擦拐点上，会把斜率和截距一起拽偏；而截距恰恰是原地转最依赖的量。
+    # 两个都报出来，差得多就说明低速段非线性，别只信一个。
+    if len(use) >= 6:
+        report(use[2:], '剔掉最低两点(静摩擦拐点)')
     print('\n  x %.1f %.1f\n  i %.0f %.0f\n  w' % (al, ar, round(bl), round(br)))
 
     if apply_it:
