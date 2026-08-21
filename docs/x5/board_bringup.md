@@ -988,6 +988,43 @@ systemctl reset-failed S99all_run && systemctl start S99all_run
 两个错误解释。排查时先给探针加 `resource.setrlimit(RLIMIT_AS, ...)`，把 `bad_alloc` 变成
 本进程的 `MemoryError`，别把固件一起拖死。
 
+## 7.6 持久化 journal:光开 `Storage=persistent` 不够,时钟会把它废掉
+
+排查重启原因需要跨重启的日志,所以 2026-08-21 开了持久化
+(`/etc/systemd/journald.conf` 的 `Storage=persistent` + 64 M 上限 + `mkdir /var/log/journal`)。
+**开完之后重启一次,上一次启动的日志依然没留住。**
+
+原因是时钟,不是配置。X5 没有 RTC,每次上电回到 **2025-08-26**;`board-autotime.service`
+会用 NTP 修好,但它要等 WiFi 拿到 IP,**比 journald 晚约 13 秒**。journald 自己给出了确证:
+
+```
+Notice: journal has been rotated since unit was started, output may be incomplete.
+```
+
+往前跳一年那一下**强制轮转日志文件**,而 `journalctl --list-boots` 按时间排序 ——
+每次启动都从 2025-08-26 开始,于是所有启动塌成一条,看不出边界。
+
+**修法:开机极早期先把时钟顶到"上次见过的时间",让跳变从一年缩到几分钟。**
+
+| 文件 | 作用 |
+|---|---|
+| `board_savetime.sh save` | 把 `date +%s` 写到 `/var/lib/board-lasttime` |
+| `board_savetime.sh restore` | 读回来,**只在保存值更新时**才 `date -s`(否则会把 NTP 校准过的时间拽回去) |
+| `board-savetime.timer` | 每 5 分钟存一次 |
+| `board-savetime.service` | `ExecStop` 再存一次,免得关机前 5 分钟白丢 |
+| `board-restoretime.service` | `DefaultDependencies=no` + `Before=systemd-journald.service`,**必须早于 journald,晚了就白做** |
+
+⚠️ **`[ "$saved" -gt "$now" ] && date -s ...` 这个写法有坑**:测试为假时脚本以 1 退出,
+systemd 把单元标成 failed —— 而"不需要顶"恰恰是最常见的正常情况。必须显式 `exit 0`。
+四种情形都要验:不需要顶 / 文件里是垃圾 / 文件不存在 / 保存值在未来。
+
+⚠️ **`board_autotime.sh` 本身没问题**,它需要网络所以不可能更早;这两个服务是互补的:
+`restore` 负责让 journald 看到大致正确的时间,`autotime` 负责最终校准。
+
+顺带:`hostapd.service` 因为没有 `/etc/hostapd/hostapd.conf` 在死循环重启,
+**每 2 秒刷 7 行日志**,会把 64 M 上限撑爆、把有用的记录挤掉。已 `systemctl disable --now hostapd`
+—— 我们用 WiFi 客户端模式,不需要它当热点。
+
 ## 8. 相关文件
 
 | 文件 | 作用 |

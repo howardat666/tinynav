@@ -1,0 +1,15 @@
+[Unit]
+Description=Save current clock for the next boot
+# 关机时也存一次，否则最后 5 分钟的时间白丢。
+DefaultDependencies=no
+Before=shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+ExecStart=/userdata/x5/board_savetime.sh save
+ExecStop=/userdata/x5/board_savetime.sh save
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

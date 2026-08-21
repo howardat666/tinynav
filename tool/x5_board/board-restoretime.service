@@ -1,0 +1,19 @@
+[Unit]
+Description=Restore last known clock before journald (X5 has no RTC)
+# 必须早于 journald：晚了就白做，日志已经带着 2025-08-26 写下去了。
+DefaultDependencies=no
+After=systemd-remount-fs.service
+Before=systemd-journald.service systemd-journal-flush.service sysinit.target shutdown.target
+Conflicts=shutdown.target
+RequiresMountsFor=/var/lib
+
+[Service]
+Type=oneshot
+ExecStart=/userdata/x5/board_savetime.sh restore
+# 卡住不能拖住开机；这一步失败只是回到原来的状况，不该阻塞任何东西。
+TimeoutStartSec=10
+RemainAfterExit=no
+SuccessExitStatus=0 2
+
+[Install]
+WantedBy=sysinit.target
