@@ -1419,6 +1419,17 @@ class BackendNode(Ros2NodeManager):
         holds bag_record, the sensor source node and build_map, so the nav children are
         not in it. recover_stale_error_state iterates the same dict, which is part of
         why nothing noticed a dead planner.
+
+        Also clears self._nav_nodes_running, not just the copy get_status() derives from
+        it. Leaving the raw flag set meant /nav/nodes/enable, which gates on that flag
+        directly, kept answering 409 "Nav nodes already running" forever after any nav
+        child crashed -- while /nav/status (built from the derived copy) correctly said
+        idle. That mismatch is exactly what looked like "the button won't light up but it
+        also says already started": the UI's toggle followed the honest status, the
+        retry followed the stale flag, and only cmd_stop_nav_nodes (an explicit disable)
+        ever reset it. 2026-08-24 board log: enable -> map_node crashed on a descriptor
+        dimension mismatch (rc=1) -> every later enable 409'd until someone disabled by
+        hand.
         """
         dead = []
         for name, proc in (
@@ -1431,6 +1442,8 @@ class BackendNode(Ros2NodeManager):
                 dead.append(f'{name}(rc={proc.returncode})')
         if not dead:
             return False
+        with self._lock:
+            self._nav_nodes_running = False
         if not self._reported_dead_procs:
             self._reported_dead_procs = True
             self.get_logger().error(
