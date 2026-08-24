@@ -52,9 +52,7 @@ BEFORE = replace(
     LEKIWI_CONFIG,
     shape='square', length=0.30, width=0.30,
     collision_radius=None,
-    obstacle_z_bottom=-0.4,
-    obstacle_z_top=0.4,
-    dilation_cells=1,
+    obstacle=ObstacleConfig(robot_z_bottom=-0.4, robot_z_top=0.4, dilation_cells=1),
     allow_reverse=False,
 )
 
@@ -104,11 +102,7 @@ def bare_node(robot, origin):
     n.force_turn_heading_rad = math.radians(80.0)
     n.escape_min_clearance_m = max(0.4, robot.front_blocked_m + 0.1)
     n.last_param = (0.0, 0.0)
-    n.obstacle_config = ObstacleConfig(
-        robot_z_bottom=robot.obstacle_z_bottom,
-        robot_z_top=robot.obstacle_z_top,
-        dilation_cells=robot.dilation_cells,
-    )
+    n.obstacle_config = robot.obstacle
     return n
 
 
@@ -177,8 +171,9 @@ def pipeline(label, robot, frames, K, target):
 
     footprint = node._CIRCLE_SEGMENTS if robot.is_circle else 4
     print(f"\n--- {label} ---")
-    print(f"  z_band=[{robot.obstacle_z_bottom:+.2f},{robot.obstacle_z_top:+.2f}] "
-          f"dilation={robot.dilation_cells} hull={robot.hull_radius:.2f} "
+    print(f"  z_band=[{robot.obstacle.robot_z_bottom:+.2f},{robot.obstacle.robot_z_top:+.2f}] "
+          f"dilation={robot.obstacle.dilation_cells} span>={robot.obstacle.min_wall_span_m} "
+          f"hull={robot.hull_radius:.2f} "
           f"hard/soft={robot.hard_clearance:.3f}/{robot.soft_clearance:.3f} "
           f"reverse={robot.allow_reverse} footprint_pts={footprint}")
     print(f"  obstacle_cells={int(np.count_nonzero(mask))}  "

@@ -36,6 +36,7 @@ from tinynav.core.robot_config import (
     B2_CONFIG,
     GO2_CONFIG,
     LEKIWI_CONFIG,
+    ObstacleConfig,
     ROBOT_CONFIGS,
     RobotConfig,
     robot_config,
@@ -86,15 +87,6 @@ _PUBLISH_PLANNING_OVERLAYS = os.environ.get('TINYNAV_PUBLISH_PLANNING_OVERLAYS',
 _EXACT_POSE_PREFIXES = ("/camera/camera/vio",)
 
 # === Helper functions ===
-
-@dataclass
-class ObstacleConfig:
-    robot_z_bottom: float = -0.4
-    robot_z_top: float = 0.4
-    occ_threshold: float = 0.1
-    min_wall_span_m: float = 0.2
-    dilation_cells: int = 1
-
 
 def build_obstacle_map(occupancy_grid, origin, resolution, robot_z, config=None):
     """Obstacle = cells where occupied voxels span >= min_wall_span_m in z.
@@ -291,13 +283,10 @@ class PlanningNode(Node):
         self.baseline = None
         self.last_T = None
         self.last_param = (0.0, 0.0) # acc and gyro
-        # From the robot, not defaulted: the band is relative to the camera, and the two
-        # configs mount it at different heights above the floor.
-        self.obstacle_config = ObstacleConfig(
-            robot_z_bottom=self.robot.obstacle_z_bottom,
-            robot_z_top=self.robot.obstacle_z_top,
-            dilation_cells=self.robot.dilation_cells,
-        )
+        # The robot's own, whole. Rebuilding it field by field wired three of five
+        # through, so min_wall_span_m and occ_threshold silently kept the class default
+        # no matter what a platform asked for.
+        self.obstacle_config = self.robot.obstacle
         self.stamp = None
         self.current_pose = None  # Store the latest pose from odometry
 

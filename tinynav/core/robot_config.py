@@ -13,9 +13,34 @@ declared twice and disagreed: ``GO2_CONFIG.camera_x = 0.2`` against a literal
 planner and the controller placed the robot's control centre 150 mm apart.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
+
+
+@dataclass
+class ObstacleConfig:
+    """How the occupancy grid becomes a 2D obstacle mask. Consumed by
+    planning_node.build_obstacle_map.
+
+    Lives here, nested in RobotConfig, because upstream's robot_specs.py does the same
+    (#228) and because x5 previously wired only three of these five through -- so
+    min_wall_span_m and occ_threshold could not be set per platform at all, which is
+    exactly the pair that matters on a 0.2 m tall car.
+    """
+    # The z slice, relative to the camera, projected into 2D.
+    robot_z_bottom: float = -0.4
+    robot_z_top: float = 0.4
+    occ_threshold: float = 0.1
+    # A cell counts as an obstacle only if occupied voxels span at least this much in z.
+    # Upstream replaced a plain height threshold with this test (#45) because the height
+    # version could not filter stairs and floor bumps. The cost is a blind spot: at the
+    # grid's 0.1 m voxels a span of 0.2 m needs three layers, so nothing shorter than
+    # ~0.2 m is an obstacle at all.
+    min_wall_span_m: float = 0.2
+    # Inflation in cells. x2.3 on the cell count, and scipy's default cross element makes
+    # it directional: 0.100 m on the axes, 0.041 m on the diagonals.
+    dilation_cells: int = 2
 
 
 @dataclass
@@ -37,16 +62,10 @@ class RobotConfig:
     # Round bases only: soft-penalty width past the hard limit, so a tight corridor
     # degrades into "prefer the middle" instead of "all forbidden".
     comfort_margin: float = 0.1
-    # The z slice, relative to the camera, projected into 2D. Per-robot because GO2's
-    # camera sits at z ~ 0 over a floor at -0.35 and LeKiwi's at 0.18 over a floor at 0.
-    obstacle_z_bottom: float = -0.4
-    obstacle_z_top: float = 0.4
+    obstacle: ObstacleConfig = field(default_factory=ObstacleConfig)
     # front_clearance at or below which only turning in place is admissible. Measured
     # from the hull edge, so LeKiwi gates 0.50 m out from its control centre.
     front_blocked_m: float = 0.3
-    # Obstacle inflation in cells. Measured x2.3 on the cell count, and scipy's default
-    # cross element makes it directional: 0.100 m on the axes, 0.041 m on the diagonals.
-    dilation_cells: int = 1
     # What the base can actually deliver, not what we would like. The planner used
     # to sample up to 0.5 m/s on a chassis that saturates at 0.268, so its
     # predictions ran 2x ahead of reality; see LEKIWI_CONFIG.
@@ -151,8 +170,8 @@ class RobotConfig:
             f"ctrl=({self.control_x},{self.control_y}), "
             f"safety_r={self.safety_radius}m, "
             f"hard/soft={self.hard_clearance:.2f}/{self.soft_clearance:.2f}m, "
-            f"z_band=[{self.obstacle_z_bottom:+.2f},{self.obstacle_z_top:+.2f}], "
-            f"dilation={self.dilation_cells}, "
+            f"z_band=[{self.obstacle.robot_z_bottom:+.2f},{self.obstacle.robot_z_top:+.2f}], "
+            f"dilation={self.obstacle.dilation_cells} span>={self.obstacle.min_wall_span_m}m, "
             # 速度以前不在这一行里，所以日志看不出一次 run 是按什么上限跑的 —— 而这是最常调的参数。
             f"vx<={self.max_vx}/rev{self.max_reverse_vx} yaw<={self.max_yaw} "
             f"(clamp {self.actuator_max_vx}/{self.actuator_max_yaw}), "
@@ -193,9 +212,7 @@ LEKIWI_CONFIG = RobotConfig(
     # Top matters, bottom does not. Capping at 0.38 m of world height halved the
     # obstacle count on a real floor (40.2 -> 17.4 cells) by dropping table tops the
     # 0.25 m robot drives under. Below the floor the layers measured empty.
-    obstacle_z_bottom=-0.2,
-    obstacle_z_top=0.2,
-    dilation_cells=0,
+    obstacle=ObstacleConfig(robot_z_bottom=-0.2, robot_z_top=0.2, dilation_cells=0),
     camera_x=0.06, camera_y=0.05,
     control_x=0.0, control_y=0.0,
     safety_radius=0.1,
@@ -236,9 +253,15 @@ DIFFCAR_CONFIG = RobotConfig(
     # to the hull: the grid is 0.1 m per voxel and build_obstacle_map's span test needs
     # spare z layers to distinguish a wall from floor noise, so a narrow band turns the
     # floor into a wall (see docs/x5/diffcar.md).
-    obstacle_z_bottom=-0.3,
-    obstacle_z_top=0.2,
-    dilation_cells=0,
+    #
+    # dilation 2, which is what every upstream platform runs (go2, go2w, b2, b2w, g1 all
+    # take the default) and what this one wrongly overrode to 0. It is not a nicety here:
+    # score_trajectories_by_ESDF samples the footprint at five points, and on a
+    # 0.28x0.35 m body over 0.1 m cells that leaves 2.5 unsampled cells between the front
+    # corners -- a 0.1 m obstacle can sit in the gap and every sample reads clear.
+    # Inflation is how upstream covers that, and turning it off removed the cover without
+    # replacing it. hard_clearance is 1e-3 on a square, so there was no other margin.
+    obstacle=ObstacleConfig(robot_z_bottom=-0.3, robot_z_top=0.2, dilation_cells=2),
     # 0.6, and the reaction-budget argument that held it at 0.3 was mostly wrong: the
     # library samples 7 speeds from 0 to vx_max and collision-checks each over its whole
     # 3 s extent, so raising the ceiling adds fast options rather than forcing speed --

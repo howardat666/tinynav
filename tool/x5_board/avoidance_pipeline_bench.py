@@ -21,7 +21,7 @@ from scipy.ndimage import distance_transform_edt
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 from tinynav.core.planning_kernels import (
     run_raycasting_loopy, generate_trajectory_library_3d, score_trajectories_by_ESDF)
-from tinynav.core.planning_node import build_obstacle_map, ObstacleConfig, normalize_pose_trajectories
+from tinynav.core.planning_node import build_obstacle_map, normalize_pose_trajectories
 from tinynav.core.math_utils import quat_to_matrix
 from tinynav.core.robot_config import LEKIWI_CONFIG as R
 
@@ -68,9 +68,7 @@ def pipeline(depth, T, K, res, shape, step, label, n=7):
     origin = T[:3, 3] - np.array(shape) * res / 2
     t_ray, occ = tm(run_raycasting_loopy, n, depth, T, shape, fx, fy, cx, cy, origin, step, res)
     np.clip(occ, -0.2, 0.2, out=occ)
-    cfg = ObstacleConfig(robot_z_bottom=R.obstacle_z_bottom, robot_z_top=R.obstacle_z_top,
-                         dilation_cells=R.dilation_cells)
-    t_obs, mask = tm(build_obstacle_map, n, occ, origin, res, T[2, 3], cfg)
+    t_obs, mask = tm(build_obstacle_map, n, occ, origin, res, T[2, 3], R.obstacle)
     t_esdf, esdf = tm(lambda: distance_transform_edt(~mask).astype(np.float32) * res, n)
     trajs, params = generate_trajectory_library_3d(init_p=T[:3, 3].copy(),
                                                   init_q=np.array([0., 0., 0., 1.]),
