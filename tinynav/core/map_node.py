@@ -451,15 +451,6 @@ class MapNode(Node):
             Odometry, "/control/target_pose",
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
         )
-        # 前视点是不是路径末端。planning 只能靠"目标闲置 2 秒"猜到达，而目标的刷新周期就是
-        # 关键帧周期（实测中位 7.1 s），所以那个猜法必然误判：2026-08-24 的 run 里 11 次目标
-        # 有 9 次是中间点，车每次开到前视点就被判成"到了"然后停 3~47 秒。这里只有 map_node
-        # 知道答案 —— chosen_index 是不是最后一个点。TRANSIENT_LOCAL 跟 target_pose 一致，
-        # 否则晚加入的订阅者永远收不到。
-        self.target_is_final_pub = self.create_publisher(
-            Bool, "/control/target_is_final",
-            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
-        )
 
         self.tf_broadcaster = TransformBroadcaster(self)
 
@@ -1586,7 +1577,6 @@ class MapNode(Node):
             t_stage = mark_stage("target_select", t_stage)
 
             self.target_pose_pub.publish(np2msg(dummy_pose, self.get_clock().now().to_msg(), "world", "camera"))
-            self.target_is_final_pub.publish(Bool(data=bool(chosen_index == len(paths_in_map) - 1)))
             t_stage = mark_stage("target_pose_publish", t_stage)
 
             path_msg = Path()

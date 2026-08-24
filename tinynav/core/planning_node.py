@@ -297,7 +297,6 @@ class PlanningNode(Node):
 
         self.smoothed_velocity = 0.0
         self.dt = 0.1
-        self.target_reached_distance_m = 0.15
         self._last_static_log_ns = {}
         self._last_target_rx_ns = 0
         self._last_cycle_ns = 0
@@ -311,7 +310,6 @@ class PlanningNode(Node):
         # arrival rather than as passing over a waypoint. map_node republishes roughly
         # once a second while it is navigating and stops entirely once the POI list is
         # done, so anything comfortably above its period separates the two.
-        self.target_idle_arrival_s = 2.0
         # Rotate-first escape hatch: how much closer the best trajectory must get
         # than standing still to count as progress, and how far from the target it
         # must be before turning is preferred over closing the last few centimetres.
@@ -348,16 +346,6 @@ class PlanningNode(Node):
 
         self.poi_change_sub = self.create_subscription(Odometry, "/mapping/poi_change", self.poi_change_callback, 10)
 
-        # /control/target_pose is a rolling lookahead, and only map_node knows whether the
-        # point it just published is the path's last one. Latched, same as the target
-        # itself. None means "never heard" -- see the arrival test for what that falls
-        # back to and why the fallback was wrong on its own.
-        self._target_is_final = None
-        self.create_subscription(
-            Bool, "/control/target_is_final",
-            lambda m: setattr(self, "_target_is_final", bool(m.data)),
-            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
-        )
 
         # Whether a browser is actually looking at the local view. The overlay layers and
         # the voxel cloud exist only to be drawn, and together they measured 25.9 ms of a
@@ -1042,52 +1030,24 @@ class PlanningNode(Node):
             # pose is fixed by whatever publishes it, and inferring it from a consumer
             # -- even a consumer in this same file -- gets a plausible wrong answer.
             target_dist_xy = float(np.linalg.norm(init_p[:2] - target_pose[:2]))
-            # Proximity alone is not arrival. /control/target_pose carries a ROLLING
-            # LOOKAHEAD point, not the goal: map_node walks the path until it has
-            # spent a 5 m budget and publishes wherever it stopped, so on a short path
-            # the point sits a few tens of centimetres ahead and the robot is
-            # permanently "within 0.15 m" of it. Clearing the target there stalled
-            # navigation into a loop of reach-stop-refetch: measured 113 arrivals in
-            # one 19-minute run, cmd_vel non-zero on 1.1% of ticks, the robot moving
-            # for 11 s in total.
+            # No arrival test here, deliberately. main's planning_node has none: the
+            # target is cleared only by /mapping/poi_change, and map_node owns arrival --
+            # it holds the POI list, its own 0.5 m radius, and publishes /mapping/nav_done
+            # when the list is done. x5 added a "close to the target AND map_node has gone
+            # quiet for 2 s" heuristic on the premise that map_node only goes quiet when
+            # finished. That premise is false on this board: map_node also goes quiet for
+            # 7-40 s whenever keyframes starve. Measured 2026-08-24, one 227 s run declared
+            # arrival six times on a rolling lookahead 2 m down a 9.9 m path -- 9 of its 11
+            # published targets were intermediate -- and stopped the car for 138 s, 61% of
+            # the run.
             #
-            # The real arrival signal is map_node going quiet. It owns the POI list
-            # and a 0.5 m arrival radius, it is what the UI reports as reached, and it
-            # stops publishing once the list is done. So require both: close to the
-            # point AND nothing new for target_idle_arrival_s.
-            #
-            # (2026-08-10 also saw this "fixed" by switching the axes to [0, 2], which
-            # appeared to work -- the robot drove to the goal -- because the target's
-            # height sits about a metre off the robot's, so the distance never fell
-            # under the threshold and the test simply stopped firing. That is this
-            # change by accident, resting on a height offset nobody controls. The axes
-            # are (x, y): base_pose_to_camera_pose emits a z-up world position whose
-            # third component is the camera height.)
-            target_idle_s = (
-                self.get_clock().now().nanoseconds - self._last_target_rx_ns) / 1e9
-            # The idle test alone was wrong, not merely conservative: it assumed map_node
-            # goes quiet only when it is done, and map_node also goes quiet for 7-40 s
-            # whenever keyframes starve -- which on this board is most of the time. So a
-            # rolling lookahead 2 m down a 9.9 m path was declared arrival six times in
-            # one 227 s run, each time stopping the car until the next keyframe. Idle is
-            # kept as the timing signal, but a target map_node says is intermediate can
-            # never be arrival. None (topic never heard) keeps the old behaviour so an
-            # older map_node does not silently stop the robot from ever arriving.
-            is_final = self._target_is_final is not False
-            if (is_final
-                    and target_dist_xy <= self.target_reached_distance_m
-                    and target_idle_s >= self.target_idle_arrival_s):
-                self.target_pose = None
-                self._publish_static_path(
-                    init_p, init_q, depth_msg.header, base_time, static_steps,
-                    f"Target pose reached (xy_dist={target_dist_xy:.3f}m, target idle {target_idle_s:.1f}s, "
-                    f"is_final={self._target_is_final})",
-                    log_key="Target pose reached"
-                )
-                return
+            # Nothing replaces it because nothing needs to: standing on the lookahead makes
+            # target_dist_xy small, the cost function stops rewarding forward motion, and
+            # the robot coasts to a halt there until the next target arrives. The POI
+            # advance that ends the leg comes from map_node either way.
 
-            # The counterpart to "Target pose reached", which did not exist: while the
-            # robot was actually navigating this node logged nothing at all, so a run
+            # While the robot was actually navigating this node logged nothing at all,
+            # so a run
             # that drove badly and a run that never started were indistinguishable in
             # the log. Diagnosing the axis bug above needed init_p, and init_p had to
             # be reconstructed by solving backwards from the reported distance --
@@ -1099,7 +1059,6 @@ class PlanningNode(Node):
                 self._last_static_log_ns["navigating"] = now_ns
                 self.get_logger().info(
                     f"navigating: ground_dist_xy={target_dist_xy:.3f}m "
-                    f"(threshold {self.target_reached_distance_m:.2f}m) "
                     # One position now: planned-from and measured are the same thing
                     # since the trajectory seed went away.
                     f"robot=[{init_p[0]:.2f},{init_p[1]:.2f},{init_p[2]:.2f}] "
