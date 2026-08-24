@@ -406,6 +406,7 @@ class MapNode(Node):
         # distributions are comparable from one grep over the log.
         self.last_relocalization_detail = ""
         self.last_relocalization_timing = {}
+        self._last_nav_path_sig = None
         # The same numbers last_relocalization_detail carries, kept numeric. The string is
         # for humans reading one case; offline evaluation aggregates thousands of queries,
         # and re-parsing that string is how the wrong 58% success rate got reported once.
@@ -1572,6 +1573,19 @@ class MapNode(Node):
             t_stage = mark_stage("global_path_msg_build", t_stage)
 
             self.global_plan_pub.publish(path_msg)
+            # 判"target 跳变"的分水岭:/control/target_pose 本来就是沿路径滚动的前视点，所以
+            # 它动是正常的。只有这条路径自己变了，跳变才是缺陷。记首尾点和长度就够对上。
+            head = paths_in_map[0] if len(paths_in_map) else None
+            tail = paths_in_map[-1] if len(paths_in_map) else None
+            sig = (len(paths_in_map), None if head is None else tuple(round(v, 2) for v in head),
+                   None if tail is None else tuple(round(v, 2) for v in tail))
+            if sig != self._last_nav_path_sig:
+                prev = self._last_nav_path_sig
+                self._last_nav_path_sig = sig
+                self.get_logger().info(
+                    f"nav path changed: n={sig[0]} head={sig[1]} tail={sig[2]}"
+                    + (f"  (was n={prev[0]} head={prev[1]} tail={prev[2]})" if prev else "  (first)")
+                )
             t_stage = mark_stage("global_path_publish", t_stage)
 
             self.tf_broadcaster.sendTransform(np2tf(T, self.get_clock().now().to_msg(), "world", "map"))

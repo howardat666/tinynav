@@ -348,6 +348,9 @@ class PlanningNode(Node):
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
         )
         self.target_pose = None
+        # 0.5 m at the 5 Hz lookahead rate would need 2.5 m/s, well past max_vx, so
+        # anything above this is the path moving rather than the robot advancing.
+        self.target_jump_warn_m = float(os.environ.get('TINYNAV_TARGET_JUMP_WARN_M', '0.5'))
 
         self.poi_change_sub = self.create_subscription(Odometry, "/mapping/poi_change", self.poi_change_callback, 10)
 
@@ -431,10 +434,26 @@ class PlanningNode(Node):
             )
 
     def target_pose_callback(self, msg):
-        self.target_pose = np.array([msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z])
+        new_target = np.array([msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z])
+        now_ns = self.get_clock().now().nanoseconds
+        # /control/target_pose is a ROLLING LOOKAHEAD, so it is supposed to move -- which
+        # is exactly why a jump needs its own line. The `navigating:` log is throttled to
+        # 1 Hz, so at 5 Hz four out of five targets are never recorded and a jump has to be
+        # inferred by diffing two surviving lines. Report the step and the gap it happened
+        # over; map_node's "nav path changed" tells you whether the path moved under it.
+        if self.target_pose is not None and self._last_target_rx_ns:
+            step = float(np.linalg.norm(new_target - self.target_pose))
+            dt = (now_ns - self._last_target_rx_ns) / 1e9
+            if step > self.target_jump_warn_m:
+                self.get_logger().warning(
+                    f"target jumped {step:.2f}m in {dt:.2f}s: "
+                    f"[{self.target_pose[0]:.2f},{self.target_pose[1]:.2f},{self.target_pose[2]:.2f}]"
+                    f" -> [{new_target[0]:.2f},{new_target[1]:.2f},{new_target[2]:.2f}]"
+                )
+        self.target_pose = new_target
         # When the target last arrived, which is what separates "standing on a rolling
         # waypoint" from "the run is over". See the arrival test in the planning loop.
-        self._last_target_rx_ns = self.get_clock().now().nanoseconds
+        self._last_target_rx_ns = now_ns
 
     def _ui_active_callback(self, msg: Bool):
         if bool(msg.data) != self._ui_active:

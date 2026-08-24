@@ -23,7 +23,7 @@ state=/tmp/.run_stats_prev
 # diffcar_control 是差速车的执行器（旧平台是 wheel_odometry_node）。两个都留着:换平台时
 # 不改这里，那一列会一直是空的而不报错 —— 和 nav_health 里同一类坑。
 NODES="diffcar_control wheel_odometry_node looper_bridge_node planning_node map_node cmd_vel_control uvicorn insight_full"
-printf "time\ttemp_c\tload\tavail_mb" > "$out"
+printf "time\ttemp_c\tload\tavail_mb\tbpu_pct" > "$out"
 for n in $NODES; do printf "\t%s_cpu\t%s_rss" "$n" "$n" >> "$out"; done
 printf "\tservo_fail_cum\n" >> "$out"
 echo "recording every ${P}s -> $out"
@@ -32,6 +32,9 @@ while :; do
   now=$(date +%s)
   line="$(date +%H:%M:%S)\t$(awk '{printf "%.1f", $1/1000}' /sys/class/thermal/thermal_zone0/temp)"
   line="$line\t$(awk '{print $1}' /proc/loadavg)\t$(awk '/MemAvailable/{printf "%d", $2/1024}' /proc/meminfo)"
+  # BPU 是这块板子上第三个会先耗尽的资源（CPU、可用内存、BPU），而它一直没被采过。
+  bpu=$(cat /sys/devices/system/bpu/ratio 2>/dev/null || cat /sys/devices/system/bpu/bpu0/ratio 2>/dev/null)
+  line="$line\t${bpu:--}"
   new=""
   for n in $NODES; do
     pid=""; 

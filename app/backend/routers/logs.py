@@ -32,6 +32,14 @@ _NODES = ('map_node', 'build_map_node', 'diffcar_control', 'wheel_odometry',
 # 匹配到 build_map_node，把建图日志当成导航的收进来。
 _NODE_RE = r'^(\d{4}(?:_\d{2}){5})_%s\.txt$'
 _MAX_BUNDLES = 10
+# Per-process CPU/RSS and BPU are the one thing nothing samples continuously, and
+# 10 s (board_health) is too coarse to see a stall. So this is the one writer the
+# start button really does start.
+# The Python sampler, not run_stats.sh: the shell one forked a `tr` per process per
+# node name and measured 5.5 s a sample on this board, so it distorted the very load
+# it was there to record.
+_STATS_PY = '/userdata/x5/tinynav/tool/x5_board/run_stats.py'
+_STATS_PERIOD_S = '1'
 
 
 def _log_dir() -> Path:
@@ -52,6 +60,31 @@ def _bundle_dir() -> Path:
 
 def _marker_path() -> Path:
     return _log_dir() / '.collect_marker.json'
+
+
+def _start_sampler() -> str | None:
+    """1 Hz per-process sampler. Returns the TSV it will write, or None."""
+    if not Path(_STATS_PY).exists():
+        return None
+    before = set(_log_dir().glob('run_stats_*.tsv'))
+    try:
+        subprocess.Popen(['python3', _STATS_PY, _STATS_PERIOD_S],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except Exception:
+        return None
+    # The script names its own file from the clock, so the new one has to be found
+    # rather than chosen -- it writes the header before the first sample.
+    for _ in range(20):
+        time.sleep(0.1)
+        fresh = set(_log_dir().glob('run_stats_*.tsv')) - before
+        if fresh:
+            return fresh.pop().name
+    return None
+
+
+def _stop_sampler() -> None:
+    subprocess.run(['pkill', '-f', f'python3 {_STATS_PY}'], capture_output=True)
 
 
 def _validate_bundle(name: str) -> str:
@@ -152,6 +185,8 @@ def collect_start(label: str = '') -> dict:
     for name in _SLICED:
         p = d / name
         marker['files'][name] = p.stat().st_size if p.exists() else 0
+    _stop_sampler()          # 上一次没正常停的话，别留两个采样器同时写
+    marker['stats'] = _start_sampler()
     _marker_path().write_text(json.dumps(marker, indent=2))
     return collect_status()
 
@@ -161,6 +196,7 @@ def collect_stop() -> dict:
     m = _read_marker()
     if m is None:
         raise HTTPException(409, 'Not collecting')
+    _stop_sampler()
     d = _log_dir()
     stamp = time.strftime('%Y%m%d_%H%M%S', time.localtime(m['t']))
     out = _bundle_dir() / f'run_{stamp}.tar.gz'
@@ -174,6 +210,12 @@ def collect_stop() -> dict:
                 (staged / name).write_bytes(data)
                 contents.append({'name': name, 'size': len(data),
                                  'lines': data.count(b'\n')})
+        stats = m.get('stats')
+        if stats and (d / stats).exists():
+            shutil.copy2(d / stats, staged / stats)
+            raw = (d / stats).read_bytes()
+            contents.append({'name': stats, 'size': len(raw),
+                             'lines': raw.count(b'\n')})
         for name in _WHOLE:
             src = d / name
             if src.exists() and src.stat().st_size:
