@@ -123,8 +123,10 @@ def ping_ms(host, timeout=2.5):
             if len(data) >= 28 and data[20] == 0 and data[24:26] == struct.pack("!H", pid):
                 return "%.0f" % ((time.time() - t0) * 1000)
         return "MISS"
-    except OSError:
-        return "ERR"
+    except OSError as e:
+        # 带上 errno:105=ENOBUFS(发送队列堵死,链路还在但挤不出去)、101/113=路由或主机不可达。
+        # 2026-08-24 那次掉线全程 link=1 carrier=1 usb=1，只有这里报错,分不清是哪种。
+        return "ERR%d" % (e.errno or 0)
     finally:
         if s is not None:
             s.close()
