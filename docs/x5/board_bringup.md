@@ -1190,10 +1190,13 @@ journalctl -u board-health | wc -l ->  5 行，全是重启之后的
 **唯一能分开「网卡掉电」和「射频问题」的那份 rssi/link 时间序列,正好是丢掉的那一份。**
 上面那条时间线是从 `/userdata` 上的**节点日志**拿的 —— 那个分区连 8 月 21 号的日志都还在。
 
-rootfs 本身是持久的(8 月 21 号装的脚本全在,`/var/backups` 的 mtime 还是 8 月 18),所以不是
-整个 `/var` 易失。最可能是 journald 对持久存储的 `SyncIntervalSec` **默认 5 分钟**、而且用
-mmap 写 —— 硬断电时脏页还没回写就全丢。**已在 `/var/log/PERSIST_TEST` 留了标记文件**,
-下次重启一看便知:还在 = `/var/log` 持久、问题在 journald 的同步策略;没了 = `/var/log` 本身易失。
+✅ **已定案(留的标记文件给了答案)**:在 `/var/log/PERSIST_TEST` 写了个文件并 `sync`,两次重启后
+**它没了** —— 所以**`/var/log` 的内容根本活不过重启**,不是 journald 同步策略的问题。
+`Storage=persistent` 在这块板子上是**永远不可能生效**的:目录在,内容每次开机清空。
+
+⚠️ 注意 `/var` 本身**不是**全易失(`/var/backups` mtime 还是 8 月 18、`/var/spool` 是 7 月 17,
+8 月 21 号装进 `/usr/local/sbin` 的脚本也都在),`/proc/mounts` 里 `/var/log` 也不是挂载点 ——
+是这个地平线镜像的某处在开机清它。**别再花时间找是谁清的,结论已经够用:换地方写。**
 
 🔑 **教训:凡是要活过断电的东西,一律写 `/userdata`,别信 rootfs。**
 
