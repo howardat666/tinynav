@@ -1,4 +1,5 @@
 import argparse
+import collections
 import copy
 import os
 import time
@@ -40,6 +41,13 @@ class LooperBridgeNode(Node):
         self.cached_camera_info = None
         self.last_keyframe_pose = None
         self.last_keyframe_time = None
+        # stamp_ns -> the depth Image with that stamp, newest few only. Depth now reaches
+        # the keyframe path by lookup rather than by being a sync input; 12 entries is
+        # ~2.8 s at the board's 4.3 Hz, far longer than the sub-100 ms the two paths can
+        # drift apart, and 12 x 680 kB is 8 MB held at worst.
+        self._depth_by_stamp = collections.OrderedDict()
+        self._depth_cache_max = 12
+        self._depth_lookup_miss = 0
         self.last_pose = None
         self.last_pose_time = None
         self._missing_input_counter = 0
@@ -114,10 +122,6 @@ class LooperBridgeNode(Node):
         )
 
         # The 100 Hz pose stays unbridged; cmd_vel_control consumes it directly.
-        self.depth_sub = message_filters.Subscriber(
-            self, Image, "/camera/camera/depth/image_rect_raw",
-            qos_profile=self.sync_depth_qos, callback_group=self.sync_group
-        )
         self.pose_sub = message_filters.Subscriber(
             self, PoseStamped, args.pose_topic,
             qos_profile=self.sync_fast_qos, callback_group=self.sync_group
@@ -144,15 +148,29 @@ class LooperBridgeNode(Node):
         #
         # So `auto` uses exact only for a pose topic that is stamp-locked to the
         # images, approximate otherwise, and logs which branch it took.
+        # Pose + infra1 only. main syncs depth in as well, and on its target that is free:
+        # all three inputs run at the camera's 20 Hz. The X5 sets depth_frame_skip=4 in the
+        # firmware for thermal reasons (0.86 core, 89% BPU and 10 C, see
+        # docs/x5/depth_frame_skip.md), which silently made depth the rate limiter of a
+        # three-way exact-stamp sync -- keyframes could never exceed 4.3 Hz, and depth was
+        # a third input that could starve the match. Measured 2026-08-24: keyframes at
+        # 0.161 Hz, sync_callback idle for up to 39.6 s at a stretch, 61% of the run.
+        #
+        # Depth was only ever feeding /slam/keyframe_depth (measured Subscription count: 0)
+        # and the optional /slam/disparity_vis. What map_node relocalizes on is
+        # /slam/keyframe_image, which comes from infra1, with its pose -- both 20 Hz. So
+        # depth leaves the sync and is looked up by stamp from the single subscription that
+        # already receives it for /slam/depth. That also ends the duplicate subscription:
+        # the same 680 kB frame was being delivered and deserialized twice per frame.
         use_exact = self._pose_sync_is_exact()
         if use_exact:
             self.sync = message_filters.TimeSynchronizer(
-                [self.depth_sub, self.pose_sub, self.image_sub],
+                [self.pose_sub, self.image_sub],
                 queue_size=args.sync_queue_size,
             )
         else:
             self.sync = message_filters.ApproximateTimeSynchronizer(
-                [self.depth_sub, self.pose_sub, self.image_sub],
+                [self.pose_sub, self.image_sub],
                 queue_size=args.sync_queue_size,
                 slop=args.pose_sync_slop,
             )
@@ -295,6 +313,10 @@ class LooperBridgeNode(Node):
         # branch on msg.encoding, and perception_node still publishes 32FC1 here in
         # RealSense mode, so this topic was never single-encoding to begin with.
         self.depth_pub.publish(self.relabel_depth(depth_msg))
+        key = depth_msg.header.stamp.sec * 1_000_000_000 + depth_msg.header.stamp.nanosec
+        self._depth_by_stamp[key] = depth_msg
+        while len(self._depth_by_stamp) > self._depth_cache_max:
+            self._depth_by_stamp.popitem(last=False)
 
     def relabel_depth(self, depth_msg: Image) -> Image:
         """Re-header the camera depth for /slam/depth, sharing the payload.
@@ -355,7 +377,7 @@ class LooperBridgeNode(Node):
         disp_color_msg.header.frame_id = "camera"
         return disp_color_msg
 
-    def sync_callback(self, depth_msg: Image, pose_msg: PoseStamped, image_msg: Image):
+    def sync_callback(self, pose_msg: PoseStamped, image_msg: Image):
         if self.cached_camera_info is None:
             self.log_missing_inputs()
             return
@@ -377,14 +399,19 @@ class LooperBridgeNode(Node):
         stamp_s = self.stamp_to_sec(stamp)
         if self._last_sync_log_stamp is None or stamp_s - self._last_sync_log_stamp >= 1.0:
             self._last_sync_log_stamp = stamp_s
+            # depth is no longer a sync input, so it cannot be reported here. depth_cache
+            # is what says whether the lookup below will find anything, which is the thing
+            # worth knowing now.
             self.get_logger().info(
                 "sync_callback: "
                 f"t={stamp_s:.3f}, "
-                f"depth={depth_msg.height}x{depth_msg.width}, image={image_msg.height}x{image_msg.width}"
+                f"image={image_msg.height}x{image_msg.width}, "
+                f"depth_cache={len(self._depth_by_stamp)}, depth_misses={self._depth_lookup_miss}"
             )
 
-        # This callback fires on every synced set, up to 5 Hz, but keyframes land at
-        # roughly 1 Hz -- so four of every five sets used to pay for work nobody read: a
+        # This callback fires on every synced set -- up to the camera's 20 Hz now that depth
+        # is not a sync input, where it used to be capped at depth's 4.3 -- but keyframes
+        # still land at roughly 1 Hz, so most sets pay for work nobody reads: a
         # depth decode over 544x640, a 1.39 MB float32 Image built from it, a deepcopy of
         # the infra1 image and an Odometry, all constructed unconditionally above and then
         # used only inside the keyframe branch at the bottom. The latency of this callback
@@ -403,10 +430,24 @@ class LooperBridgeNode(Node):
             or self.keyframe_depth_pub.get_subscription_count() > 0
         )
 
-        # Decoded at most once per callback, and only when something will read it.
+        # Decoded at most once per callback, and only when something will read it. Depth
+        # comes from the cache now: the pose/image pair runs at 20 Hz and depth at 4.3, so
+        # most callbacks have no depth for their stamp -- that is expected, and the two
+        # consumers below are the only things that care.
         depth_m = None
+        depth_msg = None
         if want_keyframe_depth or self.disparity_pub_vis is not None:
-            depth_m = self.decode_depth_meters(depth_msg)
+            depth_msg = self._depth_by_stamp.get(
+                stamp.sec * 1_000_000_000 + stamp.nanosec)
+            if depth_msg is not None:
+                depth_m = self.decode_depth_meters(depth_msg)
+            else:
+                self._depth_lookup_miss += 1
+                self.get_logger().info(
+                    f"no depth for keyframe stamp (total {self._depth_lookup_miss}); "
+                    "keyframe_depth and disparity_vis skipped for this one",
+                    throttle_duration_sec=10.0,
+                )
 
         camera_info_out = copy.deepcopy(self.cached_camera_info)
         camera_info_out.header.stamp = stamp
@@ -418,7 +459,7 @@ class LooperBridgeNode(Node):
         # reciprocal over 544x640, a colour map, and serialising ~1 MB into DDS at
         # up to 5 Hz, all of it inside the callback whose latency decides whether
         # map_node accepts the keyframe at all.
-        if self.disparity_pub_vis is not None:
+        if self.disparity_pub_vis is not None and depth_m is not None:
             self.disparity_pub_vis.publish(self.build_disparity_vis(depth_m, stamp))
         self.slam_camera_info_pub.publish(camera_info_out)
         if self.camera_info_alias_pub is not None:
@@ -430,7 +471,7 @@ class LooperBridgeNode(Node):
             image_out.header.frame_id = "camera"
             self.keyframe_pose_visual_pub.publish(self.make_odom_msg(T_world_camera, stamp))
             self.keyframe_image_pub.publish(image_out)
-            if want_keyframe_depth:
+            if want_keyframe_depth and depth_m is not None:
                 self.keyframe_depth_pub.publish(self.build_depth_msg(depth_m, stamp))
             self.last_keyframe_pose = T_world_camera.copy()
             self.last_keyframe_time = self.stamp_to_sec(stamp)
