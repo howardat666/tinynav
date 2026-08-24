@@ -368,6 +368,26 @@ _IMAGE_TOPICS_ALL = _IMAGE_TOPICS_REALSENSE  # fallback
 # topics get a slower cadence rather than being dropped. infra1 is the image
 # SuperPoint actually runs on, so it is the one worth keeping visible.
 _PREVIEW_MIN_INTERVAL = float(os.environ.get('TINYNAV_PREVIEW_INTERVAL', '0.2'))
+# Downscale before encoding, which is what main does and x5 had dropped. The board was
+# JPEG-encoding the full 640x544 frame: 348160 pixels against 87040 at a 320 px edge,
+# exactly 4x, and JPEG cost is near-linear in pixels. Measured 2026-08-24, uvicorn sat at
+# 70.9% CPU during navigation on a board already at load 14.7/8 cores. The browser panel
+# is a few hundred pixels wide either way, so this is free.
+_PREVIEW_MAX_EDGE_PX = int(os.environ.get('TINYNAV_PREVIEW_MAX_EDGE_PX', '320'))
+_PREVIEW_JPEG_QUALITY = int(os.environ.get('TINYNAV_PREVIEW_JPEG_QUALITY', '50'))
+
+
+def _resize_preview_frame(arr: np.ndarray, max_edge_px: int = _PREVIEW_MAX_EDGE_PX) -> np.ndarray:
+    """Downscale preview frame so the longest side is <= max_edge_px."""
+    if max_edge_px <= 0 or arr is None or arr.size == 0:
+        return arr
+    height, width = arr.shape[:2]
+    longest = max(height, width)
+    if longest <= max_edge_px:
+        return arr
+    scale = max_edge_px / float(longest)
+    new_size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
+    return cv2.resize(arr, new_size, interpolation=cv2.INTER_AREA)
 _PREVIEW_SLOW_INTERVAL = float(os.environ.get('TINYNAV_PREVIEW_SLOW_INTERVAL', '0.5'))
 _PREVIEW_SLOW_TOPICS = frozenset({
     '/camera/camera/infra1/image_rect_raw',
@@ -1181,7 +1201,8 @@ class BackendNode(Ros2NodeManager):
                     arr = arr[:, :, 0]
                 elif msg.encoding == 'rgb8':
                     arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-            _, buf = cv2.imencode('.jpg', arr, [cv2.IMWRITE_JPEG_QUALITY, 50])
+            arr = _resize_preview_frame(arr)
+            _, buf = cv2.imencode('.jpg', arr, [cv2.IMWRITE_JPEG_QUALITY, _PREVIEW_JPEG_QUALITY])
             frame = buf.tobytes()
         except Exception:
             return

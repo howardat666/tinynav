@@ -237,6 +237,24 @@ class CmdVelControlNode(Node):
         # wants the newest measurement; an old one is not partial information, it is
         # wrong information.
         self.create_subscription(PoseStamped, self._pose_topic, self._odom_cb, 1)
+        # Timer-driven, which is what main does: it runs cmd_timer_callback at
+        # cmd_rate_hz = 12.0 and never ties the loop to the pose rate. x5 had _odom_cb
+        # end by calling _control_loop, so the whole controller ran at the pose topic's
+        # 99 Hz -- measured 73.8% of a core during navigation on a board already at load
+        # 14.7/8. The comment above justifies a depth-1 queue, which is about pose
+        # freshness, and says nothing about needing the loop itself that often.
+        #
+        # Pose ingest stays at 99 Hz: storing the newest sample is nearly free, and the
+        # 0.35 low-pass in _odom_cb is per-message, so throttling the subscription would
+        # change its time constant. Only the loop is throttled.
+        #
+        # 25, not main's 12: this is not main's controller -- x5 rewrote it as a
+        # time-parameterised Samson-type tracker -- and its stability at 12 Hz has not
+        # been measured on the floor. 25 is still a 4x cut. Lower it once measured.
+        self.declare_parameter("cmd_rate_hz", 25.0)
+        self._cmd_rate_hz = float(self.get_parameter("cmd_rate_hz").value)
+        self.create_timer(1.0 / self._cmd_rate_hz, self._control_loop)
+        self.get_logger().info(f"control loop {self._cmd_rate_hz:.0f} Hz (pose in at ~99 Hz)")
         self.create_subscription(Path, "/planning/trajectory_path", self._traj_cb, 10)
         self.cmd_pub = self.create_publisher(Twist, "/cmd_vel", 10)
 
@@ -277,7 +295,6 @@ class CmdVelControlNode(Node):
                 self.position,
                 self.rotation,
             )
-        self._control_loop()
 
     def _traj_cb(self, msg: Path):
         now = self._now_sec()
@@ -422,6 +439,11 @@ class CmdVelControlNode(Node):
                 self._publish_zero("nav paused")
 
     def _control_loop(self):
+        # The timer starts before the first pose does, and self.position is zeros until
+        # then -- driving on that would aim at the odom origin.
+        if not self._odom_pose_initialized:
+            return
+
         # Checked before anything else, including the trajectory, so a stale path
         # cannot drive the wheels while paused.
         if self._nav_paused:
