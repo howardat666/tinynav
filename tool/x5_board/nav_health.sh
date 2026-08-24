@@ -35,7 +35,10 @@ since=$((now - W))
 recent() { [ -f "$1" ] && awk -v s="$since" 'match($0,/\[[0-9]+\.[0-9]+\]/){t=substr($0,RSTART+1,RLENGTH-2)+0; if(t>=s) print}' "$1"; }
 
 echo "=== last ${W}s ==="
-m=$(newest map_node.py); p=$(newest planning_node.py); c=$(newest cmd_vel_control); w=$(newest wheel_odometry_node.py)
+m=$(newest map_node.py); p=$(newest planning_node.py); c=$(newest cmd_vel_control)
+# 2026-08-24 起差速车的执行器是 diffcar_control，不再是 wheel_odometry_node。两个都查:
+# 换平台时忘了改这里，会让整节静默变成"没有异常"。
+w=$(newest wheel_odometry_node.py); dc=$(newest diffcar_control.py)
 
 echo "-- relocalization (map_node) --"
 if [ -n "$m" ]; then
@@ -118,12 +121,30 @@ if [ -n "$c" ]; then
   [ "$nz" = "0" ] && echo "   !! robot is commanded to stand still"
 fi
 
-echo "-- servo bus (wheel_odometry) --"
+echo "-- actuator --"
 if [ -n "$w" ]; then
   f=$(recent "$w" | grep "read failed" | tail -1 | sed 's/.*(\([0-9]*\) total).*/\1/')
   f0=$(recent "$w" | grep "read failed" | head -1 | sed 's/.*(\([0-9]*\) total).*/\1/')
-  if [ -n "$f" ] && [ -n "$f0" ]; then echo "   read failures in window: $((f - f0))  (cumulative $f)"
-  else echo "   no read failures logged in window"; fi
+  if [ -n "$f" ] && [ -n "$f0" ]; then echo "   servo bus read failures in window: $((f - f0))  (cumulative $f)"
+  else echo "   servo bus: no read failures logged in window"; fi
+fi
+if [ -n "$dc" ]; then
+  sag=$(recent "$dc" | grep -c "battery sagged")
+  low=$(recent "$dc" | grep "battery sagged" | sed -n 's/.*sagged to \([0-9.]*\) V.*/\1/p' \
+        | sort -n | head -1)
+  pcbad=$(recent "$dc" | grep -c "unreachable")
+  pcok=$(recent "$dc" | grep -c "reachable again")
+  # 固件主动上报的告警：ESP32 偷偷重启 / 堵转 / 失联停车 / 闭环被 CFG_REV 锁住。
+  # 这些只在串口上说一次，2026-08-24 之前 diffcar_control 把它们全丢了。
+  fw=$(recent "$dc" | grep -c "firmware:")
+  echo "   diffcar_control: 电池告警 $sag 次${low:+（最低 ${low} V）}   PC 不可达 $pcbad / 恢复 $pcok"
+  if [ "$fw" -gt 0 ]; then
+    echo "   !! 固件告警 $fw 条:"; recent "$dc" | grep "firmware:" | tail -5 | sed 's/^/      /'
+  else
+    echo "   固件告警: 无（重启/堵转/失联/闭环锁 都没发生）"
+  fi
+else
+  echo "   !! 没有 diffcar_control 日志 —— 执行器没起，车不会动"
 fi
 echo "-- processes --"
 # app_start.sh stop has been seen to leave the previous wheel_odometry alive, so two
@@ -138,8 +159,8 @@ for pp in /proc/[0-9]*; do
 done
 echo "   ttyS3 holders: $h"
 [ "$h" -gt 1 ] && echo "   !! more than one process holds the servo bus -- run cleanup.sh"
-[ "$h" = "0" ] && echo "   !! nobody holds the servo bus -- wheel_odometry is down"
-for n in wheel_odometry_node map_node planning_node looper_bridge_node cmd_vel_control; do
+[ "$h" = "0" ] && echo "   !! nobody holds /dev/ttyS3 -- 执行器(diffcar_control)没在跑"
+for n in wheel_odometry_node diffcar_control map_node planning_node looper_bridge_node cmd_vel_control; do
   c=0
   for pp in /proc/[0-9]*; do
     case "$(tr '\0' ' ' < $pp/cmdline 2>/dev/null)" in python3*$n*) c=$((c+1));; esac
@@ -158,3 +179,11 @@ printf "   temp %sC   load %s   avail %s kB\n" \
   "$(awk '{printf "%.1f", $1/1000}' /sys/class/thermal/thermal_zone0/temp)" \
   "$(awk '{print $1}' /proc/loadavg)" \
   "$(awk '/MemAvailable/{print $2}' /proc/meminfo)"
+# 链路。掉线两次的判据都在这一行里：fa 阶跃到 >1000 是射频干扰，usb=0 才是网卡掉电。
+BH=/userdata/x5/logs/board_health.log
+[ -r "$BH" ] && echo "   link: $(tail -1 "$BH" | cut -d' ' -f3-)"
+NH=/userdata/x5/logs/board_netheal.log
+if [ -r "$NH" ]; then
+  n=$(tail -40 "$NH" | grep -c "第.级")
+  [ "$n" -gt 0 ] && { echo "   !! netheal 动过手 $n 次:"; tail -4 "$NH" | sed 's/^/      /'; }
+fi

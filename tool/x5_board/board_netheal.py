@@ -118,6 +118,8 @@ def probe(host):
             if len(data) >= 28 and data[20] == 0 and data[24:26] == struct.pack("!H", pid):
                 return True, "%.0fms" % ((time.time() - t0) * 1000)
         return False, "MISS"
+    except socket.timeout:
+        return False, "MISS"      # 见 board_health.py 里的注释:超时不是发送失败
     except OSError as e:
         return False, "ERR%d" % (e.errno or 0)
     finally:
@@ -177,7 +179,9 @@ def emit(line):
 def steps(dev):
     """梯度。每一项是 (名字, 动作, 之后等多少秒再复验)。"""
     return [
-        ("reassociate", lambda: sh("wpa_cli -i %s reassociate" % dev, 20), 20),
+        # 不用 wpa_cli reassociate:板上的 wpa_supplicant 是 wifi-connect.sh 手工起的、
+        # 没带 -C 控制套接字，wpa_cli 直接 rc=255 连不上 —— 那一级是空操作(2026-08-24 实测)。
+        ("link-bounce", lambda: sh("ifconfig %s down; sleep 2; ifconfig %s up" % (dev, dev), 30), 25),
         ("wifi-connect", lambda: sh("sh %s" % WIFI_UP, 120), 25),
         ("usb-reauthorize", lambda: (
             sh("echo 0 > %s/authorized; sleep 3; echo 1 > %s/authorized" % (USB_DEV, USB_DEV), 30),
@@ -196,6 +200,7 @@ def main():
     armed = FORCE_FAIL
     rung = 0
     down_since = None
+    last_rc = None
     backoff_until = 0.0
     while True:
         time.sleep(PERIOD_S)
@@ -204,11 +209,17 @@ def main():
         ok, why = (False, "forced") if FORCE_FAIL else probe(gw)
         if ok:
             if down_since is not None:
-                emit("恢复 断了%.0fs 由第%d级(%s)救回 | %s"
-                     % (time.time() - down_since, rung,
-                        steps(dev)[rung - 1][0] if 0 < rung <= len(steps(dev)) else "自愈",
-                        snapshot(dev)))
-            armed, fails, rung, down_since = True, 0, 0, None
+                lad = steps(dev)
+                if rung == 0:
+                    how = "自己好的(还没动手)"
+                elif last_rc == 0:
+                    how = "第%d级 %s 之后" % (rung, lad[rung - 1][0])
+                else:
+                    # 那一级没执行成功就别记它的功。2026-08-24 第1级 rc=255 却被记成"救回"
+                    how = "第%d级 %s 之后，但那一级 rc=%s，很可能是自己好的" % (
+                        rung, lad[rung - 1][0], last_rc)
+                emit("恢复 断了%.0fs %s | %s" % (time.time() - down_since, how, snapshot(dev)))
+            armed, fails, rung, down_since, last_rc = True, 0, 0, None, None
             continue
         fails += 1
         if not armed:
@@ -235,6 +246,7 @@ def main():
         rung += 1
         emit("第%d级 %s 开始 | %s" % (rung, name, snapshot(dev)))
         rc, out = act()
+        last_rc = rc
         emit("第%d级 %s 执行完 rc=%s 等%.0fs 复验 | %s"
              % (rung, name, rc, wait, out.strip().replace("\n", " / ")[-160:]))
         time.sleep(0 if DRY else wait)

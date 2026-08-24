@@ -152,6 +152,7 @@ class DiffCarControlNode(Node):
         # 百分比契约，前端直接当 "%" 渲染 —— 把电压发进去会显示成 "10%"，而 3S 锂电
         # 9.98V 的真实余量恰好也是 5~10%，于是错数看着像对的，比明显错的更危险。
         self.batt_pub = self.create_publisher(Float32, "/battery_voltage", 10)
+        self._fw_seen_noise: set[str] = set()
         self._batt_period = float(g("battery_period_s").value)
         self._batt_warn = float(g("battery_warn_v").value)
         self._batt_at = 0.0
@@ -257,9 +258,30 @@ class DiffCarControlNode(Node):
             b = _BATT_RE.search(line)
             if b:
                 self._on_battery(float(b.group(1)), float(b.group(2)))
+                continue
+            self._on_firmware_line(line)
         if self._pose is None:
             return
         self._publish(*self._pose)
+
+    # 固件主动上报的东西，之前全被丢掉了。ESP32 偷偷重启、堵转、失联停车、闭环被 CFG_REV
+    # 锁住 —— 跑导航时这几件正是最需要知道的，而它们只在串口上说一次。
+    _FW_ALERT = ("BOOT ", "失联保护", "堵转保护", "闭环已锁", "低压", "电压过低")
+
+    def _on_firmware_line(self, line: str) -> None:
+        if not line:
+            return
+        if any(k in line for k in self._FW_ALERT):
+            self.get_logger().warning(f"firmware: {line}")
+            return
+        # 其余的每种只报一次:回显和帮助文本会刷屏，但完全不看又会漏掉没预料到的话。
+        # 按前 24 字符去重，因为大部分重复行只有尾部的数字在变。
+        head = line[:24]
+        if head not in self._fw_seen_noise:
+            if len(self._fw_seen_noise) > 200:
+                self._fw_seen_noise.clear()
+            self._fw_seen_noise.add(head)
+            self.get_logger().info(f"firmware (first time): {line}")
 
     def _on_battery(self, now_v: float, min_v: float) -> None:
         """min_v is the lowest since the firmware was last asked, so it catches a sag

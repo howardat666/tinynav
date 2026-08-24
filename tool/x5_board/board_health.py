@@ -123,9 +123,13 @@ def ping_ms(host, timeout=2.5):
             if len(data) >= 28 and data[20] == 0 and data[24:26] == struct.pack("!H", pid):
                 return "%.0f" % ((time.time() - t0) * 1000)
         return "MISS"
+    except socket.timeout:
+        # settimeout 下 recvfrom 是**抛异常**而不是返回，所以上面那个 return "MISS" 其实
+        # 到不了。而 socket.timeout 是 OSError 的子类、errno 为 None —— 2026-08-24 就是因此
+        # 把"没收到回包"全打成了 ERR0，害我以为是发送失败(ENOBUFS)，推出一整套错的解释。
+        return "MISS"
     except OSError as e:
-        # 带上 errno:105=ENOBUFS(发送队列堵死,链路还在但挤不出去)、101/113=路由或主机不可达。
-        # 2026-08-24 那次掉线全程 link=1 carrier=1 usb=1，只有这里报错,分不清是哪种。
+        # 真的发不出去才走这里:105=ENOBUFS 队列堵死、101/113=路由或主机不可达。
         return "ERR%d" % (e.errno or 0)
     finally:
         if s is not None:
