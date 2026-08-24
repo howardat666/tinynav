@@ -37,7 +37,9 @@ HELP = """
   p     打印一份快照(留在屏幕上好抄)    +/-   调速度上限
   h     重印帮助                        q     退出
 
-  左偏和转角都是左为正。量卷尺时建议固定量"起点 -> 车体左后角"，
+  前进/左偏都是相对"按 z 那一刻的车头朝向"的投影(不是行程)，左偏和转角都左为正。
+  VIO 要先定向:清零后往前直走 0.25 m 以上，它才知道哪个方向是"前"。
+  量卷尺时建议固定量"起点 -> 车体左后角"，
   别量"后缘"——那是一条 0.35 m 宽的线，车一歪就读不准(踩过一次，差了 3.7%)。
 """
 
@@ -149,22 +151,30 @@ class Teleop(Node):
         return (float(d[0] * u[0] + d[1] * u[1]), float(-d[0] * u[1] + d[1] * u[0]), yaw)
 
 
-def brief(t):
+def why_unlatched(wr):
+    """定向没成功时说清差哪一项。判据故意用"从清零点算起"的累计位姿:VIO 的前进方向必须和
+    轮速侧同一个基准，而先转弯再直行会让位移在起始系里几乎全是横向的，永远凑不够。"""
+    if wr is None:
+        return "等轮速数据"
+    return "清零后往前直走 %.2f m (现在 前进 %+.2f 左偏 %+.2f)" % (LATCH_M, wr[0], wr[1])
+
+
+def brief(t, wr=None):
     """实时那一行只放三个数，行程留给快照 —— 一行塞不下就会被截断。"""
     if t is None:
-        return "%-30s" % "等数据"
+        return "%-46s" % "等数据"
     f, l, y = t
     if f is None:
-        return "%-30s" % ("待定向 转角%+6.2f" % np.degrees(y))
+        return "%-46s" % ("待定向 转角%+7.2f  <- %s" % (np.degrees(y), why_unlatched(wr)))
     return "%+7.3f / %+7.3f / %+6.2f" % (f, l, np.degrees(y))
 
 
-def fmt(t, path):
+def fmt(t, path, wr=None):
     if t is None:
         return "%-42s" % "等数据"
     f, l, y = t
     if f is None:
-        return "%-42s" % ("待定向(先往前直走 %.2f m)  转角 %+.2f 度" % (LATCH_M, np.degrees(y)))
+        return "待定向  转角 %+7.2f 度   <- %s" % (np.degrees(y), why_unlatched(wr))
     return "前进 %+8.4f  左偏 %+8.4f  转角 %+7.2f  行程 %7.4f" % (f, l, np.degrees(y), path)
 
 
@@ -226,7 +236,7 @@ def main():
                     wr, vr = node.wheel_rel(), node.vio_rel()
                     print("\n------- %s 快照 -------" % time.strftime("%H:%M:%S"))
                     print("  轮速里程计   " + fmt(wr, node.path_o))
-                    print("  VIO          " + fmt(vr, node.path_v))
+                    print("  VIO          " + fmt(vr, node.path_v, wr))
                     if wr and vr and vr[0] is not None:
                         print("  差(轮-VIO)   前进 %+8.4f  左偏 %+8.4f  转角 %+7.2f"
                               % (wr[0] - vr[0], wr[1] - vr[1], np.degrees(wr[2] - vr[2])))
@@ -267,7 +277,7 @@ def main():
                 last_draw = now
                 wr, vr = node.wheel_rel(), node.vio_rel()
                 sys.stdout.write("\r前进/左偏/转角   轮 %s | VIO %s | %.2f V | 指令 %+.2f %+.2f  "
-                                 % (brief(wr), brief(vr), node.batt or 0, v, w))
+                                 % (brief(wr), brief(vr, wr), node.batt or 0, v, w))
                 sys.stdout.flush()
     except KeyboardInterrupt:
         pass
