@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 """直线前进/后退，比较 VIO 和轮式里程计各自算出的每米曲率。走 ROS 话题，不碰串口。
 
-  python3 diffcar_straight_curvature.py [单程米] [趟数] [m/s]
+  python3 diffcar_straight_curvature.py [--cycles 1] [--max-leg 1.5] [--speed 0.20]
 
-一个测试同时回答两个问题（kappa = 每米航向变化，带符号，除以带符号的行程）：
+一个测试同时回答三个问题（kappa = 每米航向变化，带符号，除以带符号的行程）：
 
   前进的 kappa 和后退的 kappa 同号  -> 左右轮有效半径不一样(反向时 dtheta 和 dx 一起变号)
   前进的 kappa 和后退的 kappa 变号  -> 外部侧向力(路面横坡 / 脚轮拖拽)
-
   VIO 的 kappa 和 里程计的 kappa 反号 -> 确认是半径差：闭环抹平编码器速度，半径小的那侧
                                         计数反而多，固件用同一个周长换算就把符号搞反了
 
-kappa 用回归拿，不用首尾相减：后退时后脚轮变成前置脚轮会甩一下，头 0.15 m 必须扔掉，
-而回归还能顺带给出 R2 —— 半径差是匀速累积(R2 高)，甩头是瞬态(R2 低)。
+🔑 **一对"前进+后退"做完之后离原点的残差，就是脚轮换向那一甩的量。** 纯半径差给出的是一条
+固定曲率的圆弧，前进走一段、后退走同一段是同一条弧，会原路退回、不累积；能累积的只有脚轮
+换向的滞回。所以残差既是安全阀(超过 MAX_RESID 就停，免得逐趟偏出过道)，也是一个独立测量。
+
+单程宁长勿多：信号按行程线性增长(约 0.43 度/米)，而每次换向都要付一次脚轮的甩头。
+1 趟 1.3 m 的信噪比比 3 趟 0.6 m 好，而且只换向一次。要更多样本就让人把车摆回去再跑一次。
+
+kappa 用回归拿不用首尾相减，头 SKIP_M 米扔掉(脚轮要甩、闭环要起步)，而且**被扔掉的那一段
+单独报出来** —— 那就是甩头的瞬态本身。回归顺带给出 R2:半径差是匀速累积(R2 高)，甩头是瞬态(R2 低)。
 """
-import sys
+import argparse
 import time
 
 import numpy as np
@@ -27,9 +33,11 @@ from std_msgs.msg import Float32
 
 FX = 309.49
 CX, CY = 272.22, 318.80
-SKIP_M = 0.15          # 每趟头这么多米不参与回归：脚轮要甩、闭环要起步
+SKIP_M = 0.15          # 每趟头这么多米不参与回归，但会单独报出来
 BRAKE_M = 0.40         # 深度刹车线（车体前缘在相机前 0.05 m）
 HALF_W = 0.20
+MAX_RESID = 0.12       # 一对往返后离原点超过这个就停：再跑下去会偏出过道
+V_ABORT = 9.9
 
 
 def qmul(a, b):
@@ -48,30 +56,37 @@ def rotvec_z(q0, q1):
     return 0.0 if n < 1e-12 else float(v[2] / n * 2.0 * np.arctan2(n, rel[3]))
 
 
+def wrap(a):
+    while a > np.pi:
+        a -= 2 * np.pi
+    while a < -np.pi:
+        a += 2 * np.pi
+    return a
+
+
 class Drive(Node):
     def __init__(self):
         super().__init__("straight_curvature")
         self.cmd = self.create_publisher(Twist, "/cmd_vel", 10)
-        self.odom_q = self.vio_q = None
-        self.pos = None
+        self.odom = None            # (x, y, theta)
+        self.vio = None             # (xyz, quat)
         self.batt = None
         self.clear = None
         self._plane = None
         self._uu = self._vv = None
-        self.create_subscription(Odometry, "/wheel/odometry", self._odom, 10)
-        self.create_subscription(PoseStamped, "/camera/camera/vio_100hz", self._vio, 20)
+        self.create_subscription(Odometry, "/wheel/odometry", self._on_odom, 10)
+        self.create_subscription(PoseStamped, "/camera/camera/vio_100hz", self._on_vio, 20)
         self.create_subscription(Float32, "/battery_voltage",
-                                 lambda m: setattr(self, "batt", m.data), 5)
+                                 lambda m: setattr(self, "batt", float(m.data)), 5)
         self.create_subscription(Image, "/camera/camera/depth/image_rect_raw", self._depth, 1)
 
-    def _odom(self, m):
-        o = m.pose.pose.orientation
-        self.odom_q = (o.x, o.y, o.z, o.w)
-        self.pos = np.array([m.pose.pose.position.x, m.pose.pose.position.y])
+    def _on_odom(self, m):
+        p, o = m.pose.pose.position, m.pose.pose.orientation
+        self.odom = (p.x, p.y, 2.0 * np.arctan2(o.z, o.w))
 
-    def _vio(self, m):
-        o = m.pose.orientation
-        self.vio_q = (o.x, o.y, o.z, o.w)
+    def _on_vio(self, m):
+        p, o = m.pose.position, m.pose.orientation
+        self.vio = (np.array([p.x, p.y, p.z]), (o.x, o.y, o.z, o.w))
 
     def _fit_floor(self, X, Y, Z):
         sel = np.isfinite(Z) & (self._vv > 420) & (self._vv < 580) & (np.abs(self._uu - CX) < 120)
@@ -112,40 +127,38 @@ class Drive(Node):
         self.clear = float(np.percentile(Z[ob], 1)) if ob.sum() > 40 else 99.0
 
 
-def odom_yaw(q):
-    return 2.0 * np.arctan2(q[2], q[3])
-
-
 def leg(node, v, dist):
-    """跑一趟，返回 (里程计 kappa, VIO kappa, 实际行程, 里程计R2, VIO R2, 刹车原因)."""
+    """跑一趟。返回 dict:两侧 kappa/R2、实际行程、被扔掉那段的甩头瞬态、刹车原因。"""
     for _ in range(20):
         rclpy.spin_once(node, timeout_sec=0.02)
-    q_v0 = node.vio_q
-    y0 = odom_yaw(node.odom_q)
-    p_prev = node.pos.copy()
+    x0, y0, t0 = node.odom
+    q_v0 = node.vio[1]
+    p_prev = np.array([x0, y0])
     s = 0.0
-    rec = []
+    rec = []                    # (行程, 轮侧横偏, 轮侧转角, VIO转角)
     brake = None
-    t0 = last_cmd = time.time()
+    tstart = last_cmd = time.time()
     while True:
         rclpy.spin_once(node, timeout_sec=0.004)
         now = time.time()
-        if node.pos is not None:
-            s += float(np.linalg.norm(node.pos - p_prev))
-            p_prev = node.pos.copy()
-        dy = odom_yaw(node.odom_q) - y0
-        while dy > np.pi:
-            dy -= 2 * np.pi
-        while dy < -np.pi:
-            dy += 2 * np.pi
-        rec.append((s, dy, rotvec_z(q_v0, node.vio_q)))
+        p = np.array(node.odom[:2])
+        s += float(np.linalg.norm(p - p_prev))
+        p_prev = p
+        dx, dy = node.odom[0] - x0, node.odom[1] - y0
+        rec.append((s,
+                    -dx * np.sin(t0) + dy * np.cos(t0),
+                    wrap(node.odom[2] - t0),
+                    rotvec_z(q_v0, node.vio[1])))
         if s >= dist:
             break
         if v > 0 and node.clear is not None and node.clear < BRAKE_M:
             brake = "深度刹车，前方只剩 %.2f m" % node.clear
             break
-        if now - t0 > dist / abs(v) + 8.0:
+        if now - tstart > dist / abs(v) + 8.0:
             brake = "超时"
+            break
+        if node.batt and node.batt < V_ABORT:
+            brake = "电压 %.2f V" % node.batt
             break
         if now - last_cmd > 0.05:
             m = Twist()
@@ -158,91 +171,109 @@ def leg(node, v, dist):
         node.cmd.publish(m)
         rclpy.spin_once(node, timeout_sec=0.01)
 
+    sgn = 1.0 if v > 0 else -1.0
     use = [r for r in rec if r[0] > SKIP_M]
     if len(use) < 20:
         return None
     x = np.array([r[0] for r in use])
-    sgn = 1.0 if v > 0 else -1.0
 
-    def fit(y):
+    def fit(col):
+        y = np.array([r[col] for r in use])
         a, b = np.polyfit(x, y, 1)
         pred = a * x + b
         ss = 1 - ((y - pred) ** 2).sum() / max(1e-12, ((y - y.mean()) ** 2).sum())
-        return a * sgn, ss          # 除以带符号行程 -> kappa 带符号
-    ko, r2o = fit(np.array([r[1] for r in use]))
-    kv, r2v = fit(np.array([r[2] for r in use]))
-    return ko, kv, s * sgn, r2o, r2v, brake
+        return a * sgn, ss
+
+    ko, r2o = fit(2)
+    kv, r2v = fit(3)
+    # 被扔掉那一段就是换向后的甩头瞬态，单独报
+    head = [r for r in rec if r[0] <= SKIP_M]
+    trans = (head[-1][1], head[-1][2], head[-1][3]) if head else (0.0, 0.0, 0.0)
+    return dict(ko=ko, kv=kv, s=s * sgn, r2o=r2o, r2v=r2v, brake=brake, trans=trans)
 
 
 def main():
-    dist = float(sys.argv[1]) if len(sys.argv) > 1 else 0.60
-    cycles = int(sys.argv[2]) if len(sys.argv) > 2 else 3
-    v = float(sys.argv[3]) if len(sys.argv) > 3 else 0.20
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--cycles", type=int, default=1, help="往返几对。默认 1：宁长勿多")
+    ap.add_argument("--max-leg", type=float, default=1.5)
+    ap.add_argument("--speed", type=float, default=0.20)
+    args = ap.parse_args()
+
     rclpy.init()
     node = Drive()
     t0 = time.time()
     while time.time() - t0 < 15:
         rclpy.spin_once(node, timeout_sec=0.1)
-        if node.odom_q is not None and node.vio_q and node.pos is not None and node.clear is not None:
+        if node.odom and node.vio is not None and node.clear is not None and node.batt:
             break
-    if node.clear is None or node.odom_q is None:
-        sys.exit("数据不全")
-    room = node.clear - BRAKE_M
-    if room < dist:
-        print("前方余量 %.2f m，刹车线 %.2f -> 单程压到 %.2f m" % (node.clear, BRAKE_M, max(0.30, room)))
-        dist = max(0.30, room)
-    if dist < 0.30:
-        sys.exit("前方只有 %.2f m，摆不开" % node.clear)
-    print("电池 %.2f V，单程 %.2f m，%d 趟往返，%.2f m/s\n" % (node.batt or 0, dist, cycles, v))
+    if node.odom is None or node.vio is None or node.clear is None:
+        raise SystemExit("数据不全：/wheel/odometry(app 起了吗) /vio_100hz /depth")
+
+    dist = min(args.max_leg, node.clear - BRAKE_M)
+    if dist < 0.35:
+        raise SystemExit("前方只有 %.2f m，摆不开(刹车线 %.2f)" % (node.clear, BRAKE_M))
+    print("电池 %.2f V，前方余量 %.2f m -> 单程 %.2f m，%d 对往返，%.2f m/s"
+          % (node.batt, node.clear, dist, args.cycles, args.speed))
+    print("预计信号 约 %.2f 度/趟（按 0.43 度/米）\n" % (0.43 * dist))
+    origin = node.vio[0].copy()
 
     rows = []
-    print("  趟次         里程计 kappa      VIO kappa       行程      里程计R2  VIO R2")
-    for i in range(cycles):
+    for i in range(args.cycles):
         for sgn, tag in ((+1, "前进"), (-1, "后退")):
-            r = leg(node, sgn * v, dist)
+            r = leg(node, sgn * args.speed, dist)
             if r is None:
-                print("  %d %s: 样本不足" % (i + 1, tag))
+                print("  第%d对 %s: 样本不足" % (i + 1, tag))
                 continue
-            ko, kv, s, r2o, r2v, brake = r
-            rows.append((sgn, ko, kv, s))
-            print("  %d %s   %+8.4f 度/m   %+8.4f 度/m   %+6.3f m    %.3f    %.3f%s"
-                  % (i + 1, tag, np.degrees(ko), np.degrees(kv), s, r2o, r2v,
-                     "   !! " + brake if brake else ""))
-            if node.batt and node.batt < 9.9:
-                print("  电压 %.2f V，停止" % node.batt)
-                node.destroy_node(); rclpy.shutdown(); return
+            rows.append((sgn, r))
+            print("  第%d对 %s  里程计 kappa %+8.4f 度/m (R2 %.3f)   VIO kappa %+8.4f 度/m (R2 %.3f)"
+                  % (i + 1, tag, np.degrees(r["ko"]), r["r2o"], np.degrees(r["kv"]), r["r2v"]))
+            print("           行程 %+6.3f m   起步 %.2f m 内的甩头: 横偏 %+.4f m 转角 %+.2f 度%s"
+                  % (r["s"], SKIP_M, r["trans"][0], np.degrees(r["trans"][1]),
+                     "   !! " + r["brake"] if r["brake"] else ""))
+        d = node.vio[0] - origin
+        resid = float(np.hypot(d[0], d[1]))
+        print("  -> 这一对做完，离原点 %.4f m（纯半径差应当原路退回，所以这就是脚轮滞回的量）"
+              % resid)
+        if resid > MAX_RESID:
+            print("  !! 残差超过 %.2f m，停止 —— 再跑下去会偏出过道" % MAX_RESID)
+            break
 
-    print("\n" + "=" * 66)
+    print("\n" + "=" * 68)
     print("判读")
-    print("=" * 66)
-    for sgn, tag in ((+1, "前进"), (-1, "后退")):
-        g = [r for r in rows if r[0] == sgn]
-        if not g:
-            continue
-        print("  %s (n=%d): 里程计 kappa = %+.4f +- %.4f 度/m   VIO kappa = %+.4f +- %.4f 度/m"
-              % (tag, len(g),
-                 np.degrees(np.mean([r[1] for r in g])), np.degrees(np.std([r[1] for r in g])),
-                 np.degrees(np.mean([r[2] for r in g])), np.degrees(np.std([r[2] for r in g]))))
-    kf = [r for r in rows if r[0] > 0]
-    kb = [r for r in rows if r[0] < 0]
+    print("=" * 68)
+    kf = [r for sgn, r in rows if sgn > 0]
+    kb = [r for sgn, r in rows if sgn < 0]
+    for tag, g in (("前进", kf), ("后退", kb)):
+        if g:
+            print("  %s (n=%d): 里程计 kappa %+.4f 度/m   VIO kappa %+.4f 度/m"
+                  % (tag, len(g), np.degrees(np.mean([r["ko"] for r in g])),
+                     np.degrees(np.mean([r["kv"] for r in g]))))
     if kf and kb:
-        mf, mb = np.mean([r[2] for r in kf]), np.mean([r[2] for r in kb])
-        print("\n  1) 前进/后退的 VIO kappa: %+.4f vs %+.4f 度/m -> %s"
+        mf = np.mean([r["kv"] for r in kf])
+        mb = np.mean([r["kv"] for r in kb])
+        print("\n  1) VIO 的 kappa 前进 %+.4f vs 后退 %+.4f 度/m -> %s"
               % (np.degrees(mf), np.degrees(mb),
-                 "同号，左右轮有效半径不一样" if mf * mb > 0 else "变号，是外部侧向力(横坡/脚轮拖拽)"))
-    allo, allv = np.mean([r[1] for r in rows]), np.mean([r[2] for r in rows])
-    print("  2) 里程计 kappa %+.4f  vs  VIO kappa %+.4f 度/m -> %s"
-          % (np.degrees(allo), np.degrees(allv),
-             "反号，确认是半径差(里程计把航向符号搞反了)" if allo * allv < 0 else "同号，里程计航向符号是对的"))
-    if allo * allv < 0 and abs(allv) > 1e-5:
-        # 真实曲率 kv 需要左右地面速度差 kv*L；里程计报了 ko，两者之差就是周长比失配
-        base = 0.3234
-        mism = float((abs(allv) + abs(allo)) * base)      # 每米的地面行程差
-        print("\n  左右轮有效周长失配 = %.3f%%  (70mm 轮上直径差 %.2f mm)"
-              % (100 * mism, 1000 * mism * 70.0))
-        side = "左" if allv > 0 else "右"
-        print("  %s轮偏小。修法(不用重烧固件): 把%s轮 ppr 调大 %.3f%%，再敲 w 存起来"
-              % (side, side, 100 * mism))
+                 "同号，左右轮有效半径不一样" if mf * mb > 0
+                 else "变号，是外部侧向力(横坡/脚轮拖拽)"))
+    allr = [r for _, r in rows]
+    if allr:
+        allo = float(np.mean([r["ko"] for r in allr]))
+        allv = float(np.mean([r["kv"] for r in allr]))
+        print("  2) 里程计 kappa %+.4f  vs  VIO kappa %+.4f 度/m -> %s"
+              % (np.degrees(allo), np.degrees(allv),
+                 "反号，确认是半径差(里程计把航向符号搞反了)" if allo * allv < 0
+                 else "同号，里程计航向符号是对的"))
+        if allo * allv < 0 and abs(allv) > 1e-5:
+            base = 0.3234
+            mism = float((abs(allv) + abs(allo)) * base)
+            side = "左" if allv > 0 else "右"
+            print("\n  左右轮有效周长失配 %.3f%%（70mm 轮上直径差 %.2f mm），%s轮偏小"
+                  % (100 * mism, 1000 * mism * 70.0, side))
+            print("  修法(不用重烧固件): 把%s轮 ppr 调大 %.3f%%，再敲 w 存起来"
+                  % (side, 100 * mism))
+        tr = [abs(r["trans"][0]) for r in allr]
+        print("  3) 每趟起步 %.2f m 内的甩头横偏 中位 %.4f m 最大 %.4f m -> 每次换向的代价"
+              % (SKIP_M, float(np.median(tr)), max(tr)))
     node.destroy_node()
     rclpy.shutdown()
 
