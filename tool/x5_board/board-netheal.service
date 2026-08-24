@@ -1,0 +1,14 @@
+[Unit]
+Description=Heal the WiFi link when the gateway stops answering
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -u /usr/local/sbin/board_netheal.py
+Restart=always
+RestartSec=10
+# 想让它在整条梯度都无效时自动重启，就把下面这行的注释去掉
+#Environment=NETHEAL_ALLOW_REBOOT=1
+
+[Install]
+WantedBy=multi-user.target
