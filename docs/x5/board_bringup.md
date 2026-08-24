@@ -1074,8 +1074,9 @@ active 的单元拽回来,不停掉的话 `NEXT` 依旧是 `n/a`(我第一次就
 | 链路与热 | `board-health.service`(`tool/x5_board/board_health.py`),每 10 s 一行进 journal | RSSI / 误报警 / IGI / rx_rate / link / 温度 / 负载 / 可用内存 / 到 PC 的 RTT |
 | 电压 | `diffcar_control` 每 2 s 发 `e`,发布 `/battery`,并在最低值 < 10.0 V 时告警 | 电池带载塌压 —— 只有 ESP32 知道,而串口只有它持有 |
 
-**健康行写 stdout 交给 journald**,不写自己的文件:这样它和内核/驱动消息**按时间穿插在一起**,
-排查时不用对两份时间戳,轮转也由 journald 的 64MB 上限负责。
+**健康行写 stdout 交给 journald**,这样它和内核/驱动消息**按时间穿插在一起**,排查时不用对
+两份时间戳。⚠️ 但「不写自己的文件」这个决定 2026-08-24 被推翻了 —— journal 在 rootfs 上,
+硬断电后一行都没剩。现在是双写,见下面那一节。
 
 **下次掉线的判据速查:**
 
@@ -1089,6 +1090,86 @@ active 的单元拽回来,不停掉的话 `NEXT` 依旧是 `n/a`(我第一次就
 
 🔑 **它上线一分钟内就抓到一件事**:空载电压已经 9.79–9.92 V,而固件闭锁线是 9.60 V,
 只剩 0.2 V 余量(当天下午还是 10.6–10.9 V)。**这种状态下做任何带载标定都会拟合出垃圾。**
+
+### 2026-08-24 掉线定案:带载塌压把 USB 网卡打掉了
+
+这三层第一次真的派上用场,而且暴露了它们自己的一个漏洞。
+
+**时间线**(取自 `/userdata/x5/logs/nodes/*_diffcar_control.txt`):
+
+```
+09:55:25  PC reachable again
+10:26:12  battery sagged to 9.97 V (now 9.85)   <- 正在跑 360° 闭合标定
+10:26:14  battery sagged to 9.86 V (now 9.92)
+10:26:16  battery sagged to 9.96 V (now 9.96)
+10:26:18  battery sagged to 9.95 V (now 10.14)
+10:26:27  PC unreachable -- LED goes cyan       <- 9 秒后 WiFi 断
+10:34:35  battery sagged to 9.99 V (now 10.12)  <- 网断了但节点还在写日志
+10:35:01  battery back to 10.67 V
+10:36:17  人工断电重上
+```
+
+🔑 **WiFi、ESP32、Looper、电机全部由同一个电池供电**(已确认)。电机电流把这条共用轨拉到
+9.85 V,9 秒后 USB 网卡(`0bda:b711`, RTL8710BU)就掉了。固件的低压闭锁线是 9.60,只差 0.25 V。
+
+⚠️ **9.85 V 是固件内部跟踪的最小值,不是 `/battery_voltage` 话题上的数** —— 那个话题 0.5 Hz,
+当时报的最低只有 10.30。固件采样快得多,抓到了话题漏掉的瞬时凹坑。**光看 web 上的电压不够。**
+
+**青灯一个人就把故障定位了。**触发条件是 `!g_pcOk && (now - g_pcStamp < 8000ms)`,也就是
+ESP32 在最近 8 秒内收到过 Looper 发来的 `K 0`;而**橙灯(UART1 静默 5 s)优先级压过青灯**,
+当时没亮橙。两条合起来:
+
+| 环节 | 状态 | 依据 |
+|---|---|---|
+| X5 板子 | 活着 | 不然发不出 `K 0` |
+| ROS app / `diffcar_control` | 活着 | 它就是发 `K 0` 的进程,且必须在 8 s 内发过 |
+| 串口 `/dev/ttyS3` | 通 | 不然会亮橙,橙压青 |
+| **WiFi 到 PC** | **断** | `diffcar_control` 自己的 ICMP 探测连丢 3 次 |
+
+边缘欠压能打死一个 USB 外设而不重启主控,这很典型;而掉电的 USB 设备**不重新枚举就一直是
+死的**,所以它没自己恢复。`/sys/fs/pstore` 是空的,排除 panic。
+
+### 🔴 journal 没活过断电 —— 「装了没生效」的第三次
+
+`board_health` 的健康行写的是 stdout → journald → `/var/log/journal`,而重启后:
+
+```
+journalctl --list-boots           ->  只有当前这一次开机
+/var/log/journal/<id>/            ->  只有一个本次开机创建的 system.journal，没有归档文件
+journalctl -u board-health | wc -l ->  5 行，全是重启之后的
+```
+
+**唯一能分开「网卡掉电」和「射频问题」的那份 rssi/link 时间序列,正好是丢掉的那一份。**
+上面那条时间线是从 `/userdata` 上的**节点日志**拿的 —— 那个分区连 8 月 21 号的日志都还在。
+
+rootfs 本身是持久的(8 月 21 号装的脚本全在,`/var/backups` 的 mtime 还是 8 月 18),所以不是
+整个 `/var` 易失。最可能是 journald 对持久存储的 `SyncIntervalSec` **默认 5 分钟**、而且用
+mmap 写 —— 硬断电时脏页还没回写就全丢。**已在 `/var/log/PERSIST_TEST` 留了标记文件**,
+下次重启一看便知:还在 = `/var/log` 持久、问题在 journald 的同步策略;没了 = `/var/log` 本身易失。
+
+🔑 **教训:凡是要活过断电的东西,一律写 `/userdata`,别信 rootfs。**
+
+**已修**(`board_health.py`):
+
+- 双写 —— 除 stdout 外再追加 `/userdata/x5/logs/board_health.log`,8 MB 单代轮转
+- 新增两个字段,专门用来分开这次分不出的那两种故障:
+
+```
+2026-08-24 10:43:58 up=461 load=1.97 memavail=1391M temp=82.0/81.9
+                    rssi=-55 qual=86 link=1 igi=0x1c fa=512 rx_rate=MCS7
+                    carrier=1 usb=1 pc=153
+```
+
+| 下次掉线看到 | 结论 |
+|---|---|
+| **`usb=0`** | 网卡从 USB 总线上掉了 → **供电塌陷** |
+| `usb=1` 但 `carrier=0` | 网卡在、链路断 → 空口或 AP 那头 |
+| `usb=1 carrier=1` 但 `pc=MISS` 连续多行 | 上游网络,板子和网卡都好 |
+| `rssi` 先塌下去 | 射频(这块网卡余量本来就薄:−6 dB、速率掉到 MCS4) |
+
+**预防**:①电池是首要变量,静置 11 V 的 3S 电池只剩三分之一,带载塌 1 V 以上说明内阻已经不小;
+②`max_yaw` 从 0.8 降到 0.6 —— 0.8 rad/s 原地转是这台车电流最大的动作,正是它把电池拉塌的,
+而且 VIO 在那一档本来就已经在跳变(见 `diffcar.md`)。
 
 ### ⚠️ 两个读数曾经在骗人,已修
 
