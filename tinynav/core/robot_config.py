@@ -152,7 +152,11 @@ class RobotConfig:
             f"safety_r={self.safety_radius}m, "
             f"hard/soft={self.hard_clearance:.2f}/{self.soft_clearance:.2f}m, "
             f"z_band=[{self.obstacle_z_bottom:+.2f},{self.obstacle_z_top:+.2f}], "
-            f"dilation={self.dilation_cells}, reverse={self.allow_reverse})"
+            f"dilation={self.dilation_cells}, "
+            # 速度以前不在这一行里，所以日志看不出一次 run 是按什么上限跑的 —— 而这是最常调的参数。
+            f"vx<={self.max_vx}/rev{self.max_reverse_vx} yaw<={self.max_yaw} "
+            f"(clamp {self.actuator_max_vx}/{self.actuator_max_yaw}), "
+            f"reverse={self.allow_reverse})"
         )
 
 
