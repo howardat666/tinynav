@@ -316,6 +316,8 @@ def _actuator_geometry() -> dict | None:
                 round(_ROBOT.camera_x - _ROBOT.control_x, 4), _ROBOT.camera_y, 0.18],
             'maxVx': _ROBOT.max_vx,
             'maxYaw': _ROBOT.max_yaw,
+            'teleopMaxVx': _ROBOT.actuator_max_vx,
+            'teleopMaxYaw': _ROBOT.actuator_max_yaw,
         }
     return None
 
@@ -334,8 +336,11 @@ def _diffcar_control_argv() -> list[str]:
         # the trinocular's infra1 -- the image the whole stack runs on -- sits 50 mm
         # left of the middle lens, and a flipped sign puts every obstacle 100 mm off.
         '-p', f'camera_offset_xyz:=[{cam_x},{_ROBOT.camera_y},0.18]',
-        '-p', f'max_vx:={_ROBOT.max_vx}',
-        '-p', f'max_yaw:={_ROBOT.max_yaw}',
+        # The actuator's clamp, not the planner's limit -- see RobotConfig.chassis_max_vx.
+        # Passing max_vx here made hand-driving inherit the replan-period margin that only
+        # navigation needs.
+        '-p', f'max_vx:={_ROBOT.actuator_max_vx}',
+        '-p', f'max_yaw:={_ROBOT.actuator_max_yaw}',
         '-p', 'cmd_vel_topic:=/cmd_vel',
     ]
 

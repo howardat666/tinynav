@@ -53,6 +53,21 @@ class RobotConfig:
     max_vx: float = 0.5
     max_reverse_vx: float = 0.2
     max_yaw: float = 0.8
+    # The actuator's own clamp, which is a different question from what the planner may
+    # plan: max_vx is limited by the replan period (see DIFFCAR_CONFIG), while a human on
+    # a joystick or the keyboard is the reaction budget and needs no such margin. None
+    # means "same as max_vx", so a platform that has not thought about it cannot get a
+    # higher limit by accident.
+    chassis_max_vx: float | None = None
+    chassis_max_yaw: float | None = None
+
+    @property
+    def actuator_max_vx(self) -> float:
+        return self.max_vx if self.chassis_max_vx is None else self.chassis_max_vx
+
+    @property
+    def actuator_max_yaw(self) -> float:
+        return self.max_yaw if self.chassis_max_yaw is None else self.chassis_max_yaw
     # The occupancy grid is written only by forward raycasting, so a reverse move is
     # scored against cells the camera never looked at. Gated on front_blocked too.
     allow_reverse: bool = True
@@ -230,6 +245,10 @@ DIFFCAR_CONFIG = RobotConfig(
     # against 0.044 on the old 110 mm one -- the wider base costs wheel speed for the
     # same yaw, so this is no longer nearly free.
     max_yaw=0.8,
+    # 手动开车（摇杆/键盘）的上限。导航的 0.3 是被重规划周期限住的，手上开车没有那个约束，
+    # 固件本身收 0.8 m/s。
+    chassis_max_vx=0.6,
+    chassis_max_yaw=0.8,
     allow_reverse=True,
     # Default 0.3, not the 0.2 the 240x120 mm car shipped with -- that value was chosen
     # because a 110 mm track "turns in place freely", and it does not any more. Measured

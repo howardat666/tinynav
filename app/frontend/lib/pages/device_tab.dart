@@ -26,6 +26,11 @@ class DeviceTab extends ConsumerWidget {
       child: ListView(
         padding: const EdgeInsets.all(16),
         children: [
+          // ── Run logs ───────────────────────────────────────────────────
+          // 放最上面：每次 run 开始和结束都要点它，而 System 那张卡片很长，
+          // 摆在它下面每次都要滚到底。
+          const _LogsCard(),
+          const SizedBox(height: 12),
           // ── Connection ─────────────────────────────────────────────────
           _SectionCard(
             icon: Icons.wifi_rounded,
@@ -97,9 +102,6 @@ class DeviceTab extends ConsumerWidget {
               ),
             ],
           ),
-          const SizedBox(height: 12),
-          // ── Run logs ─────────────────────────────────────
-          const _LogsCard(),
         ],
       ),
     );

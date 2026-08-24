@@ -89,13 +89,20 @@ class _OperateTabState extends ConsumerState<OperateTab> {
     } catch (_) {}
   }
 
+  // x used to drive linear_y, which is a LeKiwi leftover: that chassis was three-wheel
+  // omni and could strafe. diffcar_control reads only linear.x and angular.z, so on the
+  // diff car the sideways half was silently dropped -- dragging this stick to 45 degrees
+  // gave pure forward, never an arc. One stick is throttle and steering now, which is
+  // also the only way to get an arc from a single mouse pointer.
   void _onLeftJoystick(double x, double y) {
     _linearX = -y * _maxLinear;
-    _linearY = -x * _maxLinear;
+    _angularZ = -x * _maxAngular;
     _sendVelocity(force: x == 0 && y == 0);
   }
 
+  // Kept as a pure in-place turn: same axis, no forward component, for lining up.
   void _onRightJoystick(double x, double y) {
+    _linearX = 0;
     _angularZ = -x * _maxAngular;
     _sendVelocity(force: x == 0 && y == 0);
   }
@@ -1827,7 +1834,7 @@ class _JoystickPanel extends ConsumerWidget {
           Expanded(
             child: Column(
               children: [
-                const Text('Move', style: TextStyle(fontSize: 10, color: Colors.grey, fontWeight: FontWeight.w600)),
+                const Text('Drive', style: TextStyle(fontSize: 10, color: Colors.grey, fontWeight: FontWeight.w600)),
                 const SizedBox(height: 4),
                 Expanded(child: _JoystickPad(onChange: onLeft)),
               ],
@@ -1858,7 +1865,7 @@ class _JoystickPanel extends ConsumerWidget {
           Expanded(
             child: Column(
               children: [
-                const Text('Rotate', style: TextStyle(fontSize: 10, color: Colors.grey, fontWeight: FontWeight.w600)),
+                const Text('Turn in place', style: TextStyle(fontSize: 10, color: Colors.grey, fontWeight: FontWeight.w600)),
                 const SizedBox(height: 4),
                 Expanded(child: _JoystickPad(onChange: onRight, axisOnly: Axis.horizontal)),
               ],

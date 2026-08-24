@@ -218,6 +218,14 @@ do_stop() {
         rm -f "${PIDFILE}"
         return 0
     fi
+    # 建图是 app 的子进程，停 app 就把它杀了 —— 一次 13 分钟的建图在 9 分钟处被
+    # `systemctl restart board-app` 静默毁掉（2026-08-24，我干的）。bag 还在，但半成品地图
+    # 得手动清。FORCE=1 明确表示"我知道会毁掉建图"。
+    if pgrep -f '[b]uild_map_node' >/dev/null 2>&1 && [[ "${FORCE:-0}" != "1" ]]; then
+        echo "refusing to stop: a map build is running -- stopping the app kills it" >&2
+        echo "  wait for it, or: FORCE=1 bash $0 stop" >&2
+        exit 1
+    fi
     # Negative pid = the process group setsid created, so the ROS children die too.
     kill -TERM "-${pid}" 2>/dev/null || kill -TERM "${pid}" 2>/dev/null
     for _ in $(seq 20); do
