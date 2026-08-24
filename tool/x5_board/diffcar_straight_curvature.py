@@ -195,6 +195,9 @@ def leg(node, v, dist):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cycles", type=int, default=1, help="往返几对。默认 1：宁长勿多")
+    ap.add_argument("--one-way", action="store_true",
+                    help="只往前开一趟，不换向。反正'里程计和 VIO 反号'这一条本身就能分开"
+                         "半径差和外部侧向力，而换向会把脚轮滞回混进来")
     ap.add_argument("--max-leg", type=float, default=1.5)
     ap.add_argument("--speed", type=float, default=0.20)
     args = ap.parse_args()
@@ -218,8 +221,9 @@ def main():
     origin = node.vio[0].copy()
 
     rows = []
+    legs = ((+1, "前进"),) if args.one_way else ((+1, "前进"), (-1, "后退"))
     for i in range(args.cycles):
-        for sgn, tag in ((+1, "前进"), (-1, "后退")):
+        for sgn, tag in legs:
             r = leg(node, sgn * args.speed, dist)
             if r is None:
                 print("  第%d对 %s: 样本不足" % (i + 1, tag))
@@ -230,10 +234,21 @@ def main():
             print("           行程 %+6.3f m   起步 %.2f m 内的甩头: 横偏 %+.4f m 转角 %+.2f 度%s"
                   % (r["s"], SKIP_M, r["trans"][0], np.degrees(r["trans"][1]),
                      "   !! " + r["brake"] if r["brake"] else ""))
+        if args.one_way:
+            r = rows[-1][1] if rows else None
+            if r:
+                # 恒定曲率下横偏 = kappa * d^2 / 2。给个预测值好让人用卷尺核对 ——
+                # 卷尺是唯一不受 VIO 那 7% 平移偏置影响的参照。
+                for tag2, k in (("里程计", r["ko"]), ("VIO", r["kv"])):
+                    print("  -> %s 预测横偏 %+.1f cm（量 起点 -> 车体左后角，左为正）"
+                          % (tag2, 100 * k * r["s"] ** 2 / 2))
+            continue
         d = node.vio[0] - origin
         resid = float(np.hypot(d[0], d[1]))
         print("  -> 这一对做完，离原点 %.4f m（纯半径差应当原路退回，所以这就是脚轮滞回的量）"
               % resid)
+        print("     ⚠️ 这是 VIO 量的。VIO 平移少报约 7%%，1.5 m 单程就是 10 cm 量级 ——"
+              "所以这个残差和 VIO 尺度误差分不开，要实数得用卷尺")
         if resid > MAX_RESID:
             print("  !! 残差超过 %.2f m，停止 —— 再跑下去会偏出过道" % MAX_RESID)
             break
@@ -267,8 +282,8 @@ def main():
             base = 0.3234
             mism = float((abs(allv) + abs(allo)) * base)
             side = "左" if allv > 0 else "右"
-            print("\n  左右轮有效周长失配 %.3f%%（70mm 轮上直径差 %.2f mm），%s轮偏小"
-                  % (100 * mism, 1000 * mism * 70.0, side))
+            print("\n  左右轮有效周长失配 %.3f%%（70mm 轮上直径差 %.3f mm），%s轮偏小"
+                  % (100 * mism, mism * 70.0, side))
             print("  修法(不用重烧固件): 把%s轮 ppr 调大 %.3f%%，再敲 w 存起来"
                   % (side, 100 * mism))
         tr = [abs(r["trans"][0]) for r in allr]
