@@ -17,11 +17,11 @@ import 'local_voxel_painter.dart';
 import 'map_painter.dart';
 import 'planning_painter.dart';
 
-// Matched to diffcar_control's own clamp (max_vx 0.3, max_yaw 0.8). They used to be
-// 0.5 and 1.0, so the outer 40% of the stick travel asked for speeds that were then
-// clipped -- the stick felt dead near the edge.
-const double _maxLinear = 0.3;   // m/s
-const double _maxAngular = 0.8;  // rad/s
+// Below diffcar_control's clamp (0.8 / 1.2), not equal to it: a deliberately gentler
+// stick is fine, dead travel is not. These used to be 0.5 and 1.0 against a 0.3 clamp,
+// so the outer 40% of the throw asked for speeds that were then clipped.
+const double _maxLinear = 0.6;   // m/s
+const double _maxAngular = 1.0;  // rad/s
 const Duration _teleopSendInterval = Duration(milliseconds: 100); // 10 Hz
 
 // ── Main widget ───────────────────────────────────────────────────────────────

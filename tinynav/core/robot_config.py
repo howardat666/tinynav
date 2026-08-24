@@ -235,20 +235,33 @@ DIFFCAR_CONFIG = RobotConfig(
     obstacle_z_bottom=-0.3,
     obstacle_z_top=0.2,
     dilation_cells=0,
-    # Reaction-budget limited, not chassis limited: the firmware takes 0.8 m/s, but the
-    # planner republishes at p50 1.17 s, so 0.5 m/s commits 0.58 m -- ~3x the
-    # front_blocked gate -- before anything newly seen can change the plan. 0.3 puts one
-    # period at 0.35 m, about the gate. Raise it once the loop is measured on the floor.
-    max_vx=0.3,
+    # 0.6, and the reaction-budget argument that held it at 0.3 was mostly wrong: the
+    # library samples 7 speeds from 0 to vx_max and collision-checks each over its whole
+    # 3 s extent, so raising the ceiling adds fast options rather than forcing speed --
+    # near an obstacle the fast ones are refused and a slower or turning one wins. The
+    # 3 s check also looks 1.8 m ahead at 0.6, far past the 0.5 m front gate, so the gate
+    # is the turn-only mode switch and not the primary guard. What is still true, and
+    # narrower: an obstacle that only becomes visible after the car commits gets 0.70 m
+    # of reaction distance instead of 0.35, and cmd_vel_control has no brake of its own --
+    # a planning stall stops the car only when the trajectory expires.
+    max_vx=0.6,
     max_reverse_vx=0.2,
-    # An in-place turn at this rate needs 0.128 m/s at each wheel on the 320 mm track,
-    # against 0.044 on the old 110 mm one -- the wider base costs wheel speed for the
-    # same yaw, so this is no longer nearly free.
-    max_yaw=0.8,
+    # 1.05, matching the pi/3 the trajectory library samples: at 0.8 every turn the
+    # planner scored was clipped 31% on its way to the wheels. Wheel speed is not the
+    # limit either way (1.05 rad/s is 0.168 m/s per wheel on the 320 mm track, against
+    # the 0.8 m/s the motors deliver). The real limit is that fast rotation is how VIO
+    # loses tracking, and insight_full does not recover from that on its own -- watch
+    # `ros2 topic info /camera/camera/vio_image` for Publisher count going to 0.
+    max_yaw=1.05,
     # 手动开车（摇杆/键盘）的上限。导航的 0.3 是被重规划周期限住的，手上开车没有那个约束，
     # 固件本身收 0.8 m/s。
-    chassis_max_vx=0.6,
-    chassis_max_yaw=0.8,
+    # 0.8 = 固件自己的上限，当硬兜底用。它不是"平时开这么快"，摇杆和键盘各自有更低的默认值；
+    # 这一条只保证限幅不会去截断上层真的想发的指令 —— 摇杆 0.5 被 clip 到 0.3 那种事。
+    chassis_max_vx=0.8,
+    # 1.2 而不是导航的 0.8：轮速不是瓶颈（0.8 rad/s 只要 0.128 m/s 每轮，电机跑 0.8），
+    # 卡住导航的是快速旋转会让 VIO 丢跟踪，而丢了之后 insight_full 自恢复失败、要重启固件。
+    # 手上开车看得见就停，所以这条约束不适用；导航仍留 0.8 直到量过旋转下的跟踪表现。
+    chassis_max_yaw=1.2,
     allow_reverse=True,
     # Default 0.3, not the 0.2 the 240x120 mm car shipped with -- that value was chosen
     # because a 110 mm track "turns in place freely", and it does not any more. Measured

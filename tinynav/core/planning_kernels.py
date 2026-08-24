@@ -96,14 +96,18 @@ def run_raycasting_loopy(depth_image, T_cam_to_world, grid_shape, fx, fy, cx, cy
 @njit(cache=True)
 def generate_trajectory_library_3d(
     num_samples=15, duration=3.0, dt=0.1,
-    init_p=np.zeros(3), init_q=np.array([0, 0, 0, 1]), vx_max=0.5
+    init_p=np.zeros(3), init_q=np.array([0, 0, 0, 1]), vx_max=0.5, omega_max=np.pi / 3
 ):
     """Regular sampled lattice (forward-only)."""
     num_steps = int(duration / dt) + 1
 
     n_vx = max(3, int(num_samples / 2))
     vx_samples = np.linspace(0.0, vx_max, n_vx)
-    omega_y_samples = np.linspace(-np.pi / 3, np.pi / 3, num_samples)
+    # omega_max used to be a hardcoded pi/3 = 1.047 while cmd_vel_control clipped wz to
+    # RobotConfig.max_yaw = 0.8, so every turn the planner scored was 31% faster than the
+    # one the wheels received -- the same "predictions run ahead of reality" this file's
+    # vx_max comment warns about. Derived now so the two cannot disagree again.
+    omega_y_samples = np.linspace(-omega_max, omega_max, num_samples)
 
     num_samples = len(vx_samples) * len(omega_y_samples)
 
