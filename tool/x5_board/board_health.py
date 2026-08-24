@@ -23,6 +23,11 @@ import time
 PERIOD_S = 10.0
 WIFI_DIR = "/proc/net/rtl8710bu"
 PC = os.environ.get("HEALTH_PING_HOST", "192.168.19.51")
+# 2026-08-24 掉线后 journal 里一行都没剩(rootfs 上的 journal 没活过硬断电)，
+# 所以再往 /userdata 落一份 —— 那个分区连断电都扛住了，节点日志就在上面。
+LOGFILE = "/userdata/x5/logs/board_health.log"
+MAXBYTES = 8 << 20
+USB_WIFI = "0bda:b711"      # RTL8710BU；掉电重枚举时这一行会消失
 
 
 def read(path, default=""):
@@ -69,6 +74,28 @@ def wifi():
             out.append("rx_rate=%s" % line.split("rx_rate :", 1)[1].split(",")[0].strip())
             break
     return " ".join(out) if out else "wifi=unreadable"
+
+
+def netstate():
+    """载波 + USB 网卡是否还在枚举里。这两个合起来能分开"网卡掉电"和"射频/AP 问题"：
+    usb=0 -> 网卡自己掉了(供电塌陷)；usb=1 但 carrier=0 -> 空口或 AP 那头。"""
+    out = []
+    for name in sorted(os.listdir("/sys/class/net")):
+        if name.startswith("wl"):
+            out.append("carrier=%s" % read("/sys/class/net/%s/carrier" % name, "?").strip())
+            break
+    seen = 0
+    try:
+        for d in os.listdir("/sys/bus/usb/devices"):
+            v = read("/sys/bus/usb/devices/%s/idVendor" % d).strip()
+            p = read("/sys/bus/usb/devices/%s/idProduct" % d).strip()
+            if v and "%s:%s" % (v, p) == USB_WIFI:
+                seen = 1
+                break
+    except OSError:
+        seen = -1
+    out.append("usb=%d" % seen)
+    return " ".join(out)
 
 
 def _cksum(data):
@@ -124,11 +151,24 @@ def sysline():
     return " ".join(out)
 
 
+def emit(line):
+    """落盘一份。超过 MAXBYTES 就轮转一次，不做多代 —— 掉线排查只看最近的。"""
+    try:
+        if os.path.exists(LOGFILE) and os.path.getsize(LOGFILE) > MAXBYTES:
+            os.replace(LOGFILE, LOGFILE + ".1")
+        with open(LOGFILE, "a") as f:
+            f.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), line))
+    except OSError:
+        pass
+
+
 def main():
     print("board_health 起动, 每 %.0fs 一行, ping %s" % (PERIOD_S, PC), flush=True)
     while True:
         try:
-            print("%s %s pc=%s" % (sysline(), wifi(), ping_ms(PC)), flush=True)
+            line = "%s %s %s pc=%s" % (sysline(), wifi(), netstate(), ping_ms(PC))
+            print(line, flush=True)
+            emit(line)
         except Exception as e:                                        # noqa: BLE001
             # 绝不因为一次读失败而退出 —— 这个服务的价值全在"连续"上
             print("health sample failed: %r" % (e,), flush=True)
