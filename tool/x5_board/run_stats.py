@@ -18,8 +18,20 @@ import sys
 import time
 from pathlib import Path
 
-NODES = ('diffcar_control', 'wheel_odometry_node', 'looper_bridge_node', 'planning_node',
-         'map_node', 'build_map_node', 'cmd_vel_control', 'uvicorn', 'insight_full')
+# (列名, 在 cmdline 里找的串). 必须带 .py 而不是裸名字：'map_node' 是 'build_map_node'
+# 的子串，裸匹配会把同一个建图进程同时算成两个节点 —— 实测两列报出完全相同的 105.9%/379MB。
+NODE_MATCH = (
+    ('diffcar_control', 'diffcar_control.py'),
+    ('wheel_odometry_node', 'wheel_odometry_node.py'),
+    ('looper_bridge_node', 'looper_bridge_node.py'),
+    ('planning_node', 'planning_node.py'),
+    ('map_node', '/map_node.py'),
+    ('build_map_node', 'build_map_node.py'),
+    ('cmd_vel_control', 'cmd_vel_control.py'),
+    ('uvicorn', '-m uvicorn'),
+    ('insight_full', 'insight_full'),
+)
+NODES = tuple(n for n, _ in NODE_MATCH)
 LOG_DIR = Path(os.environ.get('TINYNAV_APP_LOG_DIR', '/userdata/x5/logs'))
 TICK = os.sysconf('SC_CLK_TCK')
 BPU = ('/sys/devices/system/bpu/ratio', '/sys/devices/system/bpu/bpu0/ratio')
@@ -45,8 +57,8 @@ def _scan():
         # insight_full is not python; everything else must be, so this sampler's own
         # command line -- which contains every name in NODES -- cannot match itself.
         is_py = cmd.startswith('python3') or cmd.startswith('/usr/bin/python3')
-        for n in NODES:
-            if n in found or n not in cmd:
+        for n, needle in NODE_MATCH:
+            if n in found or needle not in cmd:
                 continue
             if (n == 'insight_full') == is_py:
                 continue
