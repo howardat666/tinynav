@@ -20,7 +20,9 @@ P=${1:-10}
 TICK=$(getconf CLK_TCK 2>/dev/null || echo 100)
 out="/userdata/x5/logs/run_stats_$(date +%Y%m%d_%H%M%S).tsv"
 state=/tmp/.run_stats_prev
-NODES="wheel_odometry_node looper_bridge_node planning_node map_node cmd_vel_control uvicorn insight_full"
+# diffcar_control 是差速车的执行器（旧平台是 wheel_odometry_node）。两个都留着:换平台时
+# 不改这里，那一列会一直是空的而不报错 —— 和 nav_health 里同一类坑。
+NODES="diffcar_control wheel_odometry_node looper_bridge_node planning_node map_node cmd_vel_control uvicorn insight_full"
 printf "time\ttemp_c\tload\tavail_mb" > "$out"
 for n in $NODES; do printf "\t%s_cpu\t%s_rss" "$n" "$n" >> "$out"; done
 printf "\tservo_fail_cum\n" >> "$out"

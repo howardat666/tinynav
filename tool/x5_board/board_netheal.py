@@ -23,8 +23,9 @@ import sys
 import time
 
 PERIOD_S = 15.0
-FAIL_N = 4                 # 连续失败这么多次才动手 = 60 s。实测 p95 RTT 839 ms、
-                           # 最大连丢 2 次，所以这个门限很保守
+FAIL_N = 6                 # 连续失败这么多次才动手 = 90 s。2026-08-24 见过一次 53 s 的掉线
+                           # 自己好了，而第2级的拆重建反而把"关联着但过不了流量"打成
+                           # "连都连不上"（association failed after 20s）—— 宁可多等
 TIMEOUT_S = 2.5
 GRACE_S = 90.0             # 开机宽限，别和 wifi-connect.sh 抢
 BACKOFF_S = 120.0          # 整条梯度都没救回来之后歇多久再重来
@@ -206,6 +207,13 @@ def main():
         time.sleep(PERIOD_S)
         gw = gateway() or gw
         dev = iface() or dev
+        # 拿不到网卡、或默认路由是 usb0 的链路本地地址，说明现在的状态本身不可信 ——
+        # 这时候动手只会拿 None 去拼命令、或者去 ping 一个和 WiFi 无关的目标。
+        if dev is None or gw is None or gw.startswith("169.254."):
+            if fails % 8 == 0:
+                emit("状态不可信，先等:iface=%s gw=%s（USB 重新枚举后会短暂如此）" % (dev, gw))
+            fails += 1
+            continue
         ok, why = (False, "forced") if FORCE_FAIL else probe(gw)
         if ok:
             if down_since is not None:
@@ -238,7 +246,9 @@ def main():
                 emit("整条梯度都没救回来，按配置重启 | %s" % snapshot(dev))
                 sh("sync; systemctl reboot", 30)
                 return
-            emit("整条梯度都没救回来，歇 %.0fs 再从头试(要自动重启就设 "
+            # 歇之前必须把网卡留在"通电并在尝试关联"的状态，不能留在 down。
+            sh("sh %s" % WIFI_UP, 120)
+            emit("整条梯度都没救回来，已重新拉起网卡，歇 %.0fs 再从头试(要自动重启就设 "
                  "NETHEAL_ALLOW_REBOOT=1) | %s" % (BACKOFF_S, snapshot(dev)))
             rung, backoff_until = 0, time.time() + BACKOFF_S
             continue
