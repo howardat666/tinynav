@@ -270,3 +270,17 @@ final poisProvider = FutureProvider.autoDispose<List<Poi>>((ref) async {
     rethrow;
   }
 });
+
+/// Run-log bundles from GET /logs/bundles.
+final logBundlesProvider = FutureProvider.autoDispose<List<FileEntry>>((ref) async {
+  final dio = ref.watch(dioProvider);
+  if (ref.watch(baseUrlProvider) == null) return [];
+  try {
+    final resp = await dio.get('/logs/bundles');
+    return (resp.data['files'] as List)
+        .map((j) => FileEntry.fromJson(j as Map<String, dynamic>))
+        .toList();
+  } catch (_) {
+    return [];
+  }
+});

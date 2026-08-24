@@ -18,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .manager_client import BACKEND_ROLE, is_display_role
 from .state import runner
-from .routers import action, bag, device, files, nav, sensor
+from .routers import action, bag, device, files, logs, nav, sensor
 from .routers import map as map_router
 from .routers import poi
 from .routers import proxy
@@ -55,6 +55,7 @@ else:
     app.include_router(poi.router)
     app.include_router(nav.router, prefix='/nav')
     app.include_router(files.router)
+    app.include_router(logs.router)
     app.include_router(action.router)
 
 

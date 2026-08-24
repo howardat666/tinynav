@@ -1,0 +1,26 @@
+[Unit]
+Description=Start the TinyNav app (backend + web UI + ROS nodes) at boot
+# 时钟必须先对好。X5 无 RTC，早于 board-autotime 起来的话整份 app.log 会带着
+# 2025-08-26 的时间戳写下去，事后没法和 board_health 对时间。
+After=board-autotime.service
+Wants=board-autotime.service
+RequiresMountsFor=/userdata
+
+[Service]
+# app_start.sh 自己 setsid 出 uvicorn 然后退出，所以是 oneshot；RemainAfterExit
+# 让 systemctl status 反映"已启动过"，而不是每次看都是 inactive。
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-/userdata/x5/app.env
+Environment=TINYNAV_SCHEME=a
+ExecStart=/bin/bash -c '/bin/bash /userdata/x5/tinynav/tool/x5_board/app_start.sh start "${TINYNAV_SCHEME}"'
+ExecStop=/bin/bash /userdata/x5/tinynav/tool/x5_board/app_start.sh stop
+# 脚本里有 sleep 12 的启动确认，再加上 ROS 起节点的时间。
+TimeoutStartSec=180
+# 开机时相机固件可能还没就绪，失败就隔 30s 再来，最多 3 次。
+Restart=on-failure
+RestartSec=30
+StartLimitBurst=3
+
+[Install]
+WantedBy=multi-user.target

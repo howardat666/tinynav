@@ -168,6 +168,12 @@ do_start() {
         exit 1
     fi
 
+    # 一代轮转。以前 app.log 只追加，涨到 44000 行、横跨一年，找一次 run 的 400 行要
+    # 在里面 grep；而崩溃后重启的现场只需要上一代就够。
+    if [[ -s "${LOGFILE}" ]]; then
+        mv -f "${LOGFILE}" "${LOGFILE}.1"
+    fi
+
     {
         echo "=============================================================="
         echo "scheme        : ${scheme}   (map=${map_src}, nav=${nav_src})"
