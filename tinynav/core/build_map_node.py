@@ -247,8 +247,14 @@ class LoopClosure:
             if dbow3_vocabulary_path is None and dbow3_vocabulary is None:
                 raise ValueError("dbow3_vocabulary_path is required when mode='bow'")
             from tinynav.core.models_trt import DBoW3Engine
+            # 这段是 nav 启动的最大一块：837 个关键帧实测 17 秒，而"enable 到第一次关键帧回调"
+            # 一共 32 秒。以前只有进度行，分不出词典构造、取描述子、加进 DBoW3 各占多少。
+            _t_voc = time.perf_counter()
             self.dbow3_engine = DBoW3Engine(dbow3_vocabulary_path, voc=dbow3_vocabulary)
+            _t_get = _t_add = 0.0
+            _voc_ms = (time.perf_counter() - _t_voc) * 1000.0
             total = len(self.timestamps)
+            _t_loop = time.perf_counter()
             for idx, ts in enumerate(self.timestamps):
                 # One line per keyframe is ~1100 lines of log for a real map, which
                 # is slow enough to show up in the startup profile. Keep the first,
@@ -257,6 +263,7 @@ class LoopClosure:
                     logger.info(
                         f"[LoopClosure] loading map keyframe {idx + 1}/{total}, timestamp={int(ts)}"
                     )
+                _t0 = time.perf_counter()
                 try:
                     cand_features = self.db.get_features(ts)
                 except Exception as e:
@@ -264,7 +271,17 @@ class LoopClosure:
                         f"[LoopClosure] failed loading timestamp={int(ts)}: {e}"
                     )
                     raise
+                _t1 = time.perf_counter()
                 self.dbow3_engine.add(cand_features)
+                _t_get += _t1 - _t0
+                _t_add += time.perf_counter() - _t1
+            logger.info(
+                "[LoopClosure] map load timing ms: total=%.0f, keyframes=%d, vocab=%.0f, "
+                "db_get_features=%.0f, dbow3_add=%.0f, other=%.0f"
+                % ((time.perf_counter() - _t_loop) * 1000.0 + _voc_ms, total, _voc_ms,
+                   _t_get * 1000.0, _t_add * 1000.0,
+                   (time.perf_counter() - _t_loop - _t_get - _t_add) * 1000.0)
+            )
 
     def add_timestamp(self, timestamp: int):
         ts = int(timestamp)

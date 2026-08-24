@@ -279,6 +279,11 @@ class PlanningNode(Node):
         self.origin = np.array(self.grid_shape) * self.resolution / -2.
         self.step = 10
         self.occupancy_grid = np.zeros(self.grid_shape)
+        # 每个 2D 格子最后一次"是障碍"的时刻。占据栅格没有任何时间衰减 —— 只有射线穿过时
+        # 才 -0.05，所以一个走出视野的格子会一直留着。热力图上"障碍物停留很久"就是这个，
+        # 而以前没有任何数字能区分"它确实还在"和"它只是没人再看它一眼"。
+        self._obstacle_first_seen = np.zeros(self.grid_shape[:2], dtype=np.float64)
+        self._obstacle_last_seen = np.zeros(self.grid_shape[:2], dtype=np.float64)
         self.K = None
         self.baseline = None
         self.last_T = None
@@ -342,6 +347,17 @@ class PlanningNode(Node):
         self.target_jump_warn_m = float(os.environ.get('TINYNAV_TARGET_JUMP_WARN_M', '0.5'))
 
         self.poi_change_sub = self.create_subscription(Odometry, "/mapping/poi_change", self.poi_change_callback, 10)
+
+        # /control/target_pose is a rolling lookahead, and only map_node knows whether the
+        # point it just published is the path's last one. Latched, same as the target
+        # itself. None means "never heard" -- see the arrival test for what that falls
+        # back to and why the fallback was wrong on its own.
+        self._target_is_final = None
+        self.create_subscription(
+            Bool, "/control/target_is_final",
+            lambda m: setattr(self, "_target_is_final", bool(m.data)),
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+        )
 
         # Whether a browser is actually looking at the local view. The overlay layers and
         # the voxel cloud exist only to be drawn, and together they measured 25.9 ms of a
@@ -661,6 +677,29 @@ class PlanningNode(Node):
         fx, fy = (fwd[0] / n, fwd[1] / n) if n > 1e-6 else (1.0, 0.0)
         return self._clearance_along(center, fx, fy, obstacle_mask, max_dist)
 
+    def _track_obstacle_age(self, mask):
+        """障碍格子的存活时长。判"它还在不在"要看的是这个，不是格子总数。"""
+        now = time.time()
+        new = mask & (self._obstacle_last_seen == 0.0)
+        self._obstacle_first_seen[new] = now
+        self._obstacle_last_seen[mask] = now
+        # 掉出掩码的格子清零，这样年龄是"连续存在的时长"而不是"第一次见到有多久"
+        self._obstacle_first_seen[~mask] = 0.0
+        self._obstacle_last_seen[~mask] = 0.0
+        if not mask.any():
+            return
+        age = now - self._obstacle_first_seen[mask]
+        now_ns = self.get_clock().now().nanoseconds
+        if now_ns - self._last_static_log_ns.get("obstacle_age", 0) < 5_000_000_000:
+            return
+        self._last_static_log_ns["obstacle_age"] = now_ns
+        self.get_logger().info(
+            f"obstacle age s: cells={int(mask.sum())} "
+            f"p50={float(np.median(age)):.1f} p90={float(np.percentile(age, 90)):.1f} "
+            f"max={float(age.max()):.1f} "
+            f"older_than_5s={int((age > 5.0).sum())} older_than_20s={int((age > 20.0).sum())}"
+        )
+
     def publish_obstacle_mask(self, mask, stamp):
         msg = OccupancyGrid()
         msg.header = Header()
@@ -912,6 +951,7 @@ class PlanningNode(Node):
                 self.occupancy_grid, self.origin, self.resolution,
                 robot_z=T[2, 3], config=self.obstacle_config,
             )
+            self._track_obstacle_age(obstacle_mask)
             ESDF_map = distance_transform_edt(~obstacle_mask).astype(np.float32) * self.resolution
             # Before the no-target return below, so the UI keeps reading a clearance
             # while the robot is parked -- which is exactly when you want to know
@@ -1025,12 +1065,23 @@ class PlanningNode(Node):
             # third component is the camera height.)
             target_idle_s = (
                 self.get_clock().now().nanoseconds - self._last_target_rx_ns) / 1e9
-            if (target_dist_xy <= self.target_reached_distance_m
+            # The idle test alone was wrong, not merely conservative: it assumed map_node
+            # goes quiet only when it is done, and map_node also goes quiet for 7-40 s
+            # whenever keyframes starve -- which on this board is most of the time. So a
+            # rolling lookahead 2 m down a 9.9 m path was declared arrival six times in
+            # one 227 s run, each time stopping the car until the next keyframe. Idle is
+            # kept as the timing signal, but a target map_node says is intermediate can
+            # never be arrival. None (topic never heard) keeps the old behaviour so an
+            # older map_node does not silently stop the robot from ever arriving.
+            is_final = self._target_is_final is not False
+            if (is_final
+                    and target_dist_xy <= self.target_reached_distance_m
                     and target_idle_s >= self.target_idle_arrival_s):
                 self.target_pose = None
                 self._publish_static_path(
                     init_p, init_q, depth_msg.header, base_time, static_steps,
-                    f"Target pose reached (xy_dist={target_dist_xy:.3f}m, target idle {target_idle_s:.1f}s)",
+                    f"Target pose reached (xy_dist={target_dist_xy:.3f}m, target idle {target_idle_s:.1f}s, "
+                    f"is_final={self._target_is_final})",
                     log_key="Target pose reached"
                 )
                 return

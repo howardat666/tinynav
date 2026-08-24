@@ -451,6 +451,15 @@ class MapNode(Node):
             Odometry, "/control/target_pose",
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
         )
+        # 前视点是不是路径末端。planning 只能靠"目标闲置 2 秒"猜到达，而目标的刷新周期就是
+        # 关键帧周期（实测中位 7.1 s），所以那个猜法必然误判：2026-08-24 的 run 里 11 次目标
+        # 有 9 次是中间点，车每次开到前视点就被判成"到了"然后停 3~47 秒。这里只有 map_node
+        # 知道答案 —— chosen_index 是不是最后一个点。TRANSIENT_LOCAL 跟 target_pose 一致，
+        # 否则晚加入的订阅者永远收不到。
+        self.target_is_final_pub = self.create_publisher(
+            Bool, "/control/target_is_final",
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+        )
 
         self.tf_broadcaster = TransformBroadcaster(self)
 
@@ -1155,10 +1164,32 @@ class MapNode(Node):
                 )
             else:
                 self.get_logger().info(f"Relocalization candidate timing ms: {'; '.join(candidate_timing_summaries)}")
+                # 报错要指对阶段。matches<20 时上面的深度分支根本不执行，valid_depth=0 是构造
+                # 出来的，说"深度地标不够"会把人带去查深度 —— 实测失败的都是这一类：候选
+                # matches 11~23（成功时约 180），sim 0.051~0.061（成功时 0.078~0.085）。
+                #
+                # cand_spread 是检索对不对的干净判据：检索对的时候前 3 名是地图里相邻的关键帧
+                # （实测跨度 <1 s），错的时候散在地图各处（实测 173 s）—— 那是"没有真匹配、
+                # 只是噪声排序"的典型形状。
+                cand_ts = stats.get("cand_ts") or []
+                spread_s = ((max(cand_ts) - min(cand_ts)) / 1e9) if len(cand_ts) > 1 else 0.0
+                best_matches = max(stats["cand_matches"]) if stats["cand_matches"] else 0
+                kept = sum(stats["cand_valid_depth"]) if stats["cand_valid_depth"] else 0
+                # 归因给深度只有在深度真的丢掉了东西时才成立。实测有一例 23 个匹配全部带有效
+                # 深度、短缺纯粹是匹配太少 —— 那还是检索的问题，标成 depth 会把人带错方向。
+                if best_matches < 20:
+                    reason_kind = f"retrieval: no candidate reached 20 matches (best {best_matches})"
+                elif kept >= landmark_count and landmark_count == best_matches:
+                    reason_kind = (f"retrieval: depth kept all {kept} matches, there were "
+                                   f"just too few (best candidate {best_matches})")
+                else:
+                    reason_kind = (f"depth: {best_matches} matches on the best candidate but "
+                                   f"only {landmark_count} usable 3D landmarks")
                 return self._relocalization_failed(
-                    f"not enough valid depth landmarks: {landmark_count}<=40, "
+                    f"{reason_kind} (need >40 landmarks, got {landmark_count}), "
+                    f"cand_spread={spread_s:.1f}s, "
                     f"candidates=[{'; '.join(candidate_summaries)}]",
-                    "few_landmarks",
+                    "retrieval_miss" if reason_kind.startswith("retrieval") else "few_landmarks",
                 )
         else:
             return self._relocalization_failed(
@@ -1544,6 +1575,7 @@ class MapNode(Node):
                     f"nav target: points={len(path_arr)} path_len={path_len_m:.2f}m "
                     f"lookahead={lookahead_m:.1f}m arc_to={accumulated_distance:.2f}m "
                     f"index={chosen_index}/{len(path_arr) - 1} "
+                    f"is_final={chosen_index == len(paths_in_map) - 1} "
                     f"robot_to_target_xy="
                     f"{float(np.linalg.norm((target_position_in_map - pose_in_map_position)[:2])):.3f}m "
                     f"robot_map={np.round(pose_in_map_position[:3], 2)} "
@@ -1554,6 +1586,7 @@ class MapNode(Node):
             t_stage = mark_stage("target_select", t_stage)
 
             self.target_pose_pub.publish(np2msg(dummy_pose, self.get_clock().now().to_msg(), "world", "camera"))
+            self.target_is_final_pub.publish(Bool(data=bool(chosen_index == len(paths_in_map) - 1)))
             t_stage = mark_stage("target_pose_publish", t_stage)
 
             path_msg = Path()
