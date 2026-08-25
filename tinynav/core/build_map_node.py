@@ -1376,6 +1376,24 @@ class BuildMapNode(Node):
             stage_timer=self.stage_timer,
         )
         occupancy_db.close()
+
+        # 建图时就把 VLAD 索引算好存盘。它只取决于关键帧特征和固定词典，两者建图后都不再变，
+        # 所以放到"第一次点 nav 时算完再缓存"是把 30 秒的等待白送给使用者一次 —— 2026-08-25
+        # 实测 map_loop_closure 占 nav 启动的 97.5%。注意不能复用建图用的 self.loop_closure：
+        # add_timestamp 目前是注释掉的，它的 embeddings 一直是空的。
+        if self.loop_closure_mode == "vlad" and self.vlad_centres is not None:
+            with self.stage_timer.timed("vlad_index_build"):
+                index_db = TinyNavDB(self.map_save_path, is_scratch=False)
+                try:
+                    LoopClosure(
+                        db=index_db,
+                        timestamps=list(self.pose_graph_used_pose.keys()),
+                        mode="vlad",
+                        vlad_centres=self.vlad_centres,
+                    )
+                finally:
+                    index_db.close()
+
         with self.stage_timer.timed("occupancy_save_files"):
             occupancy_meta = np.array([occupancy_origin[0], occupancy_origin[1], occupancy_origin[2], occupancy_resolution], dtype=np.float32)
             np.save(f"{self.map_save_path}/occupancy_grid.npy", occupancy_grid)

@@ -267,6 +267,8 @@ class MapNode(Node):
         # 上次重定位成功时最佳候选帧在地图中的位置。用来判断检索指得对不对：车连续走几米，
         # 候选也该连续移动几米；跳到几十米外就是检索错了，而那种错会被记成 pnp_inliers 不足。
         self._last_reloc_ref_xyz = None
+        # 地图加载只是"点 nav 到能用"的一部分，真正的等待要算到第一次重定位成功为止。
+        self._first_reloc_wall = None
         self._reloc_last_success_monotonic = None
         # Paired wall clock for the same event, for the status panel only: monotonic
         # cannot be aged by another process, and the panel wants a live "N s ago".
@@ -379,6 +381,7 @@ class MapNode(Node):
         # nav-side loop closure, and it never gets an image written to it -- but with the
         # default it still opened two h264 encoders at every nav start, for a directory
         # nothing ever reads back.
+        self._node_start_wall = time.monotonic()
         _t_load0 = time.perf_counter()
         self.nav_temp_db = TinyNavDB(
             f"{tinynav_db_path}/nav_temp", is_scratch=True,
@@ -428,6 +431,7 @@ class MapNode(Node):
             f"map_loop_closure={(_t_maplc - _t_mapdb) * 1e3:.0f} "
             f"({len(self.map_poses)} keyframes, mode={self.loop_closure_mode}), "
             f"grids={(_t_grids - _t_maplc) * 1e3:.0f}")
+        self._map_load_s = _t_grids - _t_load0
         # Starts here, *after* the two LoopClosures, and must not be moved ahead of
         # them. It looks like free real estate: the warmup needs nothing from the
         # arrays above but their dtypes and one scalar, so starting it earlier
@@ -1189,6 +1193,12 @@ class MapNode(Node):
                     # Last line of defence: the camera has to end up somewhere the
                     # map actually covers. This catches any remaining ill-posed
                     # solve regardless of how it arose.
+                    if self._first_reloc_wall is None:
+                        self._first_reloc_wall = time.monotonic()
+                        self.get_logger().info(
+                            "time to first relocalization: "
+                            f"{self._first_reloc_wall - self._node_start_wall:.1f}s since map_node start "
+                            f"(map load was {self._map_load_s:.1f}s of it)")
                     if candidates:
                         self._last_reloc_ref_xyz = np.asarray(
                             self.map_poses[int(candidates[0]["timestamp"])])[:3, 3].copy()
