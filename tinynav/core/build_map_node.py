@@ -343,8 +343,11 @@ class LoopClosure:
         if not path or self.embeddings.shape[0] != len(self.timestamps):
             return
         try:
+            # np.savez 会给不以 .npz 结尾的路径自动补后缀，写成 xxx.tmp.npz 而 replace 找
+            # xxx.tmp —— 2026-08-25 就是这样静默失败的。传文件对象则不会被改名。
             tmp = path + ".tmp"
-            np.savez(tmp, emb=self.embeddings, fp=np.array(self._vlad_fingerprint()))
+            with open(tmp, "wb") as fh:
+                np.savez(fh, emb=self.embeddings, fp=np.array(self._vlad_fingerprint()))
             os.replace(tmp, path)
             logger.info(f"vlad index cached: {self.embeddings.shape} -> {path}")
         except OSError as exc:

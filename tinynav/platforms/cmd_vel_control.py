@@ -504,11 +504,19 @@ class CmdVelControlNode(Node):
             # 这条日志一度是最大的误导源：障碍物封路时规划器只能给出原地不动的轨迹，其终点就在
             # 车脚下，于是"到达"和"无路可走"共用同一句话。带上轨迹本身的长度就能分开两者 ——
             # traj_len 接近 0 是被困住，接近 vx*duration 才是真的走完了。
-            traj_len = float(np.linalg.norm(np.diff(self._path_ref[:, :2], axis=0), axis=1).sum())
+            # traj_len 曾经算的是 _path_ref 全长，但它按设计保留历史再追加，全长(实测 48.9 m /
+            # 6329 点)与"这一段还能走多远"无关，是个误导指标。改成从跟踪点到末尾的剩余长度，
+            # 并带上两端坐标 —— 规划器给 vx=0.4 却 dist_to_end=0.000 时，要靠坐标定位是哪一环。
+            tail = self._path_ref[self._track_idx:, :2]
+            remain = (float(np.linalg.norm(np.diff(tail, axis=0), axis=1).sum())
+                      if len(tail) > 1 else 0.0)
+            end = self._path_ref[-1]
             self._publish_zero(
                 "local trajectory endpoint reached",
                 f"dist_to_end={dist_to_end:.3f}m heading_err={heading_to_goal:+.3f}rad "
-                f"traj_len={traj_len:.2f}m poses={len(self._path_ref)}",
+                f"remain={remain:.2f}m idx={self._track_idx}/{len(self._path_ref)} "
+                f"robot=({robot_pos[0]:+.2f},{robot_pos[1]:+.2f}) "
+                f"end=({end[0]:+.2f},{end[1]:+.2f}) v_ref={end[3]:+.2f}",
             )
             return
 
