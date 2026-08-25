@@ -1,5 +1,6 @@
 import math
 import array
+from collections import deque
 import json
 import os
 import threading
@@ -298,6 +299,15 @@ class PlanningNode(Node):
         self._escape_turn_sign = None
         self._escape_turn_ns = 0
         self._escape_lock_max_s = 4.0
+        # 后退脱困。占据栅格只由前向射线写入，所以车后方的格子从来没被看过 —— 盲退曾经
+        # 造成 40 s 的 vx=-0.2 直接撞上去（2026-08-10 19:19），这也是 reverse 一直被门掉的
+        # 原因。这里换一个能证明安全的判据：只退到**自己刚刚待过**的位置去。
+        self._centre_history = deque()      # (t_ns, x, y)，只留最近 retreat_history_s
+        self._retreat_history_s = 8.0
+        self._retreat_match_m = 0.20        # 采样点离历史轨迹这么近才算"待过"。车体半宽 0.175，
+                                            # 即后退路径不得偏离车身实际压过的范围一个身位以上
+        self._retreat_max_s = 2.0           # 连续后退的上限，防止一路倒回起点
+        self._retreat_start_ns = 0
         # The robot's own, whole. Rebuilding it field by field wired three of five
         # through, so min_wall_span_m and occ_threshold silently kept the class default
         # no matter what a platform asked for.
@@ -574,6 +584,33 @@ class PlanningNode(Node):
             # the only motion whose swept volume the camera has already observed.
             return 1e9
         return 0.0
+
+    def _retreat_index(self, params, trajectories, now_ns):
+        """直线后退轨迹的下标，若此刻后退不可证明安全则 None。
+
+        占据栅格只由前向射线写入，所以车后方的格子从来没被观测过 —— 对后退做碰撞检查是
+        拿没看过的格子在打分，这正是 _motion_gate_penalty 里那段历史（40 s 的 vx=-0.2 直接
+        撞上去）的由来。这里不检查栅格，而是检查**这条后退路径的每个采样点，车体中心是否
+        在最近几秒真的待过那里** —— 待过就说明能走。"""
+        if (self._retreat_start_ns
+                and (now_ns - self._retreat_start_ns) / 1e9 > self._retreat_max_s):
+            return None                     # 退够久了就停手，不能一路倒回起点
+        if not self._centre_history:
+            return None
+        hist = list(self._centre_history)
+        for i, param in enumerate(params):
+            if not (param[0] < 0.0 and abs(param[1]) < 1e-6):
+                continue
+            pts = trajectories[i][:, :2]
+            # 每 5 个点抽一个：0.1 s 步长下相邻点只差 2 cm，逐点查是白花钱。
+            for x, y in pts[::5]:
+                if not any(math.hypot(x - hx, y - hy) <= self._retreat_match_m
+                           for _, hx, hy in hist):
+                    return None
+            if not self._retreat_start_ns:
+                self._retreat_start_ns = now_ns
+            return i
+        return None
 
     def _escape_reason(self, front_blocked, stand_dist, heading_err_abs, best_gain):
         """Why the robot should turn in place instead of following the ranking, or "".
@@ -899,6 +936,9 @@ class PlanningNode(Node):
         self.path_pub.publish(path)
 
         now_ns = self.get_clock().now().nanoseconds
+        # 这条分支也算一个走完的周期。不更新的话，下一次真决策的 cycle 会把整段放弃期间
+        # 都算进去 —— 实测报出过 14.94 s 的假值，而那 15 s 是连续的 No admissible motion。
+        self._last_cycle_ns = now_ns
         key = log_key or reason
         last_ns = self._last_static_log_ns.get(key, 0)
         if now_ns - last_ns >= 1_000_000_000:
@@ -971,6 +1011,14 @@ class PlanningNode(Node):
             # _ui_active for why the count cannot answer the question.
             if self._ui_active:
                 self.publish_3d_occupancy_cloud(self.occupancy_grid, self.resolution, self.origin)
+
+        # 每周期都记，包括没有目标的时候 —— 卡住之后要回溯的正是卡住之前走过的地方。
+        _c = self.camera_to_robot_center(T)
+        _t_ns = self.get_clock().now().nanoseconds
+        self._centre_history.append((_t_ns, float(_c[0]), float(_c[1])))
+        while (self._centre_history
+               and _t_ns - self._centre_history[0][0] > self._retreat_history_s * 1e9):
+            self._centre_history.popleft()
 
         with Timer(name='obstacle map', text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=_TIMER_LOGGER):
             obstacle_mask = build_obstacle_map(
@@ -1195,36 +1243,63 @@ class PlanningNode(Node):
             # Before trusting argsort. A gated trajectory costs 1e9 and a collided one
             # costs inf, so 1e9 < inf makes argsort hand back the gated one -- the
             # banned reverse -- whenever every ungated option is in collision.
-            if len(admissible) == 0 or (front_blocked and not turns):
-                self._publish_static_path(
-                    init_p, init_q, depth_msg.header, base_time, len(trajectories[0]),
-                    f"No admissible motion: {n_blocked}/{len(scores)} in collision and the rest "
-                    f"gated (front_clearance={self._fmt_clearance(front_clearance)}, "
-                    f"gate={'turn only' if front_blocked else 'forward only'}, "
-                    f"turns_left={len(turns)}, "
-                    f"esdf_at_robot={self._esdf_at(ESDF_map, init_p):.2f}m) -- holding still "
-                    f"rather than moving somewhere the camera has not looked",
-                    log_key="no admissible motion",
-                )
-                return
-
-            ends_xy = np.array([trajectories[i][-1, :2] for i in admissible])
-            best_gain = stand_dist - float(np.min(np.linalg.norm(
-                ends_xy - target_pose[None, :2], axis=1)))
-            escape_reason = self._escape_reason(
-                front_blocked, stand_dist,
-                abs(self._wrap(yaw_to_target - yaw_now)), best_gain)
-
             now_ns = self.get_clock().now().nanoseconds
-            if escape_reason and turns:
-                pick, escape_clear = self._pick_escape_turn(
-                    self.camera_to_robot_center(T), turns, trajectories,
-                    yaw_to_target, obstacle_mask, params, now_ns)
-                top_indices = np.array([pick])
-                turned_in_place = True
-            else:
-                # 脱困结束就松锁，否则下一次脱困会沿用上一次的方向。
+            retreating = False
+            if len(admissible) == 0 or (front_blocked and not turns):
+                # 走到这里说明前进被门掉、原地转也全撞（方形底盘的原地转是要做碰撞检查的，
+                # 圆形才豁免）。2026-08-25 18:50 实测这个状态连续 15 s，车就站着不动 ——
+                # 而它其实是从后面开进来的，退回去必然有路。
+                retreat_idx = self._retreat_index(params, trajectories, now_ns)
+                if retreat_idx is None:
+                    self._publish_static_path(
+                        init_p, init_q, depth_msg.header, base_time, len(trajectories[0]),
+                        f"No admissible motion: {n_blocked}/{len(scores)} in collision and the rest "
+                        f"gated (front_clearance={self._fmt_clearance(front_clearance)}, "
+                        f"gate={'turn only' if front_blocked else 'forward only'}, "
+                        f"turns_left={len(turns)}, "
+                        f"esdf_at_robot={self._esdf_at(ESDF_map, init_p):.2f}m, "
+                        f"retreat=unavailable) -- holding still "
+                        f"rather than moving somewhere the camera has not looked",
+                        log_key="no admissible motion",
+                    )
+                    return
+                top_indices = np.array([retreat_idx])
+                retreating = True
+                escape_reason = "retreat"
+                best_gain = float('nan')
                 self._escape_turn_sign = None
+            else:
+                ends_xy = np.array([trajectories[i][-1, :2] for i in admissible])
+                best_gain = stand_dist - float(np.min(np.linalg.norm(
+                    ends_xy - target_pose[None, :2], axis=1)))
+                escape_reason = self._escape_reason(
+                    front_blocked, stand_dist,
+                    abs(self._wrap(yaw_to_target - yaw_now)), best_gain)
+
+                if escape_reason and turns:
+                    pick, escape_clear = self._pick_escape_turn(
+                        self.camera_to_robot_center(T), turns, trajectories,
+                        yaw_to_target, obstacle_mask, params, now_ns)
+                    # 有转向可选 != 转了能出去。2026-08-25 18:50 实测：turns 只剩 1~2 条、
+                    # 每条的净空只有 0.04~0.08 m，车在那儿摆了 42 s。净空不够就别摆了，
+                    # 退回自己刚走过的地方 —— main 对「前方堵住」的答案本来就是倒车
+                    # （硬互斥门 front_clearance<=0.3 时只准倒车），它缺的只是「后面能不能
+                    # 走」的凭据，那正是 _retreat_index 提供的。
+                    if escape_clear < self.escape_min_clearance_m:
+                        retreat_idx = self._retreat_index(params, trajectories, now_ns)
+                        if retreat_idx is not None:
+                            top_indices = np.array([retreat_idx])
+                            retreating = True
+                            escape_reason = "retreat"
+                            self._escape_turn_sign = None
+                    if not retreating:
+                        top_indices = np.array([pick])
+                        turned_in_place = True
+                        self._retreat_start_ns = 0
+                else:
+                    # 脱困结束就松锁，否则下一次脱困会沿用上一次的方向。
+                    self._escape_turn_sign = None
+                    self._retreat_start_ns = 0
 
             self.last_param = params[top_indices[0]]
             best_idx = int(top_indices[0])
@@ -1232,7 +1307,8 @@ class PlanningNode(Node):
                 cycle_s = (now_ns - self._last_cycle_ns) / 1e9 if self._last_cycle_ns else float('nan')
                 self._last_static_log_ns["decision"] = now_ns
                 self.get_logger().info(
-                    f"decision: {'TURN-IN-PLACE ' if turned_in_place else ''}chose vx={params[best_idx][0]:+.3f} omega={params[best_idx][1]:+.3f} "
+                    f"decision: {'RETREAT ' if retreating else ''}"
+                    f"{'TURN-IN-PLACE ' if turned_in_place else ''}chose vx={params[best_idx][0]:+.3f} omega={params[best_idx][1]:+.3f} "
                     f"(cap {self.robot.max_vx:.2f}) blocked={n_blocked}/{len(scores)} "
                     f"front_clearance={self._fmt_clearance(front_clearance)} "
                     f"gate={'turn-only' if front_blocked else 'forward'} "

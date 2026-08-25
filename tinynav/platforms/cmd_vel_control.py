@@ -257,10 +257,12 @@ class CmdVelControlNode(Node):
         # 25, not main's 12: this is not main's controller -- x5 rewrote it as a
         # time-parameterised Samson-type tracker -- and its stability at 12 Hz has not
         # been measured on the floor. 25 is still a 4x cut. Lower it once measured.
-        # 位姿流失速多久就刹车。0.4 s = vio_image 20 Hz 下漏 8 帧，0.3 m/s 下多走 12 cm。
-        # 比 planning 的 max_input_age_s 和 diffcar 的 cmd_timeout_s（都 0.5）更紧一点：
-        # 这是最后一道刹车，晚于它们没有意义。
-        self.declare_parameter("odom_stale_s", 0.4)
+        # 位姿流失速多久就刹车。0.8 s，不是 0.4 —— 板上 vio_image 有一个约每秒一次的常态
+        # 打嗝，2026-08-25 18:48 实测 145 次的位姿年龄 p50=0.42 p90=0.43 max=0.47 s，
+        # 0.4 的门限正好压在上面，于是全速行驶中每秒被踩一脚刹车（vx=0.300 -> 0 -> 0.300），
+        # 抖动是这么来的。门限要明显高于常态打嗝：0.8 s 留了 0.33 s 余量，而它要拦的故障是
+        # 43 秒级的流死亡，也短于轨迹本身的 2~3 s 时长。0.3 m/s 下多走 24 cm。
+        self.declare_parameter("odom_stale_s", 0.8)
         self._odom_stale_s = float(self.get_parameter("odom_stale_s").value)
         self.declare_parameter("cmd_rate_hz", 25.0)
         self._cmd_rate_hz = float(self.get_parameter("cmd_rate_hz").value)
