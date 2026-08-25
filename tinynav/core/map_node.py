@@ -201,7 +201,10 @@ class DummyEmbeddingEngine:
 # _observations_constrain_pose 把关，不靠数量。
 _RELOC_GATES = {
     "bow": (20, 40, 20),
-    "vlad": (12, 12, 8),
+    # 内点门槛回调到 12：8 是在「匹配数只有 12-16」的观测下定的，而那批数字来自车停在
+    # 一个视角很差的位置。真实运行实测匹配 52-83 个，8 会放行内点率 17%、重投影中位
+    # 4.1 px 的解。12 挡掉这些，同时保留内点率 35% 以上的。
+    "vlad": (12, 12, 12),
     "embedding": (20, 40, 20),
 }
 
@@ -371,10 +374,12 @@ class MapNode(Node):
         # nav-side loop closure, and it never gets an image written to it -- but with the
         # default it still opened two h264 encoders at every nav start, for a directory
         # nothing ever reads back.
+        _t_load0 = time.perf_counter()
         self.nav_temp_db = TinyNavDB(
             f"{tinynav_db_path}/nav_temp", is_scratch=True,
             save_infra1_video=False, save_rgb_video=False,
         )
+        _t_navdb = time.perf_counter()
         self.nav_loop_closure = LoopClosure(
             db=self.nav_temp_db,
             timestamps=[],
@@ -385,9 +390,11 @@ class MapNode(Node):
             dbow3_vocabulary=shared_dbow3_vocabulary,
             vlad_centres=self.frozen_vlad_centres,
         )
+        _t_navlc = time.perf_counter()
         self.map_poses = np.load(f"{tinynav_map_path}/poses.npy", allow_pickle=True).item()
         self.map_K = np.load(f"{tinynav_map_path}/intrinsics.npy")
         self.db = TinyNavDB(tinynav_map_path, is_scratch=False)
+        _t_mapdb = time.perf_counter()
         self.map_loop_closure = LoopClosure(
             db=self.db,
             timestamps=list(self.map_poses.keys()),
@@ -398,12 +405,24 @@ class MapNode(Node):
             dbow3_vocabulary=shared_dbow3_vocabulary,
             vlad_centres=self.frozen_vlad_centres,
         )
+        _t_maplc = time.perf_counter()
         # Both databases hold their own copy now; release ours.
         del shared_dbow3_vocabulary
 
         self.occupancy_map = np.load(f"{tinynav_map_path}/occupancy_grid.npy")
         self.occupancy_map_meta = np.load(f"{tinynav_map_path}/occupancy_meta.npy")
         self.sdf_map = np.load(f"{tinynav_map_path}/sdf_map.npy")
+        _t_grids = time.perf_counter()
+        # 「点击 nav 到能用」慢在哪，此前只能靠猜。地图加载全在 __init__ 里，所以这一行就是
+        # 那段等待的全部构成；vlad 模式下 map_loop_closure 要为每个关键帧现算 VLAD，是大头。
+        self.get_logger().info(
+            f"map load timing ms: total={(_t_grids - _t_load0) * 1e3:.0f}, "
+            f"nav_temp_db={(_t_navdb - _t_load0) * 1e3:.0f}, "
+            f"nav_loop_closure={(_t_navlc - _t_navdb) * 1e3:.0f}, "
+            f"poses+map_db={(_t_mapdb - _t_navlc) * 1e3:.0f}, "
+            f"map_loop_closure={(_t_maplc - _t_mapdb) * 1e3:.0f} "
+            f"({len(self.map_poses)} keyframes, mode={self.loop_closure_mode}), "
+            f"grids={(_t_grids - _t_maplc) * 1e3:.0f}")
         # Starts here, *after* the two LoopClosures, and must not be moved ahead of
         # them. It looks like free real estate: the warmup needs nothing from the
         # arrays above but their dtypes and one scalar, so starting it earlier
