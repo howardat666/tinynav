@@ -195,6 +195,17 @@ class DummyEmbeddingEngine:
         return np.zeros((1, 768), dtype=np.float32)
 
 
+# 重定位的三道关卡原本都按 ORB 的数量级定：ORB 一帧几百个点、匹配上百个。SuperPoint 配
+# cross-check 匹配是"少而准"，实测只有 12-16 个匹配，连第一关都过不去，而路标数不可能超过
+# 匹配数，所以第二关的 40 是连坐卡死。换了特征就得换判据；几何退化另有
+# _observations_constrain_pose 把关，不靠数量。
+_RELOC_GATES = {
+    "bow": (20, 40, 20),
+    "vlad": (12, 12, 8),
+    "embedding": (20, 40, 20),
+}
+
+
 class MapNode(Node):
     def __init__(
         self,
@@ -331,6 +342,8 @@ class MapNode(Node):
         # 这一行以前不存在，检索方案只能靠日志里冒出 "ORBMatcher flann" 反推 —— 而一次
         # 用错方案的 run 和一次用对的 run 在日志里长得一模一样，直到重定位开始莫名其妙地失败。
         # 阈值一起打出来：它们是按方案取的，两套的量纲完全不同。
+        (self.reloc_min_matches, self.reloc_min_landmarks,
+         self.reloc_min_inliers) = _RELOC_GATES.get(self.loop_closure_mode, (20, 40, 20))
         self.get_logger().info(
             f"retrieval: {self.loop_closure_mode} "
             f"({'DBoW3 over ORB' if self.loop_closure_mode == 'bow' else 'VLAD over BPU SuperPoint' if self.loop_closure_mode == 'vlad' else 'DINOv2 embedding + LightGlue'}), "
@@ -1075,7 +1088,7 @@ class MapNode(Node):
                 match_ms = (time.perf_counter() - t_match) * 1000.0
                 timings["match"] = timings.get("match", 0.0) + match_ms
                 depth_ms = 0.0
-                if len(matches) >= 20:
+                if len(matches) >= self.reloc_min_matches:
                     t_depth = time.perf_counter()
                     point_3d_in_world, inliers = self.keypoint_with_depth_to_3d(reference_matched_keypoints, reference_depth, reference_keyframe_pose, self.map_K)
                     depth_ms = (time.perf_counter() - t_depth) * 1000.0
@@ -1088,7 +1101,7 @@ class MapNode(Node):
                     stats["cand_valid_depth"].append(int(np.count_nonzero(inliers)))
                 else:
                     candidate_summaries.append(
-                        f"{timestamp_in_map}:sim={similarity:.3f},matches={len(matches)}<20"
+                        f"{timestamp_in_map}:sim={similarity:.3f},matches={len(matches)}<{self.reloc_min_matches}"
                     )
                     stats["cand_valid_depth"].append(0)
                 stats["cand_matches"].append(int(len(matches)))
@@ -1098,7 +1111,7 @@ class MapNode(Node):
 
             landmark_count = int(sum(points.shape[0] for points in point_3d_in_world_arrays))
             stats["landmarks"] = landmark_count
-            if landmark_count > 40:
+            if landmark_count > self.reloc_min_landmarks:
                 point_3d_in_world_list = np.concatenate(point_3d_in_world_arrays, axis=0)
                 point_2d_in_keyframe_list = np.concatenate(point_2d_in_keyframe_arrays, axis=0)
 
@@ -1123,7 +1136,17 @@ class MapNode(Node):
                 success, rvec, tvec, inliers = cv2.solvePnPRansac(point_3d_in_world_list, point_2d_in_keyframe_list, self.map_K, None)
                 timings["pnp"] = timings.get("pnp", 0.0) + (time.perf_counter() - t_pnp) * 1000.0
                 stats["pnp_inliers"] = 0 if inliers is None else int(len(inliers))
-                if success and len(inliers) >= 20:
+                # 判断降阈值是否站得住的唯一依据：少而准的匹配应当给出高内点率和小重投影误差。
+                if success and inliers is not None and len(inliers) > 0:
+                    idx = np.asarray(inliers).ravel()
+                    proj, _ = cv2.projectPoints(point_3d_in_world_list[idx], rvec, tvec, self.map_K, None)
+                    err = np.linalg.norm(proj.reshape(-1, 2) - point_2d_in_keyframe_list[idx], axis=1)
+                    self.get_logger().info(
+                        f"PnP quality: inliers={len(idx)}/{len(point_3d_in_world_list)} "
+                        f"({len(idx) / len(point_3d_in_world_list):.0%}), gate>={self.reloc_min_inliers}, "
+                        f"reproj px p50={float(np.median(err)):.2f} p90={float(np.percentile(err, 90)):.2f} "
+                        f"max={float(err.max()):.2f}")
+                if success and len(inliers) >= self.reloc_min_inliers:
                     R, _ = cv2.Rodrigues(rvec)
                     T = np.eye(4)
                     T[:3, :3] = R
@@ -1179,7 +1202,8 @@ class MapNode(Node):
                 # 归因给深度只有在深度真的丢掉了东西时才成立。实测有一例 23 个匹配全部带有效
                 # 深度、短缺纯粹是匹配太少 —— 那还是检索的问题，标成 depth 会把人带错方向。
                 if best_matches < 20:
-                    reason_kind = f"retrieval: no candidate reached 20 matches (best {best_matches})"
+                    reason_kind = (f"retrieval: no candidate reached {self.reloc_min_matches} matches "
+                                   f"(best {best_matches})")
                 elif kept >= landmark_count and landmark_count == best_matches:
                     reason_kind = (f"retrieval: depth kept all {kept} matches, there were "
                                    f"just too few (best candidate {best_matches})")
@@ -1187,7 +1211,7 @@ class MapNode(Node):
                     reason_kind = (f"depth: {best_matches} matches on the best candidate but "
                                    f"only {landmark_count} usable 3D landmarks")
                 return self._relocalization_failed(
-                    f"{reason_kind} (need >40 landmarks, got {landmark_count}), "
+                    f"{reason_kind} (need >{self.reloc_min_landmarks} landmarks, got {landmark_count}), "
                     f"cand_spread={spread_s:.1f}s, "
                     f"candidates=[{'; '.join(candidate_summaries)}]",
                     "retrieval_miss" if reason_kind.startswith("retrieval") else "few_landmarks",

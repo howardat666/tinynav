@@ -155,6 +155,15 @@ def snapshot(dev):
                         out.append("link=%s" % v.strip())
             if "Total False Alarm" in line:
                 out.append("fa=%s" % line.rsplit("=", 1)[1].strip())
+        # 掉线时挂在哪个 AP 上 -- 板子在几个 AP 间漫游，2026-08-25 见过一次掉线正发生在
+        # 漫游到 -63 dBm 的弱 AP 之后（正常那个是 -51）。攒几次就知道是不是规律。
+        ap = read(os.path.join(base, "ap_info"))
+        for line in ap.splitlines():
+            if "macaddr" in line and ":" in line:
+                out.append("bssid=%s" % line.split(":", 1)[1].strip())
+            elif "cur_channel=" in line:
+                out.append("ch=%s" % line.split("cur_channel=", 1)[1].split(",")[0].strip())
+
         tp = read(os.path.join(base, "sta_tp_info"))
         for line in tp.splitlines():
             if "rx_rate :" in line:
