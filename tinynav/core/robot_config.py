@@ -264,12 +264,12 @@ DIFFCAR_CONFIG = RobotConfig(
     # 2 格 = 20 cm，叠加车体半宽后足以把窄通道整条封死：2026-08-25 实测规划器只能选出
     # 原地不动的轨迹，而 cmd_vel_control 的到达判据是「离局部轨迹终点 <0.1 m」，于是
     # 每周期都报 endpoint reached 并发零速。
-    # 上限 0.2 -> 1.0（相机上方，即地面上方约 1.18 m）。0.2 的理由是「桌面高度的东西车能
-    # 从下面钻过去」，但椅子座面在地面 0.45 m = 相机上方 0.27 m，正好在旧上限之外，
-    # 于是椅子只剩几条细腿能被看见 —— 深度图上细腿本来就不稳。代价是桌子/椅面这类
-    # 悬空物现在都算障碍，车不再钻桌子底下；障碍格子数会明显上升。
-    # ⚠️ 如果改完车又开始「无可行轨迹」原地不动，第一个该回退的就是这个上限（先试 0.5）。
-    obstacle=ObstacleConfig(robot_z_bottom=-0.3, robot_z_top=1.0, dilation_cells=1),
+    # 0.4，即地面上方 0.58 m。取值卡在两个实物之间：椅子座面在地面 0.45 m（相机上方
+    # 0.27 m）要看见，桌面在地面 0.70~0.75 m（相机上方 0.52 m 起）不能看见 —— 桌子车能
+    # 从下面过，把它算成障碍会把整条走廊封掉。两边各留约 0.12 m 余量。
+    # 1.0 试过，2026-08-25 实测把桌面之类的悬空物全投影成地面障碍：front_clearance 掉到
+    # 0.11 m、106 条轨迹 101 条被拒，车原地左右打转 10 s 才脱困。0.2 又低于椅面。
+    obstacle=ObstacleConfig(robot_z_bottom=-0.3, robot_z_top=0.4, dilation_cells=1),
     # 0.6, and the reaction-budget argument that held it at 0.3 was mostly wrong: the
     # library samples 7 speeds from 0 to vx_max and collision-checks each over its whole
     # 3 s extent, so raising the ceiling adds fast options rather than forcing speed --

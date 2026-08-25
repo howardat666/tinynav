@@ -274,13 +274,14 @@ class PlanningNode(Node):
         self._last_stale_log_ns = 0
         self.camerainfo_sub = self.create_subscription(CameraInfo, '/camera/camera/infra2/camera_info', self.info_callback, 10)
 
-        # z 是 13 层而不是 10：栅格以相机为中心时只覆盖相机 ±0.5 m，robot_z_top 再大也会
-        # 被栅格自己截断。椅子座面在地面 0.45 m（相机上方 0.27 m）刚好在旧上限边缘。
-        self.grid_shape = (100, 100, 13)
+        # z 是 9 层而不是对称的 10：栅格以相机为中心时只覆盖相机 ±0.5 m，robot_z_top 再大
+        # 也会被栅格自己截断。9 层 + 上抬后覆盖相机 -0.3 .. +0.6 m，够放 robot_z_top 到 0.5。
+        # 曾经开到 13 层（上限 1.0 m），结果桌面之类的悬空物全投影成地面障碍，走廊被关死：
+        # front_clearance 掉到 0.11 m、106 条轨迹里 101 条被拒，车只能原地打转（2026-08-25）。
+        self.grid_shape = (100, 100, 9)
         self.resolution = 0.1
-        # 把栅格在 z 上抬起来，使它覆盖相机 -0.3 .. +1.0 m 而不是对称的 ±0.65。地面在相机
-        # 下方 0.18 m，往下留 1 层余量够了；省下的层全给上方。
-        self.grid_offset = np.array([0.0, 0.0, 0.35])
+        # 地面在相机下方 0.18 m，往下留 1 层余量够了；省下的层全给上方。
+        self.grid_offset = np.array([0.0, 0.0, 0.15])
         self.origin = np.array(self.grid_shape) * self.resolution / -2. + self.grid_offset
         self.step = 10
         self.occupancy_grid = np.zeros(self.grid_shape)
@@ -293,6 +294,10 @@ class PlanningNode(Node):
         self.baseline = None
         self.last_T = None
         self.last_param = (0.0, 0.0) # acc and gyro
+        # 脱困转向锁定的方向与起始时刻。见 _pick_escape_turn 里的滞回说明。
+        self._escape_turn_sign = None
+        self._escape_turn_ns = 0
+        self._escape_lock_max_s = 4.0
         # The robot's own, whole. Rebuilding it field by field wired three of five
         # through, so min_wall_span_m and occ_threshold silently kept the class default
         # no matter what a platform asked for.
@@ -594,7 +599,8 @@ class PlanningNode(Node):
             return "no-progress"
         return ""
 
-    def _pick_escape_turn(self, center, turns, trajectories, yaw_to_target, obstacle_mask):
+    def _pick_escape_turn(self, center, turns, trajectories, yaw_to_target, obstacle_mask,
+                          params, now_ns):
         """Index of the in-place turn to commit to, plus the clearance it buys.
 
         Lexicographic, not a weighted sum: a heading the camera can vouch for beats a
@@ -605,7 +611,28 @@ class PlanningNode(Node):
                           for y in end_yaws])
         head_err = np.array([abs(self._wrap(yaw_to_target - y)) for y in end_yaws])
         usable = np.flatnonzero(clear >= self.escape_min_clearance_m)
-        k = int(usable[int(np.argmin(head_err[usable]))]) if len(usable) else int(np.argmax(clear))
+        cand = usable if len(usable) else np.arange(len(turns))
+
+        # 方向滞回。上面这两条规则在 usable 空/非空之间来回切换，而"最对准目标"和"最空
+        # 方向"经常指反方向 —— 2026-08-25 实测车原地左右摆了 10 s，变号时刻和 escape_clear
+        # 跨过阈值的时刻逐条对齐。一旦开始转就锁定转向，除到期或同方向已无可选项。
+        # 锁有时限：锁死一个永远转不出去的方向会变成一直自转。
+        if (self._escape_turn_sign is not None
+                and (now_ns - self._escape_turn_ns) / 1e9 < self._escape_lock_max_s):
+            same = [int(k) for k in cand
+                    if math.copysign(1.0, params[turns[k]][1]) == self._escape_turn_sign]
+            if same:
+                cand = np.array(same)
+        else:
+            self._escape_turn_sign = None
+
+        k = int(cand[int(np.argmin(head_err[cand]))]) if len(usable) \
+            else int(cand[int(np.argmax(clear[cand]))])
+        omega = params[turns[k]][1]
+        if omega != 0.0:
+            if self._escape_turn_sign is None:
+                self._escape_turn_ns = now_ns
+            self._escape_turn_sign = math.copysign(1.0, omega)
         return turns[k], float(clear[k])
 
     @staticmethod
@@ -1188,16 +1215,19 @@ class PlanningNode(Node):
                 front_blocked, stand_dist,
                 abs(self._wrap(yaw_to_target - yaw_now)), best_gain)
 
+            now_ns = self.get_clock().now().nanoseconds
             if escape_reason and turns:
                 pick, escape_clear = self._pick_escape_turn(
                     self.camera_to_robot_center(T), turns, trajectories,
-                    yaw_to_target, obstacle_mask)
+                    yaw_to_target, obstacle_mask, params, now_ns)
                 top_indices = np.array([pick])
                 turned_in_place = True
+            else:
+                # 脱困结束就松锁，否则下一次脱困会沿用上一次的方向。
+                self._escape_turn_sign = None
 
             self.last_param = params[top_indices[0]]
             best_idx = int(top_indices[0])
-            now_ns = self.get_clock().now().nanoseconds
             if now_ns - self._last_static_log_ns.get("decision", 0) >= 1_000_000_000:
                 cycle_s = (now_ns - self._last_cycle_ns) / 1e9 if self._last_cycle_ns else float('nan')
                 self._last_static_log_ns["decision"] = now_ns
