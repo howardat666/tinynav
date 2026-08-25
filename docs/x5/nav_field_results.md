@@ -761,3 +761,73 @@ user_pct=78.0      sys_pct=9.8   softirq=0.4   iowait=0.0   lo_mbs=0.01
 `Generate nav path timing ms:` 总计仅 9–11 ms，**路径规划完全不是瓶颈**。
 
 新增 `map load timing ms:` 记录「点击 nav 后那段等待」的构成（地图加载全在 `map_node.__init__`）：`nav_temp_db / nav_loop_closure / poses+map_db / map_loop_closure / grids`。vlad 模式下 `map_loop_closure` 要为每个关键帧现算 VLAD，预期是大头。
+
+## 8.10 ⭐ cmd_vel_control 的 96% —— 四分之三的位姿消息收下来就丢
+
+用一个「只订阅、什么都不做」的探针测纯接收成本（板子轻载，load 4.78）：
+
+```
+/camera/camera/vio_100hz   1917 msgs / 20.0s =  95.8 Hz   CPU 47.3%
+/camera/camera/vio_image    401 msgs / 20.0s =  20.0 Hz   CPU 11.0%
+```
+
+**光是接收 100 Hz 位姿就要 47.3% 的一个核**，约 **0.49 ms/条**，纯 rclpy 反序列化开销，我们的代码改不掉。比例（4.3×）与消息率（4.8×）基本吻合，说明是线性成本。
+
+而 `cmd_vel_control` 的控制循环是 **25 Hz** —— **每四条消息里三条解完就丢**。这就是它在导航中测到 95.9%（板子 load 14.37 / 91.6 °C）的主要来源。
+
+**改动**：`_POSE_TOPIC_VIO_CONTROL` 从 `vio_100hz` 换到 20 Hz 的 `vio_image`，预期省约 36%。回退用环境变量 `TINYNAV_POSE_TOPIC_CONTROL`。
+
+⚠️ **换频率会引爆一个潜伏的 bug，必须同时修**：里程计低通用的是写死的 `alpha=0.35`，而固定 alpha 的时间常数与采样率绑死：
+
+| 位姿频率 | alpha=0.35 的时间常数 | 0.6 m/s 下的滞后 |
+|---|---|---|
+| 99 Hz | 29 ms | 1.7 cm |
+| **20 Hz** | **143 ms** | **8.6 cm** |
+
+改成按实测间隔算 `alpha = min(1, dt / tau)`，`tau=0.03 s`（等于原先 99 Hz 下的等效时间常数），**换任何频率滤波行为都不变**。
+
+**教训**：在饱和的板子上，「单进程 CPU% 高」不等于「这个进程的代码慢」。受控探针（只订阅、不干活）能把框架开销和业务开销分开，这是这块板子上唯一可靠的归因手段。
+
+## 8.11 ⭐ 掉线的真实签名是 `ip=none`，而 netheal 的第 2 级在帮倒忙
+
+给 netheal 的现场快照加上 `bssid=`/`ch=` 之后，第一次抓到完整现场：
+
+```
+14:47:17 第2级 wifi-connect 开始 | rssi=-52 qual=98 link=1 fa=2403
+         bssid=a0:69:d9:5b:dd:b3 ch=11 rx_rate=CCK_1M carrier=1 usb=1 ip=none
+14:47:43 第2级 wifi-connect 执行完 rc=1 ... ERROR: association failed after 20s
+```
+
+**`link=1 carrier=1` 但 `ip=none`** —— 关联完好，丢的是 IP。信号 −52 dBm 很好，`fa=2403`（正常 300–900）、`rx_rate=CCK_1M`。
+
+完整链条：
+
+```
+温度高 + fa 飙升 → 速率塌到 CCK_1M → DHCP 续租在 1 Mbit/s 的链路上完不成 → ip=none
+        ↓
+netheal 第1级 link-bounce 无效（问题不在链路层）
+        ↓
+第2级 wifi-connect 拆掉关联重建 → association failed after 20s
+        ↓
+僵死，只能断电
+```
+
+🔴 **第 2 级把「关联着但没地址」打成「连都连不上」**，这也正是我两次尝试切换 SSID 时遇到的同一个失败模式。
+
+**改动**：梯度前面插入 `dhcp-renew`（只重跑 udhcpc，不碰关联），成为
+`['dhcp-renew', 'link-bounce', 'wifi-connect', 'usb-reauthorize']`。它既是最便宜的一级，也是唯一与证据匹配的一级。
+
+⚠️ 写 `pkill -f` 模式时必须用 `udhcp[c]` 这种括号写法 —— 否则模式串出现在执行它的 shell 自己的命令行里，会把自己杀掉（今天在别处踩过两次）。
+
+## 8.12 温度与射频劣化的直接对照
+
+同一块板子，两个负载状态：
+
+| 状态 | temp | load | `rx_rate` |
+|---|---|---|---|
+| 刚重启（轻载） | 85–87 °C | 3.8 | **MCS3–MCS6** |
+| 导航中（重载） | **91.6 °C** | 14.37 | **CCK_1M / CCK5_5M** |
+
+温度差 5 °C，协商速率差五六个档位（MCS5 约 52 Mbit/s vs CCK_1M 的 1 Mbit/s）。降频线是 95 °C。
+
+这条对照支持「BPU/CPU 满载 → 温度 → 射频劣化 → 速率塌陷 → DHCP 续租失败 → 掉线」，也解释了为什么掉线高峰跟着 BPU 负载走（见 `wifi_diagnosis.md` 的按小时统计）。**因此降 CPU 占用不只是省算力，它直接买回温度余量和网络稳定性。**
