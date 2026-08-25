@@ -270,7 +270,13 @@ def _bridge_argv(*, for_map_build: bool = False) -> list[str]:
         # discovery window. Navigation gets 'auto', where nothing subscribes and the
         # decode is skipped outright.
         '--keyframe-depth', 'always' if for_map_build else 'auto',
-    ]
+    ] + (
+        # The keyframe cap exists to keep map_node's 876 ms per keyframe under its
+        # 1.0 s staleness limit while driving. A build is offline and paced by the bag,
+        # so the cap only subtracts map coverage: 1.5 s would have turned this bag's
+        # 837 keyframes into at most 170.
+        ['--keyframe-min-interval', '0.0'] if for_map_build else []
+    )
 
 
 def _planning_argv() -> list[str]:

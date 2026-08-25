@@ -162,19 +162,41 @@ class LooperBridgeNode(Node):
         # depth leaves the sync and is looked up by stamp from the single subscription that
         # already receives it for /slam/depth. That also ends the duplicate subscription:
         # the same 680 kB frame was being delivered and deserialized twice per frame.
+        #
+        # ...except when /slam/keyframe_depth actually has a consumer. The stamp lookup
+        # below cannot serve one: depth runs at 4.3 Hz against pose+infra1's 20 Hz and
+        # arrives on a different callback group, so a keyframe's stamp is usually not in
+        # the cache yet -- measured 168 misses out of 168 keyframes on 2026-08-25, which
+        # left build_map_node's four-way sync one input short and produced a map with zero
+        # poses. A synchronizer waits for the input; a cache lookup cannot wait. So for a
+        # map build depth goes back in as a sync input, and only navigation gets the
+        # uncapped keyframe rate that taking it out was for.
+        self._depth_in_sync = args.keyframe_depth == 'always'
+        if self._depth_in_sync:
+            self.depth_sub = message_filters.Subscriber(
+                self, Image, "/camera/camera/depth/image_rect_raw",
+                qos_profile=self.sync_depth_qos, callback_group=self.sync_group
+            )
+            sync_inputs = [self.depth_sub, self.pose_sub, self.image_sub]
+        else:
+            self.depth_sub = None
+            sync_inputs = [self.pose_sub, self.image_sub]
+
         use_exact = self._pose_sync_is_exact()
         if use_exact:
             self.sync = message_filters.TimeSynchronizer(
-                [self.pose_sub, self.image_sub],
-                queue_size=args.sync_queue_size,
+                sync_inputs, queue_size=args.sync_queue_size,
             )
         else:
             self.sync = message_filters.ApproximateTimeSynchronizer(
-                [self.pose_sub, self.image_sub],
-                queue_size=args.sync_queue_size,
+                sync_inputs, queue_size=args.sync_queue_size,
                 slop=args.pose_sync_slop,
             )
-        self.sync.registerCallback(self.sync_callback)
+        if self._depth_in_sync:
+            self.sync.registerCallback(
+                lambda d, p_, i: self.sync_callback(p_, i, depth_msg=d))
+        else:
+            self.sync.registerCallback(self.sync_callback)
 
         self.odom_visual_pub = self.create_publisher(
             Odometry, "/slam/odometry_visual", 10
@@ -221,7 +243,7 @@ class LooperBridgeNode(Node):
         )
         self.get_logger().info(
             f"keyframe sync: {'exact' if use_exact else f'approximate slop={args.pose_sync_slop}s'}"
-            f" on pose+infra1 (depth by stamp lookup); "
+            f" on {'depth+pose+infra1' if self._depth_in_sync else 'pose+infra1 (depth by stamp lookup)'}; "
             f"gate: >={args.keyframe_translation}m or >={args.keyframe_rotation_deg}deg or "
             f">={args.keyframe_static_interval}s, capped at one per {args.keyframe_min_interval}s"
         )
@@ -384,7 +406,7 @@ class LooperBridgeNode(Node):
         disp_color_msg.header.frame_id = "camera"
         return disp_color_msg
 
-    def sync_callback(self, pose_msg: PoseStamped, image_msg: Image):
+    def sync_callback(self, pose_msg: PoseStamped, image_msg: Image, depth_msg: Image = None):
         if self.cached_camera_info is None:
             self.log_missing_inputs()
             return
@@ -413,7 +435,9 @@ class LooperBridgeNode(Node):
                 "sync_callback: "
                 f"t={stamp_s:.3f}, "
                 f"image={image_msg.height}x{image_msg.width}, "
-                f"depth_cache={len(self._depth_by_stamp)}, depth_misses={self._depth_lookup_miss}"
+                + (f"depth={depth_msg.height}x{depth_msg.width}, " if depth_msg is not None
+                   else f"depth_cache={len(self._depth_by_stamp)}, ")
+                + f"depth_misses={self._depth_lookup_miss}"
             )
 
         # This callback fires on every synced set -- up to the camera's 20 Hz now that depth
@@ -442,10 +466,10 @@ class LooperBridgeNode(Node):
         # most callbacks have no depth for their stamp -- that is expected, and the two
         # consumers below are the only things that care.
         depth_m = None
-        depth_msg = None
         if want_keyframe_depth or self.disparity_pub_vis is not None:
-            depth_msg = self._depth_by_stamp.get(
-                stamp.sec * 1_000_000_000 + stamp.nanosec)
+            if depth_msg is None:
+                depth_msg = self._depth_by_stamp.get(
+                    stamp.sec * 1_000_000_000 + stamp.nanosec)
             if depth_msg is not None:
                 depth_m = self.decode_depth_meters(depth_msg)
             else:
