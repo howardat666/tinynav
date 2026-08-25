@@ -189,6 +189,13 @@ def emit(line):
 def steps(dev):
     """梯度。每一项是 (名字, 动作, 之后等多少秒再复验)。"""
     return [
+        # 2026-08-25 定案:掉线现场是 `link=1 carrier=1 ip=none` —— 关联好着,丢的是 IP
+        # (速率塌到 CCK_1M 后 DHCP 续租失败)。所以第一步只重新拿 IP,不要动关联:第2级的
+        # 拆重建会把"关联着但没 IP"打成"连都连不上"(association failed after 20s),那次
+        # 只能断电。pkill 模式用 udhcp[c] 括起来,否则会匹配到执行它的这个 shell 自己。
+        ("dhcp-renew",
+         lambda: sh("pkill -f 'udhcp[c].*%s' 2>/dev/null; udhcpc -i %s -n -q -t 8" % (dev, dev), 40),
+         15),
         # 不用 wpa_cli reassociate:板上的 wpa_supplicant 是 wifi-connect.sh 手工起的、
         # 没带 -C 控制套接字，wpa_cli 直接 rc=255 连不上 —— 那一级是空操作(2026-08-24 实测)。
         ("link-bounce", lambda: sh("ifconfig %s down; sleep 2; ifconfig %s up" % (dev, dev), 30), 25),

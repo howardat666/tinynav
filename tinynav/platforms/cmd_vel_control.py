@@ -206,6 +206,9 @@ class CmdVelControlNode(Node):
         # columns: x, y, yaw, v_ref, w_ref, t_abs
         self._path_ref = None
         self._track_idx = 0
+        self._last_odom_stamp_sec = None
+        # 0.03 s = 原先 99 Hz 下 alpha=0.35 的等效时间常数，保持换话题前的手感。
+        self._odom_filter_tau_s = 0.03
         self._last_traj_update_sec = None
         self._last_traj_log_sec = None
         # Its own throttle. Sharing _last_traj_log_sec meant a stale warning every cycle
@@ -281,9 +284,15 @@ class CmdVelControlNode(Node):
             self.rotation = measured_rotation
             self._odom_pose_initialized = True
         else:
-            alpha = 0.35  # First-order odom low-pass filter; smaller is smoother but laggier.
+            # 一阶低通，但按实际间隔算 alpha 而不是写死。固定 alpha 的时间常数与采样率绑死：
+            # 控制位姿从 100 Hz 换到 20 Hz 后，alpha=0.35 的 29 ms 会变成 143 ms，0.6 m/s
+            # 下就是 8.6 cm 的滞后。用时间常数表述，换话题不再改变滤波行为。
+            dt = (odom_stamp_sec - self._last_odom_stamp_sec
+                  if self._last_odom_stamp_sec is not None else 0.0)
+            alpha = 1.0 if dt <= 0.0 else min(1.0, dt / self._odom_filter_tau_s)
             self.position = (1.0 - alpha) * self.position + alpha * measured_position
             self.rotation = measured_rotation
+        self._last_odom_stamp_sec = odom_stamp_sec
 
         self._odom_stamp_sec = odom_stamp_sec
         if self._debug_recorder is not None:

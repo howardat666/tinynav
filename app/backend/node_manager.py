@@ -109,7 +109,11 @@ _ENABLE_CMD_VEL_NODE = os.environ.get(
 # through the base_link -> camera extrinsic and rotated into optical axes, so it
 # is a drop-in for either.
 _POSE_TOPIC_VIO_KEYFRAME = '/camera/camera/vio_image'
-_POSE_TOPIC_VIO_CONTROL = '/camera/camera/vio_100hz'
+# 100 Hz 的那一路只是纯接收就要 47.3% CPU(2026-08-25 实测,轻载,什么都不做),20 Hz 的同
+# 一位姿只要 11.0%。而 cmd_vel_control 的控制循环是 25 Hz,四分之三的消息收下来就丢。
+# 环境变量留作回退:控制质量若变差,设 TINYNAV_POSE_TOPIC_CONTROL 指回 vio_100hz。
+_POSE_TOPIC_VIO_CONTROL = os.environ.get(
+    'TINYNAV_POSE_TOPIC_CONTROL', '/camera/camera/vio_image')
 _POSE_TOPIC_WHEEL = '/wheel/camera_pose'
 
 # Measured on this robot, not nominal. wheel_radius came from a driven 3 m
