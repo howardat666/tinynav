@@ -892,6 +892,8 @@ map load timing ms: total=30865, nav_temp_db=10, nav_loop_closure=0,
 - 指纹覆盖 **词典 + 时间戳序列**，不只是数量：顺序变了会让每一行错位，**静默给出自信而错误的位姿**
 - 首次启动仍付 30 秒并写约 219 MB，之后只需读
 
+**这一版还不够 —— 见 §8.19**：缓存是「第一次导航时建立」，操作员点第一次 nav 仍要等 30 秒。
+
 ## 8.15 🔴 重投影误差不能当门槛用（纠正一个错误推理）
 
 我曾提出「把内点数门槛换成重投影误差」，**这是错的**，据此改会让判据反向。
@@ -991,3 +993,37 @@ x5 的 `endpoint reached` 是自己加的，而且语义有歧义 —— **「�
 **新增诊断**：候选摘要加 `jump=` 字段 —— 候选帧在地图中的位置离上次成功位置多远。车连续走几米，候选也该连续移动几米；**跳到几十米外就是检索错了**，而那种错会被记成 `pnp_inliers` 不足。这是区分「检索错」和「匹配差」的判据，`cand_spread` 做不到（候选彼此聚集不代表聚集在正确的地方，重复纹理的走廊完全可以让 VLAD 一致地指向错误的另一段）。
 
 **顺带**：`max_vx` 从 0.6 收回 **0.3** —— 提速的收益在导航跑通之前无从验证，而重规划周期跟不上时速度越高冲得越远。
+
+## 8.19 ⭐ VLAD 索引挪到建图时算，以及前端仪表盘
+
+### 缓存的位置错了一层
+
+§8.14 的 `vlad_index.npz` 只解决了「第二次之后」。操作员的实际体验是**建完图第一次点 nav 还是等 30 秒** —— 而那时要算的东西在建图结束时就全部齐了。
+
+原因是建图侧的 `add_timestamp` 两处调用被注释掉了（`build_map_node.py:1224,1263` 的 `# temp disabled`），所以建图过程中 `LoopClosure.embeddings` 一直是空的，索引根本没机会顺带落盘。
+
+**改动**：`save_mapping` 在 `occupancy_db.close()` 之后，用刚写好的地图重新构造一次 `LoopClosure(mode="vlad")`，触发 `_save_vlad_index()`。建图本来就已经把每帧特征算过一遍，这一步只是把描述子聚合成 VLAD 向量，计入建图的 `vlad_index_build` 计时段。
+
+**判据**：建图产物目录里应有 `vlad_index.npz`；导航日志的 `map_loop_closure` 应是 1.7 秒量级而不是 30 秒。
+
+### 「点击 nav 到出现在地图上」不等于地图加载完
+
+我曾拿 `map load timing` 的 2.4 秒回答「现在只要 2 秒」，**这是答错了问题**。操作员看的是自己的位置出现在地图上，那还要等第一次重定位成功 —— 一次重定位单程 643–688 ms，成功率约 70%，中间还夹着节点启动和首帧同步。
+
+**新增日志**：`time to first relocalization`，从节点启动到第一次成功重定位的墙钟时间。这才是该拿去和「十多秒」对照的数字。
+
+### 前端：System 页改成仪表盘
+
+原来 System 卡片把所有指标平铺成同构的行，包括没人看的每核 CPU；run logs 列表也无上限地长。
+
+- System 变成 6 格仪表盘（电池电压 / CPU 百分比+load / BPU / 最高温度 / 内存 / 磁盘），点击展开成原来的完整明细 —— 和 Info 卡片已有的行为一致，不新增交互概念
+- 格子布局按宽度自适应：>420 px 三列，否则两列
+- run logs 只列最近 3 条，余下显示 `+N more on device`
+
+### 🔴 在 docker 里编前端的三个坑（每个都让我白跑一轮）
+
+1. **`--user` 跑不了 flutter**：`/opt/flutter/bin/cache/engine.stamp` 只有 root 能写。但用 root 又会在检出里留下 root 拥有的 `.dart_tool/` 和 `ephemeral/`。**解法是两者都不将就** —— 把 `app/frontend` 拷到 job 临时目录，在那里以 root 编，产物拷回 `build/web`（它本来就在 `.gitignore` 里）。
+2. **`git config --global --add safe.directory /opt/flutter`**：换了 `HOME` 之后 git 认为 `/opt/flutter` 属主可疑，flutter 的每条命令都会失败 —— 而且**报错只印 git 的抱怨，不印 flutter 的任何输出**，看起来像命令什么都没做。
+3. **`pub get` 和 `analyze` 必须在同一次 `docker run` 里**：分两次跑，第二次会报满屏 `package:dio/dio.dart` 找不到。看着像代码错误，其实是依赖解析没带过来。
+
+误判记录：我据此以为「前端有 7 个编译错误」，实际是 0 error / 0 warning（39 个 issue 全是 main 自带的 deprecated API 提示）。
