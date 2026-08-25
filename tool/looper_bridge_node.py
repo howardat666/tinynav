@@ -501,8 +501,12 @@ def parse_args():
     #
     # 以前这个上限是"意外"存在的：depth 被固件降到 4.3 Hz，又是三路精确同步的一员，所以
     # 顺带把关键帧压在 4.3 Hz。把 depth 移出同步之后那个意外上限没了，必须换成显式的。
-    # 1.0 s → 约 1 Hz → map_node 约 48% 一个核，而路径重算从现在的 6~17 s 变成约 1 s。
-    parser.add_argument("--keyframe-min-interval", type=float, default=1.0)
+    # 按 map_node 的每帧成本定，不是拍脑袋：vlad 实测 876 ms/帧（bow 是 477）。1.0 s 的间隔
+    # 就是 87.6% 利用率 —— 排队一抖就撞上 map_node 的 max_keyframe_age_s=1.0，关键帧被当成
+    # 超龄丢掉（判据：日志里的 "dropping stale keyframes: N so far"）。1.5 s 留到 58%。
+    # 路径重算因此是约 1.5 s，仍然比现在实测的 6~17 s 好一个量级。
+    # 换回 bow 或者 map_node 变快之后可以往下调。
+    parser.add_argument("--keyframe-min-interval", type=float, default=1.5)
     parser.add_argument(
         "--keyframe-depth", choices=("always", "auto"), default="always",
         help="Whether to produce /slam/keyframe_depth. 'auto' skips it -- decode "

@@ -35,6 +35,13 @@ NODES = tuple(n for n, _ in NODE_MATCH)
 LOG_DIR = Path(os.environ.get('TINYNAV_APP_LOG_DIR', '/userdata/x5/logs'))
 TICK = os.sysconf('SC_CLK_TCK')
 BPU = ('/sys/devices/system/bpu/ratio', '/sys/devices/system/bpu/bpu0/ratio')
+# 2026-08-24: 七个进程的 CPU 加起来 597%，而 load 是 14.7 —— 约 200% 不在任何进程名下。
+# /proc/stat 的 sys/softirq 能直接说清那是不是内核，而 lo 的字节数说清是不是回环流量
+# （实测 17.3 MB/s，深度图 680 kB > 536 kB 的共享内存段，只能走 UDP）。cpu_mhz 是为了
+# 分辨"变慢"是负载还是降频：温度中位 92.4 °C，降频线 95。
+_STAT = '/proc/stat'
+_NETDEV = '/proc/net/dev'
+_FREQ = '/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq'
 
 
 def _read(path, default=''):
@@ -43,6 +50,23 @@ def _read(path, default=''):
             return f.read()
     except OSError:
         return default
+
+
+def _cpu_jiffies():
+    """(user, nice, sys, idle, iowait, irq, softirq) from the aggregate cpu line."""
+    line = _read(_STAT).split('\n', 1)[0]
+    parts = line.split()
+    if parts[:1] != ['cpu'] or len(parts) < 8:
+        return None
+    return tuple(int(v) for v in parts[1:8])
+
+
+def _lo_bytes():
+    for line in _read(_NETDEV).splitlines():
+        if line.strip().startswith('lo:'):
+            f = line.split(':', 1)[1].split()
+            return int(f[0]), int(f[8])
+    return None
 
 
 def _scan():
@@ -81,7 +105,8 @@ def _scan():
 def main():
     period = float(sys.argv[1]) if len(sys.argv) > 1 else 1.0
     out = LOG_DIR / f"run_stats_{time.strftime('%Y%m%d_%H%M%S')}.tsv"
-    cols = ['time', 'temp_c', 'load', 'avail_mb', 'bpu_pct']
+    cols = ['time', 'temp_c', 'load', 'avail_mb', 'bpu_pct', 'cpu_mhz',
+            'sys_pct', 'softirq_pct', 'iowait_pct', 'user_pct', 'lo_mbs']
     for n in NODES:
         cols += [f'{n}_cpu', f'{n}_rss']
     with out.open('w') as f:
@@ -89,6 +114,7 @@ def main():
     print(f'recording every {period}s -> {out}', flush=True)
 
     prev, prev_t = {}, None
+    prev_cpu, prev_lo = _cpu_jiffies(), _lo_bytes()
     while True:
         now = time.time()
         temp = int(_read('/sys/class/thermal/thermal_zone0/temp', '0') or 0) / 1000.0
@@ -100,8 +126,23 @@ def main():
                 break
         bpu = next((v.strip() for v in (_read(p).strip() for p in BPU) if v), '-')
 
+        cur_cpu, cur_lo = _cpu_jiffies(), _lo_bytes()
+        shares = ['-'] * 4
+        if cur_cpu and prev_cpu:
+            d = [c - p for c, p in zip(cur_cpu, prev_cpu)]
+            tot = sum(d)
+            if tot > 0:
+                # 全机百分比（100% = 全部 8 核），和进程列的口径不同：那些是单核百分比。
+                shares = [f'{100.0 * d[i] / tot:.1f}' for i in (2, 6, 4, 0)]
+        lo_mbs = '-'
+        if cur_lo and prev_lo and prev_t and now > prev_t:
+            lo_mbs = f'{(cur_lo[0] - prev_lo[0]) / (now - prev_t) / 1048576:.2f}'
+        mhz = _read(_FREQ).strip()
+        mhz = str(int(mhz) // 1000) if mhz.isdigit() else '-'
+        prev_cpu, prev_lo = cur_cpu, cur_lo
+
         cur = _scan()
-        row = [time.strftime('%H:%M:%S'), f'{temp:.1f}', load, str(avail), bpu]
+        row = [time.strftime('%H:%M:%S'), f'{temp:.1f}', load, str(avail), bpu, mhz] + shares + [lo_mbs]
         for n in NODES:
             if n not in cur:
                 row += ['-', '-']
