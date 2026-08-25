@@ -15,7 +15,6 @@ class DeviceTab extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final statusAsync = ref.watch(deviceStatusProvider);
     final sensorAsync = ref.watch(sensorModeProvider);
-    final sysAsync = ref.watch(sysInfoProvider);
     final ip = ref.watch(deviceIpProvider) ?? '—';
 
     return RefreshIndicator(
@@ -69,39 +68,7 @@ class DeviceTab extends ConsumerWidget {
           ),
           const SizedBox(height: 12),
           // ── System ─────────────────────────────────────────────────────
-          _SectionCard(
-            icon: Icons.memory_rounded,
-            title: 'System',
-            children: [
-              statusAsync.when(
-                // Volts win when present: on the diff car that is the real reading,
-                // and the firmware cuts the motors at 9.6 V, so the number people need
-                // is the distance to that, not a percentage guessed from it.
-                data: (s) => s.batteryVolts != null
-                    ? _InfoRow(
-                        'Battery',
-                        '${s.batteryVolts!.toStringAsFixed(2)} V',
-                        valueColor: s.batteryVolts! < 10.2
-                            ? Colors.red
-                            : (s.batteryVolts! < 10.8 ? Colors.orange : null),
-                      )
-                    : s.battery != null
-                        ? _InfoRow(
-                            'Battery',
-                            '${s.battery!.toStringAsFixed(0)}%',
-                            valueColor: s.battery! < 20 ? Colors.red : null,
-                          )
-                        : const _InfoRow('Battery', '—'),
-                loading: () => const _LoadingRow(),
-                error: (_, __) => const _InfoRow('Battery', '—'),
-              ),
-              sysAsync.when(
-                data: (sys) => Column(children: _systemRows(sys)),
-                loading: () => const _LoadingRow(),
-                error: (_, __) => const _InfoRow('System', 'unavailable', dimmed: true),
-              ),
-            ],
-          ),
+          const _SystemCard(),
         ],
       ),
     );
@@ -250,7 +217,8 @@ class _LogsCardState extends ConsumerState<_LogsCard> {
               ? const _InfoRow('Bundles', 'none yet', dimmed: true)
               : Column(
                   children: [
-                    for (final f in list)
+                    // 只列最近 3 个：列表长了会把整张卡片顶下去，而实际要下载的永远是刚采的那几个。
+                    for (final f in list.take(3))
                       _BundleRow(
                         entry: f,
                         onDownload: base == null
@@ -258,6 +226,8 @@ class _LogsCardState extends ConsumerState<_LogsCard> {
                             : () => downloadFile('$base/logs/bundles/${f.name}', f.name),
                         onDelete: () => _delete(f.name),
                       ),
+                    if (list.length > 3)
+                      _InfoRow('', '+${list.length - 3} more on device', dimmed: true),
                   ],
                 ),
           loading: () => const _LoadingRow(),
@@ -490,6 +460,179 @@ class _LoadingRow extends StatelessWidget {
     return const Padding(
       padding: EdgeInsets.symmetric(vertical: 8),
       child: Center(child: SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))),
+    );
+  }
+}
+
+
+/// System 卡片：默认仪表盘（一眼看六个数），点一下切到原来的逐行明细。
+/// 明细里有 per-core、free/cached、cma、swap 这些排查才用的东西，平时只是噪音。
+class _SystemCard extends ConsumerStatefulWidget {
+  const _SystemCard();
+
+  @override
+  ConsumerState<_SystemCard> createState() => _SystemCardState();
+}
+
+class _SystemCardState extends ConsumerState<_SystemCard> {
+  bool _detailed = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final statusAsync = ref.watch(deviceStatusProvider);
+    final sysAsync = ref.watch(sysInfoProvider);
+
+    final battery = statusAsync.maybeWhen(
+      data: (s) => s.batteryVolts != null
+          ? _Metric('Battery', s.batteryVolts!.toStringAsFixed(2), 'V',
+              color: s.batteryVolts! < 10.2
+                  ? Colors.red
+                  : (s.batteryVolts! < 10.8 ? Colors.orange : null))
+          : (s.battery != null
+              ? _Metric('Battery', s.battery!.toStringAsFixed(0), '%',
+                  color: s.battery! < 20 ? Colors.red : null)
+              : const _Metric('Battery', '—', '')),
+      orElse: () => const _Metric('Battery', '—', ''),
+    );
+
+    return InkWell(
+      onTap: () => setState(() => _detailed = !_detailed),
+      borderRadius: BorderRadius.circular(12),
+      child: _SectionCard(
+        icon: Icons.memory_rounded,
+        title: _detailed ? 'System  ·  detail' : 'System',
+        children: _detailed
+            ? [
+                statusAsync.when(
+                  data: (s) => _InfoRow('Battery', battery.value + ' ' + battery.unit,
+                      valueColor: battery.color),
+                  loading: () => const _LoadingRow(),
+                  error: (_, __) => const _InfoRow('Battery', '—'),
+                ),
+                sysAsync.when(
+                  data: (sys) => Column(children: _systemRows(sys)),
+                  loading: () => const _LoadingRow(),
+                  error: (_, __) =>
+                      const _InfoRow('System', 'unavailable', dimmed: true),
+                ),
+              ]
+            : [
+                sysAsync.when(
+                  data: (sys) => _MetricGrid(metrics: _dashboardMetrics(battery, sys)),
+                  loading: () => const _LoadingRow(),
+                  error: (_, __) =>
+                      const _InfoRow('System', 'unavailable', dimmed: true),
+                ),
+              ],
+      ),
+    );
+  }
+}
+
+/// 仪表盘的六个数。温度取最高的那一路 —— 降频看的是最热的核，不是平均。
+List<_Metric> _dashboardMetrics(_Metric battery, SysInfo sys) {
+  final tMax = sys.tempsC.isEmpty
+      ? null
+      : sys.tempsC.values.reduce((a, b) => a > b ? a : b);
+  return [
+    battery,
+    _Metric(
+      'CPU',
+      sys.cpuPercent.toStringAsFixed(0),
+      sys.load1m != null ? '%  load ${sys.load1m!.toStringAsFixed(1)}' : '%',
+      color: sys.cpuPercent > 85 ? Colors.red : null,
+    ),
+    _Metric('BPU', sys.bpuPercent?.toStringAsFixed(0) ?? '—',
+        sys.bpuPercent == null ? '' : '%',
+        color: (sys.bpuPercent ?? 0) > 85 ? Colors.red : null),
+    _Metric('Temp', tMax?.toStringAsFixed(0) ?? '—', tMax == null ? '' : '\u00b0C',
+        color: tMax == null
+            ? null
+            : (tMax > 90 ? Colors.red : (tMax > 80 ? Colors.orange : null))),
+    _Metric('Memory', sys.memPercent.toStringAsFixed(0),
+        '%  ${sys.memUsedGb.toStringAsFixed(1)}/${sys.memTotalGb.toStringAsFixed(1)}G',
+        color: sys.memPercent > 85 ? Colors.red : null),
+    _Metric('Disk', sys.diskPercent.toStringAsFixed(0),
+        '%  ${sys.diskUsedGb.toStringAsFixed(0)}/${sys.diskTotalGb.toStringAsFixed(0)}G',
+        color: sys.diskPercent > 90 ? Colors.red : null),
+  ];
+}
+
+class _Metric {
+  final String label;
+  final String value;
+  final String unit;
+  final Color? color;
+  const _Metric(this.label, this.value, this.unit, {this.color});
+}
+
+class _MetricGrid extends StatelessWidget {
+  final List<_Metric> metrics;
+  const _MetricGrid({required this.metrics});
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(builder: (context, box) {
+      // 两列起步，宽了给三列。固定列数比 childAspectRatio 好调，数字不会被裁。
+      final cols = box.maxWidth > 420 ? 3 : 2;
+      final w = (box.maxWidth - (cols - 1) * 8) / cols;
+      return Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        children: [
+          for (final m in metrics) SizedBox(width: w, child: _MetricTile(m: m)),
+        ],
+      );
+    });
+  }
+}
+
+class _MetricTile extends StatelessWidget {
+  final _Metric m;
+  const _MetricTile({required this.m});
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final base = theme.textTheme.bodySmall?.color?.withOpacity(0.65);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.onSurface.withOpacity(0.05),
+        borderRadius: BorderRadius.circular(8),
+        border: m.color == null
+            ? null
+            : Border.all(color: m.color!.withOpacity(0.55)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(m.label,
+              style: theme.textTheme.labelSmall?.copyWith(
+                  color: base, letterSpacing: 0.4)),
+          const SizedBox(height: 2),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.baseline,
+            textBaseline: TextBaseline.alphabetic,
+            children: [
+              Text(m.value,
+                  style: theme.textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w600,
+                      fontFeatures: const [FontFeature.tabularFigures()],
+                      color: m.color)),
+              if (m.unit.isNotEmpty) ...[
+                const SizedBox(width: 3),
+                Expanded(
+                  child: Text(m.unit,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.labelSmall?.copyWith(color: base)),
+                ),
+              ],
+            ],
+          ),
+        ],
+      ),
     );
   }
 }

@@ -23,7 +23,7 @@ void main() async {
     ProviderScope(
       overrides: [
         sharedPreferencesProvider.overrideWithValue(prefs),
-        if (savedIp != null) deviceIpProvider.overrideWith((ref) => savedIp),
+        deviceIpProvider.overrideWith((ref) => savedIp),
       ],
       child: const TinyNavApp(),
     ),
