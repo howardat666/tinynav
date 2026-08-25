@@ -221,6 +221,9 @@ class LooperBridgeNode(Node):
         )
         self.get_logger().info(
             f"keyframe sync: {'exact' if use_exact else f'approximate slop={args.pose_sync_slop}s'}"
+            f" on pose+infra1 (depth by stamp lookup); "
+            f"gate: >={args.keyframe_translation}m or >={args.keyframe_rotation_deg}deg or "
+            f">={args.keyframe_static_interval}s, capped at one per {args.keyframe_min_interval}s"
         )
 
     def _pose_sync_is_exact(self) -> bool:
@@ -264,10 +267,14 @@ class LooperBridgeNode(Node):
         rotation_angle = np.arccos(
             np.clip((np.trace(relative_rotation) - 1.0) * 0.5, -1.0, 1.0)
         )
+        elapsed = current_time - self.last_keyframe_time
+        # 上限先判：门限满足了也不能比这更快。见 --keyframe-min-interval。
+        if elapsed < self.args.keyframe_min_interval:
+            return False
         return (
             translation >= self.args.keyframe_translation
             or rotation_angle >= np.deg2rad(self.args.keyframe_rotation_deg)
-            or current_time - self.last_keyframe_time >= self.args.keyframe_static_interval
+            or elapsed >= self.args.keyframe_static_interval
         )
 
     def make_odom_msg(self, T_world_camera: np.ndarray, stamp, velocity=None) -> Odometry:
@@ -488,6 +495,14 @@ def parse_args():
     parser.add_argument("--keyframe-translation", type=float, default=0.03)
     parser.add_argument("--keyframe-rotation-deg", type=float, default=1.0)
     parser.add_argument("--keyframe-static-interval", type=float, default=1.0)
+    # 显式的关键帧上限，x5 专有。main 的门限（3 cm / 1 度）在它的目标机上没问题：depth 也是
+    # 20 Hz，关键帧最多 20 Hz，而 Jetson 追得上。X5 上 map_node 每个关键帧实测 477 ms，
+    # 0.6 m/s 下 3 cm 门限就是 20 Hz = 954% 一个核。
+    #
+    # 以前这个上限是"意外"存在的：depth 被固件降到 4.3 Hz，又是三路精确同步的一员，所以
+    # 顺带把关键帧压在 4.3 Hz。把 depth 移出同步之后那个意外上限没了，必须换成显式的。
+    # 1.0 s → 约 1 Hz → map_node 约 48% 一个核，而路径重算从现在的 6~17 s 变成约 1 s。
+    parser.add_argument("--keyframe-min-interval", type=float, default=1.0)
     parser.add_argument(
         "--keyframe-depth", choices=("always", "auto"), default="always",
         help="Whether to produce /slam/keyframe_depth. 'auto' skips it -- decode "

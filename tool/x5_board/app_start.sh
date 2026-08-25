@@ -163,7 +163,13 @@ do_start() {
     export TINYNAV_PUBLISH_PLANNING_OVERLAYS="${TINYNAV_PUBLISH_PLANNING_OVERLAYS:-1}"
     export TINYNAV_VERBOSE_TIMER="${TINYNAV_VERBOSE_TIMER:-0}"
 
-    if [[ ! -f "${TINYNAV_DBOW3_VOCAB}" ]]; then
+    # 检索方案。vlad = VLAD over BPU SuperPoint（默认），bow = DBoW3 over ORB。
+    # 地图和重定位必须同一个值，一个模式建的图在另一个模式下每次查询都落空。
+    export TINYNAV_LOOP_CLOSURE_MODE="${TINYNAV_LOOP_CLOSURE_MODE:-vlad}"
+
+    # 词典只有 bow 用得上。以前这个检查是无条件的，vlad 模式下会因为一个用不到的文件
+    # 直接拒绝启动。
+    if [[ "${TINYNAV_LOOP_CLOSURE_MODE}" == "bow" && ! -f "${TINYNAV_DBOW3_VOCAB}" ]]; then
         echo "vocabulary missing: ${TINYNAV_DBOW3_VOCAB} -- map build will fail" >&2
         exit 1
     fi
@@ -181,7 +187,13 @@ do_start() {
         echo "robot/actuator: ${TINYNAV_ROBOT_TYPE} / ${TINYNAV_ACTUATOR}"
         echo "db            : ${TINYNAV_DB_PATH}"
         echo "node logs     : ${TINYNAV_LOG_DIR}"
-        echo "map vocab     : ${TINYNAV_DBOW3_VOCAB}"
+        if [[ "${TINYNAV_LOOP_CLOSURE_MODE}" == "bow" ]]; then
+            echo "retrieval     : bow  (DBoW3 over ORB)"
+            echo "map vocab     : ${TINYNAV_DBOW3_VOCAB}"
+        else
+            echo "retrieval     : ${TINYNAV_LOOP_CLOSURE_MODE}  (VLAD over BPU SuperPoint, no vocabulary)"
+        fi
+        echo "⚠️ 地图必须用同一个 retrieval 建，换了就得重建"
         echo "map build     : rate=${TINYNAV_MAP_PLAY_RATE} queue=${TINYNAV_MAP_SYNC_QUEUE} vis=${TINYNAV_MAP_VISUALIZATION} videos=${TINYNAV_MAP_SAVE_VIDEOS} db_sync=${TINYNAV_DB_SYNC_EVERY}"
         echo "diagnostics   : planning_overlays=${TINYNAV_PUBLISH_PLANNING_OVERLAYS} verbose_timer=${TINYNAV_VERBOSE_TIMER}"
         echo "=============================================================="

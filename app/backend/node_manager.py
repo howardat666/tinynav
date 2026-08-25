@@ -152,11 +152,19 @@ _MAP_VISUALIZATION = os.environ.get('TINYNAV_MAP_VISUALIZATION', '0') == '1'
 # See _build_map_argv: 114 s of h264 per build, for videos only PC-side tools read.
 _MAP_SAVE_VIDEOS = os.environ.get('TINYNAV_MAP_SAVE_VIDEOS', '0') == '1'
 
-# Retrieval scheme. 'bow' is DBoW3 over ORB, the scheme the maps on the board were
-# built with. 'vlad' is VLAD over BPU SuperPoint: no 407 MB vocabulary and no
-# patch_tokens.db, but the map and the relocalization must use the same value or
-# every query misses -- so one variable feeds the build and both map_node launches.
-_LOOP_CLOSURE_MODE = os.environ.get('TINYNAV_LOOP_CLOSURE_MODE', 'bow')
+# Retrieval scheme. 'vlad' is VLAD over BPU SuperPoint; 'bow' is DBoW3 over ORB. The map
+# and the relocalization must use the same value or every query misses, so one variable
+# feeds the build and both map_node launches -- and a map built under one is unusable
+# under the other.
+#
+# vlad is the default since 2026-08-25. bow was, and it costs accuracy that shows up as
+# relocalization simply failing: measured 2026-08-24 on a freshly built map, 64% success
+# (34/53), with every failure being retrieval rather than depth -- the top candidates
+# carried 11-23 ORB matches against ~184 on the successes, and DBoW3 similarity separated
+# them by 0.051-0.061 against 0.078-0.085, which is almost no contrast at all. SP+VLAD
+# measured 96.8% on this board. It costs more per keyframe (876 ms against 477), so it
+# wants the keyframe rate cap in looper_bridge_node to be sized for it.
+_LOOP_CLOSURE_MODE = os.environ.get('TINYNAV_LOOP_CLOSURE_MODE', 'vlad')
 
 
 def _retrieval_argv() -> list[str]:

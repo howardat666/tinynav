@@ -328,6 +328,16 @@ class MapNode(Node):
         (self.loop_similarity_threshold, self.loop_top_k,
          self.relocalization_threshold, self.relocalization_loop_top_k) = \
             LOOP_CLOSURE_DEFAULTS[self.loop_closure_mode]
+        # 这一行以前不存在，检索方案只能靠日志里冒出 "ORBMatcher flann" 反推 —— 而一次
+        # 用错方案的 run 和一次用对的 run 在日志里长得一模一样，直到重定位开始莫名其妙地失败。
+        # 阈值一起打出来：它们是按方案取的，两套的量纲完全不同。
+        self.get_logger().info(
+            f"retrieval: {self.loop_closure_mode} "
+            f"({'DBoW3 over ORB' if self.loop_closure_mode == 'bow' else 'VLAD over BPU SuperPoint' if self.loop_closure_mode == 'vlad' else 'DINOv2 embedding + LightGlue'}), "
+            f"loop_sim>={self.loop_similarity_threshold} top_k={self.loop_top_k}, "
+            f"reloc_sim>={self.relocalization_threshold} top_k={self.relocalization_loop_top_k}"
+            + (f", vocab={self.dbow3_vocabulary_path}" if self.loop_closure_mode == "bow" else "")
+        )
         # Straight-line pursuit radius for /control/target_pose. 2.0 m sits at the
         # 1.82 m median the old arc-length walk was actually producing, so a healthy
         # path aims where it always did; the change is that a folded one no longer
