@@ -264,6 +264,9 @@ class MapNode(Node):
         self._reloc_start_monotonic = time.monotonic()
         self._reloc_window_t0 = self._reloc_start_monotonic
         self._reloc_last_window = None
+        # 上次重定位成功时最佳候选帧在地图中的位置。用来判断检索指得对不对：车连续走几米，
+        # 候选也该连续移动几米；跳到几十米外就是检索错了，而那种错会被记成 pnp_inliers 不足。
+        self._last_reloc_ref_xyz = None
         self._reloc_last_success_monotonic = None
         # Paired wall clock for the same event, for the status panel only: monotonic
         # cannot be aged by another process, and the panel wants a live "N s ago".
@@ -1090,6 +1093,9 @@ class MapNode(Node):
                 timestamp_in_map = int(candidate["timestamp"])
                 similarity = float(candidate["similarity"])
                 reference_keyframe_pose = self.map_poses[timestamp_in_map]
+                cand_xyz = np.asarray(reference_keyframe_pose)[:3, 3]
+                cand_jump = (float(np.linalg.norm(cand_xyz - self._last_reloc_ref_xyz))
+                             if self._last_reloc_ref_xyz is not None else float("nan"))
                 t_db = time.perf_counter()
                 reference_depth, _, reference_features, _, _ = self.db.get_depth_embedding_features_images(timestamp_in_map)
                 # A map built with ORB has only ORB descriptors, so evaluating a
@@ -1117,12 +1123,14 @@ class MapNode(Node):
                     point_3d_in_world_arrays.append(point_3d_in_world[inliers])
                     point_2d_in_keyframe_arrays.append(keyframe_matched_keypoints[inliers])
                     candidate_summaries.append(
-                        f"{timestamp_in_map}:sim={similarity:.3f},matches={len(matches)},valid_depth={int(np.count_nonzero(inliers))}"
+                        f"{timestamp_in_map}:sim={similarity:.3f},matches={len(matches)},"
+                        f"valid_depth={int(np.count_nonzero(inliers))},jump={cand_jump:.1f}m"
                     )
                     stats["cand_valid_depth"].append(int(np.count_nonzero(inliers)))
                 else:
                     candidate_summaries.append(
-                        f"{timestamp_in_map}:sim={similarity:.3f},matches={len(matches)}<{self.reloc_min_matches}"
+                        f"{timestamp_in_map}:sim={similarity:.3f},matches={len(matches)}"
+                        f"<{self.reloc_min_matches},jump={cand_jump:.1f}m"
                     )
                     stats["cand_valid_depth"].append(0)
                 stats["cand_matches"].append(int(len(matches)))
@@ -1181,6 +1189,9 @@ class MapNode(Node):
                     # Last line of defence: the camera has to end up somewhere the
                     # map actually covers. This catches any remaining ill-posed
                     # solve regardless of how it arose.
+                    if candidates:
+                        self._last_reloc_ref_xyz = np.asarray(
+                            self.map_poses[int(candidates[0]["timestamp"])])[:3, 3].copy()
                     pose_ok, pose_detail = self._pose_is_within_map(T)
                     if not pose_ok:
                         self.get_logger().info(f"Relocalization candidate timing ms: {'; '.join(candidate_timing_summaries)}")

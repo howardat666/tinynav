@@ -274,7 +274,10 @@ DIFFCAR_CONFIG = RobotConfig(
     # narrower: an obstacle that only becomes visible after the car commits gets 0.70 m
     # of reaction distance instead of 0.35, and cmd_vel_control has no brake of its own --
     # a planning stall stops the car only when the trajectory expires.
-    max_vx=0.6,
+    # 2026-08-25 收回 0.3：调到 0.6 时导航还没跑通（车因为「无目标 → 原地路径」根本没走
+    # 起来），提速的收益无从验证，而重规划周期一旦跟不上，速度越高冲得越远。等重定位稳住
+    # 再谈提速。注意下面那条注释里"导航的 0.3"说的就是这个值。
+    max_vx=0.3,
     max_reverse_vx=0.2,
     # 1.05, matching the pi/3 the trajectory library samples: at 0.8 every turn the
     # planner scored was clipped 31% on its way to the wheels. Wheel speed is not the
