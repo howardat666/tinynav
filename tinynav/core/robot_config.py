@@ -279,10 +279,12 @@ DIFFCAR_CONFIG = RobotConfig(
     # narrower: an obstacle that only becomes visible after the car commits gets 0.70 m
     # of reaction distance instead of 0.35, and cmd_vel_control has no brake of its own --
     # a planning stall stops the car only when the trajectory expires.
-    # 2026-08-25 收回 0.3：调到 0.6 时导航还没跑通（车因为「无目标 → 原地路径」根本没走
-    # 起来），提速的收益无从验证，而重规划周期一旦跟不上，速度越高冲得越远。等重定位稳住
-    # 再谈提速。注意下面那条注释里"导航的 0.3"说的就是这个值。
-    max_vx=0.3,
+    # 0.5。前一句"速度越高冲得越远"的担忧本身是对的，但它的解法不是压低上限 —— 轨迹库
+    # 采 7 档速度（linspace(0, max_vx, 7)），现在每档按自己的速度要求视距
+    # （v x reaction_time_s，见 planning_node._motion_gate_penalty），所以宽敞处才敢用
+    # 高档、窄处自动落到低档。配套改的是探针量程 0.5 -> 1.2 m：0.5 时 front_clearance 的
+    # p90 就是饱和值 0.50，看不到 0.5 m/s 需要的 0.80 m，也就无从判断敢不敢快。
+    max_vx=0.5,
     max_reverse_vx=0.2,
     # 1.05, matching the pi/3 the trajectory library samples: at 0.8 every turn the
     # planner scored was clipped 31% on its way to the wheels. Wheel speed is not the
@@ -307,7 +309,11 @@ DIFFCAR_CONFIG = RobotConfig(
     # rear corner now sweeps in an in-place turn (the old car swept 0.078). At 0.2 the
     # gate would open with 0.049 m of slack, i.e. the pivot gets collision-refused before
     # the gate has bought anything, and the escape hatch runs instead.
-    front_blocked_m=0.3,
+    # 0.2：前进被**完全**禁掉的下限。以前 0.3 是"禁掉所有前进"的一刀切门限，而 0.3 比车
+    # 一个周期加位姿滞后走的距离（约 0.42 m）还短，所以它拦不住车、只能在车已经楔进去之后
+    # 报警。现在分档门限接管了"该多快"，这个值只回答"什么时候彻底别再往前"。
+    # 0.2 和最慢一档自洽：0.5/6 = 0.083 m/s x 1.6 s = 0.13 m，取 max 后是 0.2。
+    front_blocked_m=0.2,
 )
 
 ROBOT_CONFIGS = {

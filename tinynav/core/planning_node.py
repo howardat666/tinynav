@@ -126,8 +126,14 @@ def generate_predefined_trajectory_vocabularies(
     params = []
 
     # constant reverse trajectory
-    # vx = -0.2 m/s, omega = 0
-    reverse_speed = 0.2
+    # 0.06 m/s x 3 s = 0.18 m。原来是 0.2 m/s = 0.6 m，两个问题：
+    # (1) 0.6 m 直退落到"没走过"的地方 —— 车卡住时朝向已偏离到达朝向 40~60°，
+    #     0.6 m 的落点离历史轨迹 46~54 cm，_retreat_index 的 20 cm 容差必然拒绝；
+    #     0.18 m 在任何朝向下的偏差都只有约 15 cm，能过（2026-08-25 实测几何）。
+    # (2) 退 0.10 m 就足以让 esdf_at_robot 从 0.22 越过原地转的扫过半径 0.251 m，
+    #     即"退一点点就能转了"，根本不需要 0.6 m。
+    # 速度小还有一层：车后方的格子从来没被观测过，0.06 m/s 撞上去的动能是 0.2 m/s 的 1/11。
+    reverse_speed = 0.06
     p = init_p.copy()
     q = quat_to_matrix(init_q)
     # omega is zero for this vocabulary, so the orientation never changes: the
@@ -311,7 +317,7 @@ class PlanningNode(Node):
         self._retreat_min_step_m = 0.02
         self._retreat_match_m = 0.20        # 采样点离历史轨迹这么近才算"待过"。车体半宽 0.175，
                                             # 即后退路径不得偏离车身实际压过的范围一个身位以上
-        self._retreat_max_s = 2.0           # 连续后退的上限，防止一路倒回起点
+        self._retreat_max_s = 4.0           # 上限。0.06 m/s x 4 s = 0.24 m，够让原地转重新可行
         self._retreat_start_ns = 0
         # 脱困持续这么久还没脱出去就别再摆了，直接退。2026-08-25 19:12 实测：58 s 的
         # turn-only 段里 escape_clear 在 >0.50m 和 0.1x m 之间来回跳，于是"净空够就转"
@@ -333,7 +339,14 @@ class PlanningNode(Node):
         self._last_diag_ns = 0
         # How far the forward probe looks. Past this it reports the
         # sentinel max+1.0, which is not a distance -- see _clearance_along.
-        self.front_probe_max_m = 0.5
+        # 0.5 -> 1.2 m。0.5 时 front_clearance 的 p90 就是 0.50，是饱和值 —— 看不到更远，
+        # 也就无法支撑一个随速度变大的门限。1.2 m 覆盖 max_vx=0.5 需要的 0.80 m。
+        self.front_probe_max_m = 1.2
+        # 从"承诺一条轨迹"到"能改指令"之间车会走 v x reaction_time_s。实测规划周期 p50
+        # 1.11 s + 位姿滞后 stamp_lag p50 0.43 s = 1.54 s，取 1.6 s 留一点余量。
+        # 旧的固定 30 cm 门限比这个距离还短，所以它在物理上拦不住车 —— 2026-08-25 实测
+        # 从 front>0.50 到 front=0.12 只用了 3 秒，车是自己开进楔死点的。
+        self.reaction_time_s = 1.6
         self._last_loop_ns = 0
         self._loop_period_s = None
         # How long /control/target_pose must go quiet before proximity to it counts as
@@ -577,7 +590,12 @@ class PlanningNode(Node):
                     scores[i] = 0.0
         return scores, occ_points
 
-    def _motion_gate_penalty(self, param, front_blocked):
+    def _front_gate_m(self):
+        """前进被完全禁掉的净空阈值。取"最慢一档前进所需视距"和配置下限的较大者。"""
+        return max(self.robot.front_blocked_m,
+                   (self.robot.max_vx / 6.0) * self.reaction_time_s)
+
+    def _motion_gate_penalty(self, param, front_clearance, front_blocked):
         """1e9 on any motion this sensor cannot vouch for, 0.0 otherwise.
 
         The occupancy grid is written only by forward raycasting, so a reverse
@@ -585,15 +603,19 @@ class PlanningNode(Node):
         camera never looked at. Measured 2026-08-10 19:19: 40 s of vx=-0.2 straight
         into an obstacle while up to 100 of the 106 trajectories were collision-free,
         because the old gate made reverse the *only* admissible option whenever the
-        front was blocked and the library holds exactly one reverse."""
+        front was blocked and the library holds exactly one reverse.
+
+        前进不再一刀切。每条轨迹按**它自己的速度**要求视距：承诺它到能改指令之间车会走
+        v x reaction_time_s，那段距离内不能有东西。这才是"宽敞跑快、窄处爬慢"—— 旧的
+        二值门限在 0.3 m 处把所有速度一起禁掉，于是要么全速要么完全不许前进。"""
         is_reverse = param[0] < 0.0
         if is_reverse:
             return 0.0 if (front_blocked and self.robot.allow_reverse) else 1e9
-        if front_blocked and not self._is_turn_in_place(param):
-            # Blocked ahead: turn until the camera faces a way out. Turning in place is
-            # the only motion whose swept volume the camera has already observed.
-            return 1e9
-        return 0.0
+        if self._is_turn_in_place(param):
+            # Turning in place is the only motion whose swept volume the camera has
+            # already observed, so the front probe does not gate it.
+            return 0.0
+        return 0.0 if front_clearance >= param[0] * self.reaction_time_s else 1e9
 
     def _record_centre(self, centre, now_ns):
         """车体中心的近期轨迹，供 _retreat_index 判断"后面走过没有"。
@@ -757,7 +779,7 @@ class PlanningNode(Node):
         d_from_face = float(np.min(along[in_corridor])) - fl
         return d_from_face if d_from_face <= max_dist else max_dist + 1.0
 
-    def _front_obstacle_dist(self, T, obstacle_mask, max_dist=0.5):
+    def _front_obstacle_dist(self, T, obstacle_mask, max_dist=1.2):
         """Clearance in the corridor the robot is currently facing."""
         center = self.camera_to_robot_center(T)
         fwd = T[:3, :3] @ np.array([0.0, 0.0, 1.0])
@@ -919,8 +941,8 @@ class PlanningNode(Node):
             'frontClearanceM': (None if front_clearance > self.front_probe_max_m
                                 else round(float(front_clearance), 2)),
             'frontProbeMaxM': round(float(self.front_probe_max_m), 2),
-            'frontBlocked': bool(front_clearance <= self.robot.front_blocked_m),
-            'frontBlockedAtM': round(float(self.robot.front_blocked_m), 2),
+            'frontBlocked': bool(front_clearance <= self._front_gate_m()),
+            'frontBlockedAtM': round(float(self._front_gate_m()), 2),
             'obstacleCells': int(np.count_nonzero(obstacle_mask)),
             'esdfAtRobotM': (None if not np.isfinite(esdf_at_robot)
                              else round(float(esdf_at_robot), 2)),
@@ -1196,10 +1218,14 @@ class PlanningNode(Node):
             scores, occ_points = self._score_trajectories(trajectories, ESDF_map, params)
 
         with Timer(name='pub', text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=_TIMER_LOGGER):
-            front_blocked = front_clearance <= self.robot.front_blocked_m
+            # "前方堵住" = 连最慢的那档前进都过不了视距门限。轨迹库把速度采成
+            # linspace(0, max_vx, 7)，所以最慢的非零档是 max_vx/6。留一个下限：低于它就
+            # 别再试前进了，交给转向/后退。
+            front_blocked = front_clearance <= self._front_gate_m()
 
             def cost_function(traj, param, score, target_pose):
-                gate_penalty = self._motion_gate_penalty(param, front_blocked)
+                gate_penalty = self._motion_gate_penalty(
+                    param, front_clearance, front_blocked)
 
                 # regular trajectory penalty
                 traj_end = np.array(traj[-1,:3])
@@ -1230,7 +1256,7 @@ class PlanningNode(Node):
                 self._publish_static_path(
                     init_p, init_q, depth_msg.header, base_time, len(trajectories[0]),
                     f"All {len(scores)} trajectories in collision "
-                    f"(front_clearance={self._fmt_clearance(front_clearance)}, gate="
+                    f"(front_clearance={self._fmt_clearance(front_clearance, self.front_probe_max_m)}, gate="
                     f"{'turn only' if front_blocked else 'forward only'}, "
                     f"obstacle_cells={int(np.count_nonzero(obstacle_mask))}, "
                     f"esdf_at_robot={self._esdf_at(ESDF_map, init_p):.2f}m, "
@@ -1281,7 +1307,7 @@ class PlanningNode(Node):
                     self._publish_static_path(
                         init_p, init_q, depth_msg.header, base_time, len(trajectories[0]),
                         f"No admissible motion: {n_blocked}/{len(scores)} in collision and the rest "
-                        f"gated (front_clearance={self._fmt_clearance(front_clearance)}, "
+                        f"gated (front_clearance={self._fmt_clearance(front_clearance, self.front_probe_max_m)}, "
                         f"gate={'turn only' if front_blocked else 'forward only'}, "
                         f"turns_left={len(turns)}, "
                         f"esdf_at_robot={self._esdf_at(ESDF_map, init_p):.2f}m, "
@@ -1342,7 +1368,7 @@ class PlanningNode(Node):
                     f"decision: {'RETREAT ' if retreating else ''}"
                     f"{'TURN-IN-PLACE ' if turned_in_place else ''}chose vx={params[best_idx][0]:+.3f} omega={params[best_idx][1]:+.3f} "
                     f"(cap {self.robot.max_vx:.2f}) blocked={n_blocked}/{len(scores)} "
-                    f"front_clearance={self._fmt_clearance(front_clearance)} "
+                    f"front_clearance={self._fmt_clearance(front_clearance, self.front_probe_max_m)} "
                     f"gate={'turn-only' if front_blocked else 'forward'} "
                     f"escape={escape_reason or 'off'} turns={len(turns)} "
                     f"escape_age={((now_ns - self._escape_episode_ns) / 1e9) if self._escape_episode_ns else 0.0:.1f}s "
