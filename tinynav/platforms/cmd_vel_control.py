@@ -499,11 +499,17 @@ class CmdVelControlNode(Node):
         wz = float(np.clip(wz, -self.robot.max_yaw, self.robot.max_yaw))
 
         heading_to_goal = self._wrap_angle(float(self._path_ref[-1, 2]) - robot_yaw)
-        if (
-            np.linalg.norm(robot_pos[:2] - self._path_ref[-1, :2]) < 0.1
-            and abs(heading_to_goal) < 0.1
-        ):
-            self._publish_zero("local trajectory endpoint reached")
+        dist_to_end = float(np.linalg.norm(robot_pos[:2] - self._path_ref[-1, :2]))
+        if dist_to_end < 0.1 and abs(heading_to_goal) < 0.1:
+            # 这条日志一度是最大的误导源：障碍物封路时规划器只能给出原地不动的轨迹，其终点就在
+            # 车脚下，于是"到达"和"无路可走"共用同一句话。带上轨迹本身的长度就能分开两者 ——
+            # traj_len 接近 0 是被困住，接近 vx*duration 才是真的走完了。
+            traj_len = float(np.linalg.norm(np.diff(self._path_ref[:, :2], axis=0), axis=1).sum())
+            self._publish_zero(
+                "local trajectory endpoint reached",
+                f"dist_to_end={dist_to_end:.3f}m heading_err={heading_to_goal:+.3f}rad "
+                f"traj_len={traj_len:.2f}m poses={len(self._path_ref)}",
+            )
             return
 
         cmd = Twist()

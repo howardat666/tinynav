@@ -229,11 +229,18 @@ class LoopClosure:
                 raise ValueError("vlad_centres is required when mode='vlad'")
             self.vlad_centres = np.ascontiguousarray(vlad_centres, dtype=np.float32)
             self.embeddings = np.zeros((0, self.vlad_centres.size), dtype=np.float32)
-            rows = [self._vlad_for(ts) for ts in self.timestamps]
-            if rows:
-                # float32 on purpose: the A55 has no usable float16/int8 matmul, so a
-                # narrower index costs 2-7x the search time to save memory.
-                self.embeddings = np.ascontiguousarray(np.stack(rows, axis=0), dtype=np.float32)
+            # 现算一次 837 个关键帧要 30.1 秒，是「点击 nav」那 30.9 秒等待的 97.5%
+            # (2026-08-25 实测 map load timing)。算完存盘，之后直接读。
+            cached = self._load_vlad_index()
+            if cached is not None:
+                self.embeddings = cached
+            else:
+                rows = [self._vlad_for(ts) for ts in self.timestamps]
+                if rows:
+                    # float32 on purpose: the A55 has no usable float16/int8 matmul, so a
+                    # narrower index costs 2-7x the search time to save memory.
+                    self.embeddings = np.ascontiguousarray(np.stack(rows, axis=0), dtype=np.float32)
+                    self._save_vlad_index()
         elif self.mode == "embedding":
             if len(self.timestamps) == 0:
                 self.embeddings = np.zeros((0, 1), dtype=np.float32)
@@ -299,6 +306,49 @@ class LoopClosure:
         else:
             cand_features = self.db.get_features(ts)
             self.dbow3_engine.add(cand_features)
+
+    def _vlad_index_path(self) -> str | None:
+        base = getattr(self.db, "map_save_path", None)
+        if not base or getattr(self.db, "is_scratch", True):
+            return None
+        return os.path.join(str(base), "vlad_index.npz")
+
+    def _vlad_fingerprint(self) -> str:
+        """词典 + 时间戳序列。顺序变了必须失效 —— 行序错位会静默给出错误位姿。"""
+        import hashlib
+        c = hashlib.sha1(self.vlad_centres.tobytes()).hexdigest()[:16]
+        t = hashlib.sha1(np.asarray(self.timestamps, dtype=np.int64).tobytes()).hexdigest()[:16]
+        return f"{c}-{t}-{len(self.timestamps)}"
+
+    def _load_vlad_index(self) -> np.ndarray | None:
+        path = self._vlad_index_path()
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            with np.load(path, allow_pickle=False) as z:
+                if str(z["fp"]) != self._vlad_fingerprint():
+                    logger.info("vlad index cache stale, recomputing")
+                    return None
+                emb = np.ascontiguousarray(z["emb"], dtype=np.float32)
+            if emb.shape[0] != len(self.timestamps):
+                return None
+            logger.info(f"vlad index loaded from cache: {emb.shape}")
+            return emb
+        except Exception as exc:
+            logger.info(f"vlad index cache unreadable ({exc}), recomputing")
+            return None
+
+    def _save_vlad_index(self) -> None:
+        path = self._vlad_index_path()
+        if not path or self.embeddings.shape[0] != len(self.timestamps):
+            return
+        try:
+            tmp = path + ".tmp"
+            np.savez(tmp, emb=self.embeddings, fp=np.array(self._vlad_fingerprint()))
+            os.replace(tmp, path)
+            logger.info(f"vlad index cached: {self.embeddings.shape} -> {path}")
+        except OSError as exc:
+            logger.info(f"could not cache vlad index: {exc}")
 
     def _vlad_for(self, timestamp: int) -> np.ndarray:
         from tinynav.core.bow_retrieval import valid_superpoint_descriptors

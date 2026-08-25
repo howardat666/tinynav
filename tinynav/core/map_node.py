@@ -347,6 +347,8 @@ class MapNode(Node):
         # 阈值一起打出来：它们是按方案取的，两套的量纲完全不同。
         (self.reloc_min_matches, self.reloc_min_landmarks,
          self.reloc_min_inliers) = _RELOC_GATES.get(self.loop_closure_mode, (20, 40, 20))
+        # 实测通过的解占比 28-53%，被挡的 14-21%。0.25 卡在这条缝里。
+        self.reloc_min_inlier_ratio = float(os.environ.get("TINYNAV_RELOC_MIN_INLIER_RATIO", "0.25"))
         self.get_logger().info(
             f"retrieval: {self.loop_closure_mode} "
             f"({'DBoW3 over ORB' if self.loop_closure_mode == 'bow' else 'VLAD over BPU SuperPoint' if self.loop_closure_mode == 'vlad' else 'DINOv2 embedding + LightGlue'}), "
@@ -1165,7 +1167,13 @@ class MapNode(Node):
                         f"({len(idx) / len(point_3d_in_world_list):.0%}), gate>={self.reloc_min_inliers}, "
                         f"reproj px p50={float(np.median(err)):.2f} p90={float(np.percentile(err, 90)):.2f} "
                         f"max={float(err.max()):.2f}")
-                if success and len(inliers) >= self.reloc_min_inliers:
+                # 绝对数之外再看占比。重投影误差不能当门槛用：它只在内点上算，内点越少越
+                # 容易好看 —— 实测 7/49(14%) 的 p50 是 2.66 px，比 31/58(53%) 的 4.00 px
+                # "更好"，那是 RANSAC 过拟合到少数点的症状，不是解更准。占比才能挡住它。
+                inlier_ratio = (0.0 if inliers is None or len(point_3d_in_world_list) == 0
+                                else len(inliers) / len(point_3d_in_world_list))
+                if (success and len(inliers) >= self.reloc_min_inliers
+                        and inlier_ratio >= self.reloc_min_inlier_ratio):
                     R, _ = cv2.Rodrigues(rvec)
                     T = np.eye(4)
                     T[:3, :3] = R
