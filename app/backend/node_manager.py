@@ -81,6 +81,22 @@ _ROBOT_TYPE = os.environ.get('TINYNAV_ROBOT_TYPE', 'go2')
 # numpy, so this does not pull the planning stack into the backend.
 _ROBOT = robot_config(_ROBOT_TYPE)
 _ACTUATOR = os.environ.get('TINYNAV_ACTUATOR', 'unitree')
+
+# 调度优先级（nice，越小越优先）。板上 8 核实测 CPU 619%/800% = 77% 但 load 11.3 ——
+# 还有两成空闲却有近一倍线程在排队，所以瓶颈是排队延迟而不是吞吐量，调优先级能直接
+# 减小控制环抖动而不用削减任何工作量。
+#
+# map_node 故意不在表里：它是最重的消费者，提高它只会从下面这条链上抢走 CPU。
+# 后端自己（uvicorn）也故意不降：teleop 的 20 Hz 服务端重发住在后端里，而里程计侧有
+# 0.5 s 看门狗 —— 饿死后端会让手动遥控时轮子一顿一顿的。
+_NICE_BY_NAME = {
+    'cmd_vel_control': -10,   # 20 Hz 定时器，抖动直接变成轮速抖动
+    'diffcar_control': -10,   # 同上，且串口读自带看门狗
+    'wheel_odometry': -10,
+    'looper_bridge': -5,      # 饿死它就是关键帧饿死，也就是 target 跳变的根因
+    'planning': -5,           # 「轨迹过期」是已经复现过的失效模式
+    'bag_record': 5,          # 只管落盘，不该和实时链抢
+}
 _ODOM_SOURCE = os.environ.get('TINYNAV_ODOM_SOURCE', 'vio')
 
 # Which odometry the *offline map build* replays out of the bag, independent of
@@ -1602,11 +1618,26 @@ class BackendNode(Ros2NodeManager):
         """Spawn a subprocess with standard logging and process-group setup."""
         lf = self._make_log(name)
         run_env = self._normalize_run_env(env)
+        nice = _NICE_BY_NAME.get(name)
+
+        def _child_setup():
+            os.setsid()
+            if nice is not None:
+                # 绝对值，不用 os.nice() 的增量语义 —— 否则父进程的 nice 一变，子进程
+                # 的优先级就跟着漂。负值需要 CAP_SYS_NICE，失败就用默认值继续，绝不
+                # 因为调不了优先级而让节点起不来。
+                try:
+                    os.setpriority(os.PRIO_PROCESS, 0, nice)
+                except OSError:
+                    pass
+
         proc = subprocess.Popen(
-            cmd, preexec_fn=os.setsid, cwd=cwd,
+            cmd, preexec_fn=_child_setup, cwd=cwd,
             env=run_env,
             stdout=lf, stderr=subprocess.STDOUT,
         )
+        if nice is not None:
+            print(f'{name}: nice={nice} pid={proc.pid}', flush=True)
         lf.close()
         return proc
 

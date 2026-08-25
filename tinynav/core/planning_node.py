@@ -274,9 +274,14 @@ class PlanningNode(Node):
         self._last_stale_log_ns = 0
         self.camerainfo_sub = self.create_subscription(CameraInfo, '/camera/camera/infra2/camera_info', self.info_callback, 10)
 
-        self.grid_shape = (100, 100, 10)
+        # z 是 13 层而不是 10：栅格以相机为中心时只覆盖相机 ±0.5 m，robot_z_top 再大也会
+        # 被栅格自己截断。椅子座面在地面 0.45 m（相机上方 0.27 m）刚好在旧上限边缘。
+        self.grid_shape = (100, 100, 13)
         self.resolution = 0.1
-        self.origin = np.array(self.grid_shape) * self.resolution / -2.
+        # 把栅格在 z 上抬起来，使它覆盖相机 -0.3 .. +1.0 m 而不是对称的 ±0.65。地面在相机
+        # 下方 0.18 m，往下留 1 层余量够了；省下的层全给上方。
+        self.grid_offset = np.array([0.0, 0.0, 0.35])
+        self.origin = np.array(self.grid_shape) * self.resolution / -2. + self.grid_offset
         self.step = 10
         self.occupancy_grid = np.zeros(self.grid_shape)
         # 每个 2D 格子最后一次"是障碍"的时刻。占据栅格没有任何时间衰减 —— 只有射线穿过时
@@ -698,7 +703,9 @@ class PlanningNode(Node):
         msg.info.height = mask.shape[0]
         msg.info.origin.position.x = self.origin[0]
         msg.info.origin.position.y = self.origin[1]
-        msg.info.origin.position.z = self.origin[2] + self.grid_shape[2] * self.resolution / 2
+        # 画在机器人所在高度，而不是栅格的几何中心 -- 栅格在 z 上是偏置的。
+        msg.info.origin.position.z = (self.origin[2] - self.grid_offset[2]
+                                      + self.grid_shape[2] * self.resolution / 2)
         msg.info.origin.orientation.w = 1.0
         # array.array, not .tolist(). OccupancyGrid.data is int8[], and rclpy's fast
         # path for a primitive sequence is an array.array with the matching typecode;
@@ -912,12 +919,16 @@ class PlanningNode(Node):
             cx, cy = self.K[0, 2], self.K[1, 2]
 
         with Timer(name='raycasting', text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=_TIMER_LOGGER):
-            center = self.origin + np.array(self.grid_shape) * self.resolution / 2
+            # 减掉 grid_offset 才是「栅格当前对准的机器人位置」。不减的话 z 上永远差
+            # 0.35 m，每个周期都判定需要重定心并整体 roll 一次栅格。
+            center = (self.origin + np.array(self.grid_shape) * self.resolution / 2
+                      - self.grid_offset)
             robot_pos = T[:3, 3]
             delta = robot_pos - center
             if np.linalg.norm(delta) > .1:
                 new_center = robot_pos
-                new_origin = new_center - np.array(self.grid_shape) * self.resolution / 2
+                new_origin = (new_center - np.array(self.grid_shape) * self.resolution / 2
+                              + self.grid_offset)
                 self.occupancy_grid, self.origin = roll_occupancy_grid(self.occupancy_grid, self.origin, new_origin, self.resolution)
             new_occ = run_raycasting_loopy(depth, T, self.grid_shape, fx, fy, cx, cy, self.origin, self.step, self.resolution)
             self.occupancy_grid *= 0.99
