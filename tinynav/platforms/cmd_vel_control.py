@@ -202,6 +202,9 @@ class CmdVelControlNode(Node):
         self._odom_pose_initialized = False
 
         self._odom_stamp_sec = None
+        # 收到最后一条位姿的墙钟时刻。必须独立于位姿自己的时间戳 —— 见 _control_loop 里
+        # 的失速判据。
+        self._odom_rx_monotonic = None
 
         # columns: x, y, yaw, v_ref, w_ref, t_abs
         self._path_ref = None
@@ -254,6 +257,11 @@ class CmdVelControlNode(Node):
         # 25, not main's 12: this is not main's controller -- x5 rewrote it as a
         # time-parameterised Samson-type tracker -- and its stability at 12 Hz has not
         # been measured on the floor. 25 is still a 4x cut. Lower it once measured.
+        # 位姿流失速多久就刹车。0.4 s = vio_image 20 Hz 下漏 8 帧，0.3 m/s 下多走 12 cm。
+        # 比 planning 的 max_input_age_s 和 diffcar 的 cmd_timeout_s（都 0.5）更紧一点：
+        # 这是最后一道刹车，晚于它们没有意义。
+        self.declare_parameter("odom_stale_s", 0.4)
+        self._odom_stale_s = float(self.get_parameter("odom_stale_s").value)
         self.declare_parameter("cmd_rate_hz", 25.0)
         self._cmd_rate_hz = float(self.get_parameter("cmd_rate_hz").value)
         self.create_timer(1.0 / self._cmd_rate_hz, self._control_loop)
@@ -295,6 +303,7 @@ class CmdVelControlNode(Node):
         self._last_odom_stamp_sec = odom_stamp_sec
 
         self._odom_stamp_sec = odom_stamp_sec
+        self._odom_rx_monotonic = time.monotonic()
         if self._debug_recorder is not None:
             self._debug_recorder.record_odom(
                 time.time_ns(),
@@ -458,6 +467,21 @@ class CmdVelControlNode(Node):
         if self._nav_paused:
             self._publish_zero("nav paused")
             return
+
+        # 位姿流失速 —— 用墙钟量，这是关键。_now_sec() 返回的是位姿自己的时间戳，所以上游
+        # 一停它就冻住，`_trajectory_expired` 会永远算出同一个「没过期」：轨迹过期这道刹车
+        # 恰好对它本该拦下的那种故障失明。2026-08-25 18:32 实测 —— 原地旋转让 VIO 丢跟踪、
+        # 固件报了 restart 成功却 43 秒不发布，跟踪器就拿冻住的位姿把同一条旋转指令以
+        # 25 Hz 重发了 43 秒；下游 diffcar 的 0.5 s 看门狗看到的是"新鲜"消息，从不触发。
+        # 车一直转，VIO 又因为一直转而恢复不了 —— 正反馈，最后是人按 Pause 打断的。
+        if self._odom_rx_monotonic is not None:
+            age = time.monotonic() - self._odom_rx_monotonic
+            if age > self._odom_stale_s:
+                self._publish_zero(
+                    "pose stream stalled",
+                    f"no {self._pose_topic} for {age:.2f}s (limit {self._odom_stale_s:.2f}s)",
+                )
+                return
 
         if self._path_ref is None:
             self._publish_zero("no /planning/trajectory_path arrived yet")

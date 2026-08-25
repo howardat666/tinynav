@@ -1174,3 +1174,73 @@ looper 模式下 bridge 只订阅 infra1，于是**左目有订阅者就成了�
 
 **最大的一块是 Python import 的 8.5 秒**，不是地图、不是重定位。§8.19 把 30 s 砍到 3.8 s 之后，剩下的大头换人了。另外 decision 的 `cycle` 有一次 36.8 s 离群 —— 那是同步代码后首次 nav 的 numba 重编译，符合预期。
 
+## 8.24 🔴🔴 转 45 秒停不下来：刹车用的是已经停掉的那条流自己的时钟
+
+18:31 那轮一开始就原地转圈、点云不更新。四条日志拼起来是一个正反馈死循环。
+
+```
+18:32:12.6  planning  TURN-IN-PLACE gate=turn-only fc=0.22m gain=-0.00  omega=-0.150
+18:32:13.7  cmd_vel   sent vx=0.002 vyaw=0.154
+18:32:13.9  bridge    sync_callback  ← 最后一条
+18:32:15.9  固件      "VIO restarted successfully after tracking lost"
+18:32:13~58 diffcar   目标=-0.025/+0.027 恒定不变，轮子一直转
+18:32:58.2  cmd_vel   nav paused = True        ← 人按了 Pause
+18:32:58.6  bridge    sync_callback 恢复       ← 车一停 VIO 就回来了
+```
+
+### 环节 1：原地旋转把 VIO 打丢了
+
+原地转没有平移就没有视差，MSCKF 丢跟踪。固件 18:32:15.90 报 `VIO restarted successfully after tracking lost`，**但直到 18:32:58.5 才真正恢复发布 —— 报成功之后又哑了 43 秒**，正是 [[vio-tracking-lost-wedges-insight-full]] 记过的行为，只是这次的触发不是长时间静止而是原地旋转。全天两次，都在导航中（18:10:27、18:32:13），约每轮一次。
+
+### 环节 2 🔴 轨迹过期这道刹车对它本该拦下的故障失明
+
+```python
+def _now_sec(self):
+    if self._odom_stamp_sec is not None:
+        return self._odom_stamp_sec          # ← 位姿流自己的时间戳
+    return self.get_clock().now().nanoseconds * 1e-9
+```
+
+`_trajectory_expired(now_sec)` 拿这个 `now_sec` 去比 `path_end_t`。**上游一停，`_odom_stamp_sec` 就冻住，`query_t` 也冻住，于是这个判据永远算出同一个「没过期」。** 跟踪器拿冻住的位姿和冻住的时钟反复算出同一条指令，以 25 Hz 发了 43 秒。
+
+用位姿时间戳做时基本身是对的（跟踪器是时间参数化的，必须和位姿同一时基），**错在用同一个时基去判断这条流自己有没有断**。
+
+### 环节 3：下游看门狗被"新鲜"消息骗过
+
+`diffcar_control` 有 0.5 s 的 `cmd_timeout_s` 且会把指令归零 —— 但它收到的是**每 40 ms 一条的新消息**，只是内容不变，所以永远不触发。算术对得上：`vx=0.002, vyaw=0.154`，轮距 0.32 m → 左轮 −0.0226、右轮 +0.0266，与固件报的 `目标=-0.025/+0.027` 一致。
+
+### 环节 4：车一直转 → VIO 恢复不了 → 闭环
+
+打断它的是人按 Pause。**Pause 后 0.4 秒 VIO 就恢复了**，这条时间关系本身就是"旋转在阻止恢复"的证据。
+
+### 修法：加一道用墙钟量的位姿失速刹车
+
+`_control_loop` 里在 nav_paused 之后、轨迹判据之前：
+
+```python
+age = time.monotonic() - self._odom_rx_monotonic
+if age > self._odom_stale_s:          # 0.4 s，vio_image 20 Hz 下漏 8 帧
+    self._publish_zero("pose stream stalled", ...)
+    return
+```
+
+0.4 s 比 planning 的 `max_input_age_s` 和 diffcar 的 `cmd_timeout_s`（都 0.5）更紧 —— 这是最后一道刹车，晚于它们没有意义。0.3 m/s 下多走 12 cm。
+
+⚠️ 这只治"停不下来"，不治"会丢跟踪"。原地旋转仍然会打丢 VIO；降 z 上限（§8.23）减少进入 turn-only 的次数才是治那一头。
+
+### 顺带：降 z 上限之后走廊确实松开了
+
+同一轮 18:32:58 之后 **`blocked=0/106`、`front_clearance=>0.50m`、`esdf_at_robot=1.20~1.61m`、vx 稳定 0.300** —— §8.23 的 `blocked=101/106` / `fc=0.11m` 没有再出现。
+
+## 8.25 🔴 多个 POI 不按勾选顺序走 —— map_node 把顺序 sorted 掉了
+
+前端 `_checkedIds` 是 `List<int>`、勾选时 `.add()`，界面上还给每个 POI 显示勾选序号徽章；后端 `cmd_send_pois` 的 `payload = {str(pid): ... for pid in poi_ids}` 按插入序建字典，`json.dumps` 也按插入序写。**顺序一路传到 map_node 才被丢掉：**
+
+```python
+keys = sorted([int(key) for key in self.pois.keys()])   # ← 按 POI 编号重排
+```
+
+于是实际访问顺序是**建图时保存 POI 的先后（编号升序）**，不是勾选顺序。看着像"按距离走"是因为编号顺序通常跟建图走的路线一致。
+
+改成保持发布方给的键顺序。`tool/pub_pois.py` 不受影响 —— 它已经把键重编成 `0,1,2,...`，而它的 `--pois "2,1,0"` 本来就是"按我给的顺序走"的意思，**原来的 sorted 其实也让这个参数失效了**。
+

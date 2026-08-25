@@ -583,10 +583,15 @@ class MapNode(Node):
         try:
             self.pois = json.loads(msg.data)
 
+            # 保持发布方给的键顺序，不要按编号 sorted()。后端的 cmd_send_pois 用原始 POI
+            # 编号做键、按用户勾选顺序写 JSON，排序会把它重排成建图时的保存顺序 —— 而前端
+            # 在每个 POI 上显示勾选序号徽章，于是界面承诺的顺序和实际走的顺序不一致。
+            # tool/pub_pois.py 不受影响：它已经把键重编成 0,1,2,...，而它的
+            # `--pois "2,1,0"` 本来就是"按我给的顺序走"的意思。
             pois_dict = {}
-            keys = sorted([int (key) for key in self.pois.keys()])
-            for index, key in enumerate(keys):
-                pois_dict[index] = np.array(self.pois[str(key)]["position"])
+            order = list(self.pois.keys())
+            for index, key in enumerate(order):
+                pois_dict[index] = np.array(self.pois[key]["position"])
             self.pois = pois_dict
 
             if not self.pois:
@@ -602,7 +607,8 @@ class MapNode(Node):
             self._leg_initial_length = None
             self._leg_start_time = None
             self._speed_estimate = None
-            self.get_logger().info(f"Parsed POIs: {self.pois}")
+            self.get_logger().info(
+                f"Parsed POIs (visit order = as received): keys={order} -> {self.pois}")
         except json.JSONDecodeError as e:
             self.get_logger().error(f"Failed to parse POIs JSON: {e}")
             self.pois = {}
