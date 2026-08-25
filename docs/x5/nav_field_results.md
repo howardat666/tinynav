@@ -665,3 +665,99 @@ if success and len(inliers) >= 20:  # 第三关：PnP 内点数
 - ✅ `cmd_vel_control` 的 `control loop 25 Hz (pose in at ~99 Hz)` 首次在硬件上验证
 - ⚠️ `embeddings` 库里 837 条向量 `norm=0.000` **是无害的** —— vlad 的描述子由 `_vlad_for()` 在加载地图时从 SuperPoint 特征实时计算，不读这个库（它属于 DINOv2 那条路径）。但建图时仍白存了约 2.6 MB，可清理
 - 🔴 `cmd_vel_control` 出现 215 次 `reason=local trajectory endpoint reached` —— 滚动前瞻被当成到达，老问题仍在
+
+## 8.6 🔴 「到达终点」其实是「无路可走」—— 一条误导性日志
+
+2026-08-25 下午实测：重定位修好并达到 100% 之后，车仍然基本不动。
+
+```
+163 次 vx=0.000，仅 4 次非零
+151 次 reason=local trajectory endpoint reached
+```
+
+完整因果链：
+
+```
+obstacle.dilation_cells=2  →  0.1 m/格 × 2 = 每边多 20 cm，叠加车体半宽足以封死窄通道
+        ↓
+规划器所有前进轨迹被碰撞否决，只能返回「原地不动」的轨迹
+        ↓
+该轨迹的终点就在车脚下
+        ↓
+cmd_vel_control 的到达判据（cmd_vel_control.py:493）是
+    ‖robot_pos[:2] − path_ref[−1,:2]‖ < 0.1 且 |heading_to_goal| < 0.1
+        ↓
+判定「到达」→ 每周期发零速 → 日志报 local trajectory endpoint reached
+```
+
+⚠️ **「到达终点」和「无路可走」两种完全相反的状态共用同一条日志文案**，这是排查时最大的干扰源 —— 看到它会以为导航正常结束，实际上是被困住了。
+
+**改动**：`DIFFCAR_CONFIG.obstacle.dilation_cells` 2 → 1。
+
+**判据**：规划器本身的日志已经足够回答这个问题，排查时先看它们，不要只看 cmd_vel_control：
+- `decision: chose vx=... omega=...` —— 选中的是不是原地不动
+- `All N trajectories in collision`
+- `No admissible motion: n/N in collision and the rest ...`
+
+## 8.7 阈值要从实测定，不要从单点观测外推
+
+同一个阈值我在一天内调了两次，第二次是修正第一次的过度反应：
+
+| 时刻 | vlad 的 PnP 内点门槛 | 依据 | 结果 |
+|---|---|---|---|
+| 原始 | 20（与 bow 共用） | ORB 时代 | 车在好位置时约 62% 成功 |
+| 第一次改 | **8** | 观测到「匹配数只有 12–16」 | 100% 成功，**但掺水** |
+| 第二次改 | **12** | 真实运行匹配 52–83 | 保留内点率 ≥35% 的解 |
+
+**12–16 那批数字来自车停在一个视角很差的位置**，我把它当成了 SuperPoint 的普遍水平。真实运行的匹配数是 52–83，高出四倍。降到 8 换来的 100% 里，新放行的恰恰是最差的几个：
+
+```
+inliers=9/52  (17%)  reproj p50=4.07 px   ← 8 放行，12 挡掉
+inliers=12/52 (23%)  reproj p50=4.17 px   ← 同上
+inliers=17/52 (33%)  reproj p50=4.93 px   ← 同上
+inliers=45/83 (54%)  reproj p50=2.09 px   ← 保留
+inliers=32/68 (47%)  reproj p50=1.81 px   ← 保留
+```
+
+**教训**：单个位置的观测不能外推成特征本身的性质。门槛应当由 `PnP quality:` 这条日志的实测分布来定 —— 这正是加它的目的。
+
+## 8.8 导航中的负载实测（run_stats，1 Hz）
+
+```
+temp_c=91.2~91.6   load=14.37   cpu_mhz=1500(未降频)   avail_mb=484
+user_pct=78.0      sys_pct=9.8   softirq=0.4   iowait=0.0   lo_mbs=0.01
+```
+
+| 进程 | CPU |
+|---|---|
+| insight_full（相机固件，**关不掉**） | 212.8% |
+| cmd_vel_control | **95.9%** 🔴 |
+| map_node | 90.9% |
+| looper_bridge_node | 87.9% |
+| uvicorn | 73.9% |
+| planning_node | 68.9% |
+| diffcar_control | 33.0% |
+| 合计 | **663%** / 800%（8 核） |
+
+- **温度 91.6 °C，降频线 95 °C**，只剩 3.4 °C 余量；`cpu_mhz=1500` 说明尚未降频
+- **`load=14.37` 远高于 CPU 占用（83%）** —— 大量线程在运行队列排队，是「挤」不只是「忙」
+- `lo_mbs=0.01` —— 之前记录的 17.3 MB/s 回环流量在「无建图、无预览」时不存在
+- 🔴 `cmd_vel_control` 95.9% 异常（25 Hz 定时循环不该如此），排查见下
+
+⚠️ **在饱和系统上单进程 CPU% 的可比性很差**：bridge 曾用同一份代码连测三个 60 秒窗口得到 103.6% / 108.3% / 107.6%。所以「95.9% 比优化前的 73.8% 还高」不足以断定优化失效，必须用受控探针测。
+
+## 8.9 重定位分阶段耗时（vlad，837 关键帧地图）
+
+总 643–688 ms，对 1.5 s 的关键帧间隔是 43–46% 利用率，健康。
+
+| 阶段 | 耗时 | 占比 |
+|---|---|---|
+| **match** | 234–261 ms | **37%** |
+| feature_extract | 168–213 ms | 27% |
+| candidate_search | 133–152 ms | 22% |
+| db_load | 16–27 ms | 3% |
+| embedding | 2.5–4.9 ms | 0.7% |
+
+`Generate nav path timing ms:` 总计仅 9–11 ms，**路径规划完全不是瓶颈**。
+
+新增 `map load timing ms:` 记录「点击 nav 后那段等待」的构成（地图加载全在 `map_node.__init__`）：`nav_temp_db / nav_loop_closure / poses+map_db / map_loop_closure / grids`。vlad 模式下 `map_loop_closure` 要为每个关键帧现算 VLAD，预期是大头。
