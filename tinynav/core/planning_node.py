@@ -302,12 +302,22 @@ class PlanningNode(Node):
         # 后退脱困。占据栅格只由前向射线写入，所以车后方的格子从来没被看过 —— 盲退曾经
         # 造成 40 s 的 vx=-0.2 直接撞上去（2026-08-10 19:19），这也是 reverse 一直被门掉的
         # 原因。这里换一个能证明安全的判据：只退到**自己刚刚待过**的位置去。
-        self._centre_history = deque()      # (t_ns, x, y)，只留最近 retreat_history_s
-        self._retreat_history_s = 8.0
+        self._centre_history = deque()      # (t_ns, x, y)，按路程保留，见下
+        # 按**累计路程**保留而不是按时间。2026-08-25 19:12 实测教训：车原地转了 58 s，
+        # 8 秒的时间窗里全是卡住那一个点，"开进来的那条路"早被裁掉 —— 后退恰好在最需要
+        # 的时候不可用。同时"车不动就不记"，否则卡住时重复点会把有用的历史挤出去。
+        self._retreat_history_m = 2.0
+        self._retreat_history_max_s = 60.0   # 太久的不能用：这段时间里后面可能有人走过
+        self._retreat_min_step_m = 0.02
         self._retreat_match_m = 0.20        # 采样点离历史轨迹这么近才算"待过"。车体半宽 0.175，
                                             # 即后退路径不得偏离车身实际压过的范围一个身位以上
         self._retreat_max_s = 2.0           # 连续后退的上限，防止一路倒回起点
         self._retreat_start_ns = 0
+        # 脱困持续这么久还没脱出去就别再摆了，直接退。2026-08-25 19:12 实测：58 s 的
+        # turn-only 段里 escape_clear 在 >0.50m 和 0.1x m 之间来回跳，于是"净空够就转"
+        # 这一条让它一直选转向，yaw 在 -59° 到 -131° 之间摆了近一分钟也没出来。
+        self._escape_before_retreat_s = 3.0
+        self._escape_episode_ns = 0
         # The robot's own, whole. Rebuilding it field by field wired three of five
         # through, so min_wall_span_m and occ_threshold silently kept the class default
         # no matter what a platform asked for.
@@ -584,6 +594,27 @@ class PlanningNode(Node):
             # the only motion whose swept volume the camera has already observed.
             return 1e9
         return 0.0
+
+    def _record_centre(self, centre, now_ns):
+        """车体中心的近期轨迹，供 _retreat_index 判断"后面走过没有"。
+
+        车不动就不记，且按累计路程而不是时间裁剪 —— 2026-08-25 19:12 实测：车原地转了
+        58 s，按时间保留 8 s 的窗口里全是卡住那一个点，"开进来的那条路"恰好在最需要它的
+        时候被裁掉了。"""
+        h = self._centre_history
+        x, y = float(centre[0]), float(centre[1])
+        if not h or math.hypot(x - h[-1][1], y - h[-1][2]) >= self._retreat_min_step_m:
+            h.append((now_ns, x, y))
+        while len(h) > 1 and now_ns - h[0][0] > self._retreat_history_max_s * 1e9:
+            h.popleft()
+        # 点已按 2 cm 去重，2 m 预算下最多约 100 点，每周期重算一次路程可以忽略不计。
+        while len(h) > 2:
+            pts = list(h)
+            total = sum(math.hypot(b[1] - a[1], b[2] - a[2])
+                        for a, b in zip(pts, pts[1:]))
+            if total <= self._retreat_history_m:
+                break
+            h.popleft()
 
     def _retreat_index(self, params, trajectories, now_ns):
         """直线后退轨迹的下标，若此刻后退不可证明安全则 None。
@@ -1012,13 +1043,9 @@ class PlanningNode(Node):
             if self._ui_active:
                 self.publish_3d_occupancy_cloud(self.occupancy_grid, self.resolution, self.origin)
 
-        # 每周期都记，包括没有目标的时候 —— 卡住之后要回溯的正是卡住之前走过的地方。
-        _c = self.camera_to_robot_center(T)
-        _t_ns = self.get_clock().now().nanoseconds
-        self._centre_history.append((_t_ns, float(_c[0]), float(_c[1])))
-        while (self._centre_history
-               and _t_ns - self._centre_history[0][0] > self._retreat_history_s * 1e9):
-            self._centre_history.popleft()
+        # 每周期都看，包括没有目标的时候 —— 卡住之后要回溯的正是卡住之前走过的地方。
+        self._record_centre(self.camera_to_robot_center(T),
+                            self.get_clock().now().nanoseconds)
 
         with Timer(name='obstacle map', text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=_TIMER_LOGGER):
             obstacle_mask = build_obstacle_map(
@@ -1277,6 +1304,9 @@ class PlanningNode(Node):
                     abs(self._wrap(yaw_to_target - yaw_now)), best_gain)
 
                 if escape_reason and turns:
+                    if not self._escape_episode_ns:
+                        self._escape_episode_ns = now_ns
+                    escape_age_s = (now_ns - self._escape_episode_ns) / 1e9
                     pick, escape_clear = self._pick_escape_turn(
                         self.camera_to_robot_center(T), turns, trajectories,
                         yaw_to_target, obstacle_mask, params, now_ns)
@@ -1285,7 +1315,8 @@ class PlanningNode(Node):
                     # 退回自己刚走过的地方 —— main 对「前方堵住」的答案本来就是倒车
                     # （硬互斥门 front_clearance<=0.3 时只准倒车），它缺的只是「后面能不能
                     # 走」的凭据，那正是 _retreat_index 提供的。
-                    if escape_clear < self.escape_min_clearance_m:
+                    if (escape_clear < self.escape_min_clearance_m
+                            or escape_age_s > self._escape_before_retreat_s):
                         retreat_idx = self._retreat_index(params, trajectories, now_ns)
                         if retreat_idx is not None:
                             top_indices = np.array([retreat_idx])
@@ -1300,6 +1331,7 @@ class PlanningNode(Node):
                     # 脱困结束就松锁，否则下一次脱困会沿用上一次的方向。
                     self._escape_turn_sign = None
                     self._retreat_start_ns = 0
+                    self._escape_episode_ns = 0
 
             self.last_param = params[top_indices[0]]
             best_idx = int(top_indices[0])
@@ -1313,6 +1345,8 @@ class PlanningNode(Node):
                     f"front_clearance={self._fmt_clearance(front_clearance)} "
                     f"gate={'turn-only' if front_blocked else 'forward'} "
                     f"escape={escape_reason or 'off'} turns={len(turns)} "
+                    f"escape_age={((now_ns - self._escape_episode_ns) / 1e9) if self._escape_episode_ns else 0.0:.1f}s "
+                    f"hist={len(self._centre_history)}pts "
                     f"best_gain={best_gain:+.2f}m escape_clear={self._fmt_clearance(escape_clear)} "
                     # Was only logged on the two give-up branches, so a run could not
                     # be read for whether the z band and dilation did what they claim.
