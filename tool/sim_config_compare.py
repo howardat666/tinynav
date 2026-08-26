@@ -136,6 +136,20 @@ CFGS = {
                  vx_cont_w=40.0, escape=True, retreat=True, retreat_max_s=4.0,
                  omega_max=1.05, grid=(100,100,9), goffset=(0.0,0.0,0.15),
                  real_gate=True, multi_reverse=True),
+    # 只把膨胀关掉，其余同 new。仿真里墙是实心的，所以关掉膨胀不会暴露五点取样的漏洞
+    # —— 这一栏量的是**纯几何**代价，真车上要配套把取样点加密才安全。
+    "nodil": dict(max_vx=0.5, front_blocked_m=0.20, probe_max=1.2, reaction=2.0,
+                 dilation=0, z_bottom=-0.3, z_top=0.4, reverse_speed=0.06,
+                 vx_cont_w=40.0, escape=True, retreat=True, retreat_max_s=4.0,
+                 omega_max=1.05, grid=(100,100,9), goffset=(0.0,0.0,0.15),
+                 real_gate=True, multi_reverse=True),
+    # "遇到障碍就退"：其余全同 new，只把脱困的第一手从"原地转"换成"倒退"。
+    # main 的硬互斥门就是这个策略，这里剥离出来单独比，免得和 main 的其他差异混在一起。
+    "ret1st": dict(max_vx=0.5, front_blocked_m=0.20, probe_max=1.2, reaction=2.0,
+                 dilation=1, z_bottom=-0.3, z_top=0.4, reverse_speed=0.06,
+                 vx_cont_w=40.0, escape=True, retreat=True, retreat_max_s=4.0,
+                 omega_max=1.05, grid=(100,100,9), goffset=(0.0,0.0,0.15),
+                 real_gate=True, multi_reverse=True, retreat_first=True),
     # 提案：门限按**每条轨迹自己要走的那一段**来判，而不是沿当前朝向的一条直线。
     # 前进可行 <=> 它将要执行的那 reaction 秒里，车体五点的 ESDF 都还有 prefix_margin。
     "fix":  dict(max_vx=0.5, front_blocked_m=0.20, probe_max=1.2, reaction=2.0,
@@ -338,6 +352,11 @@ def decide(n, cfg, T, obstacle_mask, esdf, target_xy, now_ns, trajs, params, sco
     else:
         reason = n._escape_reason(front_blocked, stand_dist,
                                   abs(n._wrap(yaw_to_target - yaw_now)), best_gain)
+    if reason == "blocked" and cfg.get("retreat_first"):
+        ri = n._retreat_index(params, trajs, now_ns)
+        if ri is not None:
+            n._escape_turn_sign = None
+            return ri, "RETREAT", front_clearance, front_blocked
     if reason and turns:
         if not n._escape_episode_ns:
             n._escape_episode_ns = now_ns
@@ -558,6 +577,8 @@ def wall(xc, halfw=1.5, th=0.2, y0=None, zt=1.2):
     y0 = -halfw if y0 is None else y0
     return (xc, xc + th, y0, y0 + 2 * halfw, zt)
 
+_CORR = float(os.environ.get("CORR", "0.70"))   # S6/S7 的过道净宽
+
 SCEN = {
     "S0 空旷直行":    dict(boxes=[(20.0, 20.2, -3.0, 3.0, 1.2)], target=(5.0, 0.0)),
     "S1 正撞墙":      dict(boxes=[wall(4.0)], target=(8.0, 0.0)),
@@ -569,6 +590,13 @@ SCEN = {
                                   (1.0, 3.2, -0.9, -0.7, 1.2)], target=(6.0, 0.0)),
     # 斜着开进死胡同：车头已经偏 17 度，直退会离来路越退越远 —— 这正是带转向的
     # 倒车要解决的那一种，也是 2026-08-26 那趟实车楔住的形状。
+    # 0.7 m 净宽，正好在 0.55 m 要求之上、余量 0.15 m。目标在出口外。
+    "S6 窄过道":       dict(boxes=[(1.0, 5.0, _CORR/2, 2.0, 1.2),
+                                   (1.0, 5.0, -2.0, -_CORR/2, 1.2)], target=(6.0, 0.0)),
+    # 同一条过道，尽头堵住。正解是退出来，前进无解。
+    "S7 窄过道堵头":   dict(boxes=[(1.0, 5.0, _CORR/2, 2.0, 1.2),
+                                   (1.0, 5.0, -2.0, -_CORR/2, 1.2),
+                                   (3.5, 3.7, -_CORR/2, _CORR/2, 1.2)], target=(6.0, 0.0)),
     "S5 斜进死胡同":  dict(boxes=[wall(3.0, halfw=0.8),
                                   (1.0, 3.2, 0.7, 0.9, 1.2),
                                   (1.0, 3.2, -0.9, -0.7, 1.2)], target=(6.0, 0.0),
