@@ -425,7 +425,11 @@ _IMAGE_TOPICS_REALSENSE = [
     '/camera/camera/infra1/image_rect_raw',
     '/camera/camera/infra2/image_rect_raw',
     '/slam/depth',
+    '/planning/height_color',
 ]
+# planning_node 发的离地高度着色图。列在这里就会出现在前端的话题下拉里 ——
+# 那个列表是后端给的，所以加一路预览不需要重编前端。
+_HEIGHT_COLOR_TOPIC = '/planning/height_color'
 # No infra2: in looper mode nothing reads the right eye (perception_node is the
 # realsense branch and never launches here), and previewing it costs the same 98% of
 # the board's measured 0.874 Mbit/s uplink that infra1 does.
@@ -433,6 +437,7 @@ _IMAGE_TOPICS_LOOPER = [
     _COLOR_TOPIC_LOOPER,
     '/camera/camera/infra1/image_rect_raw',
     '/slam/depth',
+    _HEIGHT_COLOR_TOPIC,
 ]
 _IMAGE_TOPICS_ALL = _IMAGE_TOPICS_REALSENSE  # fallback
 # 5 fps by default. infra1 needs 0.86 Mbit/s at that rate against a measured 0.874

@@ -91,6 +91,21 @@ _EXACT_POSE_PREFIXES = ("/camera/camera/vio",)
 
 # === Helper functions ===
 
+# 离地高度的固定配色，和 tool/x5_board/low_obs_debug.py 逐字一致 —— 两边能直接对着看
+# 才有意义。固定是重点：前端原来的 3D 体素按每帧 5%~95% 分位自适应，同一个高度每帧
+# 颜色都不同。边界之外的第 7 项是无效深度。
+_HEIGHT_BINS = np.array([0.02, 0.05, 0.15, 0.25, 0.60], dtype=np.float32)
+_HEIGHT_LUT = np.array([          # BGR，给 bgr8
+    [105, 96, 90],                # <2cm    地面
+    [150, 80, 40],                # 2~5cm   噪声带
+    [60, 60, 235],                # 5~15cm  矮障碍
+    [40, 140, 245],               # 15~25cm
+    [60, 210, 240],               # 25~60cm
+    [215, 205, 200],              # >60cm
+    [22, 18, 16],                 # 无效
+], dtype=np.uint8)
+
+
 def build_obstacle_map(occupancy_grid, origin, resolution, robot_z, config=None):
     """Obstacle = cells where occupied voxels span >= min_wall_span_m in z.
     Walls have large z-span; stair risers / ground bumps have small span."""
@@ -219,6 +234,12 @@ class PlanningNode(Node):
         # Throttled JSON for the app's diagnostics panel; see _publish_diagnostics.
         self.diag_pub = self.create_publisher(String, '/planning/diagnostics', 1)
         self.height_map_pub = self.create_publisher(Image, "/planning/height_map", 10)
+        # 相机视角的离地高度着色图，给前端和 infra1 并排对比用。只在有人订阅时才算。
+        self.height_color_pub = self.create_publisher(Image, "/planning/height_color", 1)
+        self._height_color_uv = None
+        self._height_color_last_ns = 0
+        self.height_color_hz = float(os.environ.get('TINYNAV_HEIGHT_COLOR_HZ', '2.0'))
+        self.height_color_stride = int(os.environ.get('TINYNAV_HEIGHT_COLOR_STRIDE', '2'))
         self.obstacle_mask_pub = self.create_publisher(OccupancyGrid, '/planning/obstacle_mask', 10)
         self.footprint_pub = self.create_publisher(PointCloud, '/planning/footprint', 10)
         self.occupancy_cloud_pub = self.create_publisher(PointCloud2, '/planning/occupied_voxels', 10)
@@ -939,6 +960,36 @@ class PlanningNode(Node):
         msg.data = array.array('b', data.tobytes())
         self.obstacle_mask_pub.publish(msg)
 
+    def _publish_height_color(self, depth, T, fx, fy, cx, cy, floor_z, stamp):
+        """Camera-view height above the floor, fixed palette, for side-by-side with infra1.
+
+        Only the world z is needed, so only R's third row is used -- a full projection
+        would be three times the multiply-adds for two coordinates nothing looks at.
+        """
+        if self.height_color_pub.get_subscription_count() == 0:
+            return
+        now = self.get_clock().now().nanoseconds
+        if now - self._height_color_last_ns < 1e9 / max(self.height_color_hz, 0.1):
+            return
+        self._height_color_last_ns = now
+        # 半分辨率：预览链路本来就把帧缩到 320 px 边长再编码，全分辨率算完全是白花的。
+        # 全分辨率在 PC 上 7.2 ms，板上按 5~8 倍推是 40 ms 级别，而这是 5 Hz 的规划循环。
+        d = depth[::self.height_color_stride, ::self.height_color_stride]
+        if self._height_color_uv is None or self._height_color_uv[0].shape != d.shape:
+            st = self.height_color_stride
+            v, u = np.mgrid[0:depth.shape[0]:st, 0:depth.shape[1]:st]
+            self._height_color_uv = ((u.astype(np.float32) - cx) / fx,
+                                     (v.astype(np.float32) - cy) / fy)
+        gu, gv = self._height_color_uv
+        R = T[:3, :3]
+        pw_z = d * (R[2, 0] * gu + R[2, 1] * gv + R[2, 2]) + T[2, 3]
+        idx = np.searchsorted(_HEIGHT_BINS, pw_z - floor_z).astype(np.uint8)
+        idx[d <= 0] = len(_HEIGHT_LUT) - 1
+        msg = self.bridge.cv2_to_imgmsg(_HEIGHT_LUT[idx], encoding='bgr8')
+        msg.header.stamp = stamp
+        msg.header.frame_id = 'camera'
+        self.height_color_pub.publish(msg)
+
     def publish_height_map(self, origin, esdf_map, header):
         height_normalized = np.clip(esdf_map / 2.0 * 255, 0, 255).astype(np.uint8)
         color_image = cv2.applyColorMap(height_normalized, cv2.COLORMAP_JET)
@@ -1177,6 +1228,9 @@ class PlanningNode(Node):
                 self._low_obstacle *= 0.9
                 self._low_obstacle[hits >= self.low_obs_min_pts] += 0.1
                 np.clip(self._low_obstacle, 0.0, 0.2, out=self._low_obstacle)
+            self._publish_height_color(depth, T, fx, fy, cx, cy,
+                                       T[2, 3] - self.camera_height_m,
+                                       depth_msg.header.stamp)
 
             # Nothing but the app's 3D local view consumes this, so it follows the same
             # gate as the overlays below rather than get_subscription_count() -- see
