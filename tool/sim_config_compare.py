@@ -129,6 +129,13 @@ CFGS = {
                  dilation=1, z_bottom=-0.3, z_top=0.4, reverse_speed=0.06,
                  vx_cont_w=40.0, escape=True, retreat=True, retreat_max_s=4.0, omega_max=1.05,
                  grid=(100,100,9), goffset=(0.0,0.0,0.15)),
+    # new = 2026-08-26 落地的真代码：门限走 PlanningNode._prefix_clearance，
+    # 倒车词汇表 5 条(直退 + 正负 43/86 度)，「堵住」= 一条前进轨迹都不可行。
+    "new":  dict(max_vx=0.5, front_blocked_m=0.20, probe_max=1.2, reaction=2.0,
+                 dilation=1, z_bottom=-0.3, z_top=0.4, reverse_speed=0.06,
+                 vx_cont_w=40.0, escape=True, retreat=True, retreat_max_s=4.0,
+                 omega_max=1.05, grid=(100,100,9), goffset=(0.0,0.0,0.15),
+                 real_gate=True, multi_reverse=True),
     # 提案：门限按**每条轨迹自己要走的那一段**来判，而不是沿当前朝向的一条直线。
     # 前进可行 <=> 它将要执行的那 reaction 秒里，车体五点的 ESDF 都还有 prefix_margin。
     "fix":  dict(max_vx=0.5, front_blocked_m=0.20, probe_max=1.2, reaction=2.0,
@@ -178,6 +185,7 @@ def make_node(cfg):
     n.origin = np.array(n.grid_shape) * RES / -2.0 + n.grid_offset
     n.dt = 0.1
     n.front_probe_max_m = cfg["probe_max"]
+    n.prefix_margin_m = cfg.get("prefix_margin", 0.10)
     n.reaction_time_s = cfg["reaction"] if cfg["reaction"] else 0.0
     n.rotate_first_min_dist_m = 0.3
     n.force_turn_heading_rad = math.radians(35.0)
@@ -209,6 +217,9 @@ def traj_lib(cfg, n, p, q):
     vt, vp = PN.generate_predefined_trajectory_vocabularies(
         init_p=p.copy(), init_q=q.copy(), dt=n.dt)
     vt = PN.normalize_pose_trajectories(vt)
+    if not cfg.get("multi_reverse"):          # 历史配置只有直退那一条
+        keep = [i for i in range(len(vp)) if abs(vp[i][1]) < 1e-9]
+        vt, vp = vt[keep], vp[keep]
     rs = cfg["reverse_speed"]
     if abs(rs - 0.06) > 1e-9:                     # 源码写死 0.06，按配置线性换
         k = rs / 0.06
@@ -229,6 +240,12 @@ def decide(n, cfg, T, obstacle_mask, esdf, target_xy, now_ns, trajs, params, sco
     gate_m = n._front_gate_m() if cfg["reaction"] else n.robot.front_blocked_m
     front_blocked = front_clearance <= gate_m
     prefix_ok = None
+    forward_ok = None
+    if cfg.get("real_gate"):
+        forward_ok = n._prefix_clearance(trajs, esdf) >= n.prefix_margin_m
+        front_blocked = not any(
+            forward_ok[i] for i in range(len(params))
+            if params[i][0] > 0.0 and not n._is_turn_in_place(params[i]))
     if cfg.get("per_traj"):
         prefix_ok = _prefix_clearance_ok(n, trajs, params, esdf, cfg["reaction"],
                                          cfg["prefix_margin"])
@@ -238,14 +255,20 @@ def decide(n, cfg, T, obstacle_mask, esdf, target_xy, now_ns, trajs, params, sco
         front_blocked = not any(prefix_ok[i] for i in fwd)
 
     def gate(param, i=None):
+        if cfg.get("real_gate") and i is not None:            # new：调真方法
+            return n._motion_gate_penalty(param, i, forward_ok, front_blocked)
         if cfg.get("per_traj") and i is not None:             # fix：按轨迹自己那一段
             if param[0] < 0.0:
                 return 0.0 if (front_blocked and n.robot.allow_reverse) else 1e9
             if n._is_turn_in_place(param):
                 return 0.0
             return 0.0 if prefix_ok[i] else 1e9
-        if cfg["reaction"]:                                   # now：分档
-            return n._motion_gate_penalty(param, front_clearance, front_blocked)
+        if cfg["reaction"]:                                   # now：旧的分档门限
+            if param[0] < 0.0:
+                return 0.0 if (front_blocked and n.robot.allow_reverse) else 1e9
+            if n._is_turn_in_place(param):
+                return 0.0
+            return 0.0 if front_clearance >= param[0] * cfg["reaction"] else 1e9
         if cfg["escape"]:                                     # prev：二值，堵住准原地转
             if front_blocked and not n._is_turn_in_place(param):
                 return 1e9
@@ -544,6 +567,12 @@ SCEN = {
     "S4 死胡同":      dict(boxes=[wall(3.0, halfw=0.8),
                                   (1.0, 3.2, 0.7, 0.9, 1.2),
                                   (1.0, 3.2, -0.9, -0.7, 1.2)], target=(6.0, 0.0)),
+    # 斜着开进死胡同：车头已经偏 17 度，直退会离来路越退越远 —— 这正是带转向的
+    # 倒车要解决的那一种，也是 2026-08-26 那趟实车楔住的形状。
+    "S5 斜进死胡同":  dict(boxes=[wall(3.0, halfw=0.8),
+                                  (1.0, 3.2, 0.7, 0.9, 1.2),
+                                  (1.0, 3.2, -0.9, -0.7, 1.2)], target=(6.0, 0.0),
+                           start=(0.0, -0.3, 0.30)),
 }
 
 
@@ -554,12 +583,13 @@ if __name__ == "__main__":
             for _c in ("fix2", "fix3", "fix4"):
                 CFGS[_c][k_cfg] = float(os.environ[k_env])
     only = os.environ.get("ONLY", "")
-    names = os.environ.get("CFG", "main,prev,now,fix,fix2,fix3,fix4").split(",")
+    names = os.environ.get("CFG", "main,prev,now,new").split(",")
     rows = []
     for sname, sc in SCEN.items():
         if only and only not in sname: continue
         for cname in names:
-            r = simulate(cname, sc["boxes"], sc["target"], ctrl_lag_s=lag,
+            r = simulate(cname, sc["boxes"], sc["target"],
+                         start=sc.get("start", (0.0, 0.0, 0.0)), ctrl_lag_s=lag,
                          verbose=bool(os.environ.get("V")))
             rows.append((sname, cname, r))
             print(f"{sname:14s} {cname:5s} {r['verdict']:12s} "
