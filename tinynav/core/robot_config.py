@@ -269,11 +269,7 @@ DIFFCAR_CONFIG = RobotConfig(
     # 从下面过，把它算成障碍会把整条走廊封掉。两边各留约 0.12 m 余量。
     # 1.0 试过，2026-08-25 实测把桌面之类的悬空物全投影成地面障碍：front_clearance 掉到
     # 0.11 m、106 条轨迹 101 条被拒，车原地左右打转 10 s 才脱困。0.2 又低于椅面。
-    # min_wall_span_m 0.2 -> 0.1：0.2 要求一个格子里有 3 层被占（(high-low)*0.1 >= 0.2），
-    # 0.1 只要 2 层。椅子腿、矮柜脚这类只在两层里留下回波的东西原来会被当成地面噪声滤掉。
-    # 代价是地面噪声更容易凑够 2 层，走廊可能被误封 —— 2026-08-26 上板试。
-    obstacle=ObstacleConfig(robot_z_bottom=-0.3, robot_z_top=0.4, dilation_cells=1,
-                            min_wall_span_m=0.1),
+    obstacle=ObstacleConfig(robot_z_bottom=-0.3, robot_z_top=0.4, dilation_cells=1),
     # 0.6, and the reaction-budget argument that held it at 0.3 was mostly wrong: the
     # library samples 7 speeds from 0 to vx_max and collision-checks each over its whole
     # 3 s extent, so raising the ceiling adds fast options rather than forcing speed --
