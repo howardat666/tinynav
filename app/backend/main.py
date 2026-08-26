@@ -14,6 +14,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from .manager_client import BACKEND_ROLE, is_display_role
@@ -33,6 +34,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title=f'TinyNav API ({BACKEND_ROLE})', version='0.1.0', lifespan=lifespan)
+
+# StaticFiles does not compress, and the Flutter bundle's first load is main.dart.js
+# 3.04 MB + canvaskit.wasm 7.16 MB = 10.2 MB, which gzip takes to 3.8 MB (measured).
+# On a link that has been seen dropping to CCK_1M that is the difference between the page
+# opening and not -- 2026-08-20 a frontend redeploy invalidated the browser cache and the
+# page stopped loading, with repeated 206 Partial Content on exactly those two files.
+# minimum_size keeps it off the small JSON the API returns every cycle.
+app.add_middleware(GZipMiddleware, minimum_size=2048)
 
 app.add_middleware(
     CORSMiddleware,
