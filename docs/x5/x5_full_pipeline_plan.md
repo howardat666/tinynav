@@ -674,3 +674,112 @@ BPU ratio p50 **43%**、mean 48%、**max 98%**。温度 CPU 93.8 / DDR 92.8 / BP
 persistent journal(`/etc/systemd/journald.conf` 的 `Storage=persistent`),否则下次重启
 同样什么都留不下。
 
+
+## 2026-08-26 建图时间的真实构成 —— 瓶颈不是算力，是单线程搬图
+
+对照包 `bag_2026_08_24_17_35_41`（255.5 s，3.8 GB，173469 条消息），板上跑，app 停掉。
+
+### 🔴 先纠正三处认知
+
+**1. 阶段计时表的百分比是错的，`Grand total` 也不是墙上时间。**
+`mapping_loop` 是父计时段，`feature_extractor` / `msg_decode` / `save_image_and_depth` /
+`get_embeddings` / `loop_and_pose_graph_update` 全部**嵌套在它里面**，而 `log_summary` 把所有段
+直接相加算百分比。837 关键帧那次打出 `Grand total: 402 s`，实际墙上是 **942 s**，402 既不是
+总和也不是任何真实的量 —— 每关键帧的时间被数了两遍。
+
+**2. 「app 和建图不能同时跑，会 OOM」是过期结论。** `map_build_ab.py` 的 docstring 和
+`app_running()` 拦截都基于它，三条依据全部作废：
+
+| 当时写的 | 现在 |
+|---|---|
+| 板上 1338 MB | ion_cma 改过后是 **1787 MB** |
+| 词典峰值 407 MB | 那是 **DBoW3** 词典；08-25 起用 VLAD，质心文件 **256 KB** |
+| app 占 950 MB | 那是**导航时**。点建图时 `_start_rosbag_build_map` 起的是 bridge + build_map_node，导航节点不在跑 |
+
+实测建图峰值 **527 MB**（build_map_node 351 + bridge 176），全程可用内存没低于 959 MB。
+**在 app 里点建图是正确且受支持的路径。**
+
+**3. 建图既不吃内存也不吃 CPU 总量。**88.8% 进度时实测：
+
+```
+内存 796/1787 MB 用，可用 959 MB      load 3.99 / 8 核      BPU 25%      温度 88.6 C
+build_map_node  RSS 351 MB  CPU 100%   <- 正好一个核，Python 单线程
+looper_bridge   RSS 176 MB  CPU  33%
+insight_full    RSS 181 MB  CPU 155%
+```
+
+**瓶颈是 `build_map_node` 单线程占满一个核，另外七个核闲着。**播 bag、发消息、收关键帧、
+跑 SuperPoint、写盘全在同一个线程里串行。所以"往 BPU 搬"没有意义：SuperPoint 那 179 ms 里
+只有约 39 ms 真在 BPU（其余是 numpy 后处理），而 BPU 才用了 25%。
+
+### 关键帧密度对照（同包，同代码）
+
+三条门限是**或**的关系（`should_add_keyframe`），只放宽位移没用：1 度只占 79.2 度水平视场的
+1.3%，一转弯就是每度一帧；「静止 1 秒也发」那条是保底下限，255 s 的包光它就保底 255 帧。
+10 cm 在 3 m 景深处等于 1.91 度，所以配 3 度；静止那条放到 5 s。
+
+| | 3 cm / 1 度 / 1 s | **10 cm / 3 度 / 5 s** | |
+|---|---|---|---|
+| 关键帧 | 837 | **442** | **-47%** |
+| 墙上时间 | 942 s | **865 s** | **-8%** |
+| 地图体积 | 1837 MB | **971 MB** | **-47%** |
+| `depths.dat` | 1.1 GB | 588 MB | |
+| `features.dat` | 423 MB | 223 MB | |
+| `vlad_index.npz` | 210 MB | 111 MB | |
+| 每关键帧 | 220.9 ms | 222.4 ms | 不变 |
+| `occupancy_raycast` | 31.4 s | 22.3 s | |
+
+而且新的那次还**多做了 `vlad_index_build` 12.1 s**（旧的那次索引是 22 分钟后另外补存的，
+阶段表里根本没有这一行），多做了活还快 77 秒。
+
+🔴 **关键帧砍一半，时间只降 8%。**新的那次所有计时段加起来（去掉嵌套重复）只有 143 s，
+**83.5% 的时间不在任何计时段里** —— 全在 bag 播放和跨进程传图上。降密度买到的不是速度，
+是**地图体积和加载内存**：2.06 GB 的地图配 1.79 GB 的内存，范围再大就危险，这才是大范围
+建图必须降密度的理由。
+
+参数经 `TINYNAV_KEYFRAME_TRANSLATION` / `_ROTATION_DEG` / `_STATIC_INTERVAL` 传入
+（commit `2868074`），空值＝用 bridge 默认。**只影响建图**：导航路径上
+`--keyframe-min-interval 1.5 s` 比这三条都严，把它们全掩盖了。
+
+### bag 的话题构成 —— 彩色是最贵的一路
+
+| 话题 | 帧数 | 频率 |
+|---|---|---|
+| `/camera/camera/imu` | 101698 | 398.1 Hz |
+| `/camera/camera/vio_100hz` | 24237 | 94.9 Hz |
+| **`color/image_rect_raw/compressed`** | **7671** | **30.0 Hz** |
+| `color/camera_info` | 7670 | 30.0 Hz |
+| `infra1/image_rect_raw` | 5111 | 20.0 Hz |
+| `depth/image_rect_raw` | 1278 | 5.0 Hz |
+
+跳过 imu 和 vio_100hz 之后还剩 47534 条，**彩色两路占 32%，而且它是频率最高的图像话题**。
+
+### 已做的三项优化
+
+| commit | 改动 | 依据 |
+|---|---|---|
+| `2868074` | 三条关键帧门限可配 | 上表 |
+| `d8d9dc7` | TF 广播放进 `--no-visualization` 门 | `publish_all_transforms` 每次为**至今所有**位姿造 TransformStamped 再整批广播，837 帧那次单次均值 317 ms / 峰值 1411 ms，442 帧那次 196/805 —— 和已被这个门关掉的 `pose_graph_trajectory_publish` 是同一个二次方开销，当时**漏了这个调用点**。建图自己不消费它：`/tf` 订阅只为算一次 `T_rgb_to_infra1` 就退订 |
+| `afe6d75` | `--no-rgb-video` 时整条彩色链路跳过 | 之前只关了**写**（h264 编码 95.3 s），**读没关**：7671 帧照样播出来、逐帧 JPEG 解码、以约 1 MB 原始图重发、占四路同步的第 4 位、每关键帧再 cv_bridge 转 bgr8，最后因 `rgb_video_db is None` 全丢。证据是两次建图的 `rgb_images_db mode=read write_count=0` |
+
+⚠️ 第三项的风险点是同步从四路改三路 —— 配错会**零关键帧且完全不报错**（删 `keyframe_depth`
+那次就是这样，12 分钟白跑）。判据：`grep -c "Synced TinyNavDB" ` 在开跑 2 分钟内应该 >= 1。
+
+### 还没做的，按性价比
+
+| # | 改动 | 预计 | 工作量 | 风险 |
+|---|---|---|---|---|
+| 1 | BPU 推理与 CPU 后处理流水化 | 每帧约 39 ms（22%） | 中 | 低 |
+| 2 | **离线建图去掉 bridge 一跳** | 那 83.5% 的大部分 | 大 | 高 |
+| 3 | `top_k` 512 -> 256 | 描述子采样与地图体积各减半 | 极小 | 中 |
+| 4 | 在 PC 上建图 | 数量级 | 中 | **低可信**：板上重定位用 BPU 的 INT8 描述子，PC 上没有 BPU。INT8 vs fp32 的检索差异在 k-means 自身噪声内（见本文「INT8 精度」一节），所以大概率可行，但要先跑一次 PC 建图 + 板上重定位的交叉验证 |
+
+第 2 项是"两个进程之间跑一个来回"：`build_map_node` 播 bag 发原始话题 -> DDS -> bridge 做
+时间戳对齐和关键帧筛选 -> DDS -> `build_map_node` 的 `keyframe_callback`。离线时 bag 本来就在
+它自己手里，这两件事不需要另起进程。
+
+### app 录制没有磁盘检查
+
+旧的 `tool/x5_board/map_record.sh` 有 `MIN_FREE_MB=4096`，**app 的录制路径一处空间判断都没有**
+（`node_manager.py` / `routers/files.py` grep 命中 0）。实测码率 **14.9 MB/s**，录满会静默毁掉
+整个包，且在机器人上看不出来。开跑前自己算：剩余 GB x 1024 / 14.9 = 可录秒数。
