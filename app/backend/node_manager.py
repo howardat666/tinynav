@@ -186,6 +186,16 @@ _MAP_SAVE_VIDEOS = os.environ.get('TINYNAV_MAP_SAVE_VIDEOS', '0') == '1'
 # wants the keyframe rate cap in looper_bridge_node to be sized for it.
 _LOOP_CLOSURE_MODE = os.environ.get('TINYNAV_LOOP_CLOSURE_MODE', 'vlad')
 
+# 关键帧门限。三条是**或**的关系（looper_bridge_node.should_add_keyframe），所以只放宽位移
+# 没用：1 度在 79.2 度的水平视场里只占画面的 1.3%，一转弯就是每度一帧；而"静止 1 秒也发"
+# 那条是保底下限，站着不动照样每秒一帧，且它们是同一位置的重复帧。
+# 空字符串 = 不传，用 bridge 自己的默认值（0.03 m / 1.0 deg / 1.0 s）。
+# 只影响建图：导航路径上 --keyframe-min-interval 1.5 s 比这三条都严，把它们全掩盖了。
+_KEYFRAME_TRANSLATION = os.environ.get('TINYNAV_KEYFRAME_TRANSLATION', '')
+_KEYFRAME_ROTATION_DEG = os.environ.get('TINYNAV_KEYFRAME_ROTATION_DEG', '')
+_KEYFRAME_STATIC_INTERVAL = os.environ.get('TINYNAV_KEYFRAME_STATIC_INTERVAL', '')
+
+
 
 def _retrieval_argv() -> list[str]:
     if _LOOP_CLOSURE_MODE == 'vlad':
@@ -264,6 +274,18 @@ def _node_argv(rel_path: str) -> list[str]:
     return ['python3', os.path.join(_TINYNAV_ROOT, rel_path)]
 
 
+
+def _keyframe_gate_argv() -> list[str]:
+    """Whichever of the three keyframe gates the environment overrides."""
+    argv = []
+    for value, flag in ((_KEYFRAME_TRANSLATION, '--keyframe-translation'),
+                        (_KEYFRAME_ROTATION_DEG, '--keyframe-rotation-deg'),
+                        (_KEYFRAME_STATIC_INTERVAL, '--keyframe-static-interval')):
+        if value:
+            argv += [flag, value]
+    return argv
+
+
 def _bridge_argv(*, for_map_build: bool = False) -> list[str]:
     source = _MAP_ODOM_SOURCE if for_map_build else _ODOM_SOURCE
     pose_topic = _POSE_TOPIC_WHEEL if source == 'wheel' else _POSE_TOPIC_VIO_KEYFRAME
@@ -296,7 +318,7 @@ def _bridge_argv(*, for_map_build: bool = False) -> list[str]:
         # so the cap only subtracts map coverage: 1.5 s would have turned this bag's
         # 837 keyframes into at most 170.
         ['--keyframe-min-interval', '0.0'] if for_map_build else []
-    )
+    ) + _keyframe_gate_argv()
 
 
 def _planning_argv() -> list[str]:

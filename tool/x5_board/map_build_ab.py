@@ -163,7 +163,9 @@ def build_one(source: str, bag: str, map_path: str, log_path: str) -> dict:
             'log': log_path, **scan_log(log_path), 'bytes': dir_bytes(map_path)}
 
 
-_KEYFRAME_RE = re.compile(r'\bmapping_loop\b.*?count[=: ]+(\d+)', re.I)
+# `mapping_loop 837 184.896 220.9 ...` -- 计时表是空格分隔的，没有 count= 这种键值对，
+# 所以旧的正则从来没匹配上，关键帧数一直报 None。
+_KEYFRAME_RE = re.compile(r'^\s*mapping_loop\s+(\d+)\s', re.I | re.M)
 _STAGE_RE = re.compile(r'^\s*(\w+)\s+.*?total[=: ]+([\d.]+)', re.I)
 
 
