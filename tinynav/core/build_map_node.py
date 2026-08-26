@@ -1295,8 +1295,14 @@ class BuildMapNode(Node):
                 self.relative_pose_constraint,
                 max_iteration_num=5,
             )
-        with self.stage_timer.timed("tf_publish"):
-            self.publish_all_transforms()
+        # 只发给 rviz 看。publish_all_transforms 每次都为**至今所有**位姿造一个
+        # TransformStamped 再整批广播，和已经被这个门关掉的 pose_graph_trajectory_publish
+        # 是同一个二次方开销 —— 当时漏了这个调用点。实测 837 关键帧那次单次均值 317 ms、
+        # 峰值 1411 ms，442 关键帧那次降到 196/805，关键帧越多越贵。
+        # 建图自己不消费它：/tf 订阅只为算一次 T_rgb_to_infra1，算完就退订。
+        if self.publish_visualization:
+            with self.stage_timer.timed("tf_publish"):
+                self.publish_all_transforms()
         self._global_prev_num_frames = num_frames
 
     def match_keypoints(self, feats0:dict, feats1:dict, image_shape = np.array([848, 480], dtype = np.int64)) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -1348,8 +1354,9 @@ class BuildMapNode(Node):
         with self.stage_timer.timed("final_pose_graph"):
             self.pose_graph_used_pose = solve_pose_graph(self.pose_graph_used_pose, self.relative_pose_constraint)
 
-        with self.stage_timer.timed("tf_publish"):
-            self.publish_all_transforms()
+        if self.publish_visualization:
+            with self.stage_timer.timed("tf_publish"):
+                self.publish_all_transforms()
         self._global_prev_num_frames = len(self.pose_graph_used_pose)
 
         np.save(f"{self.map_save_path}/poses.npy", self.pose_graph_used_pose, allow_pickle = True)
