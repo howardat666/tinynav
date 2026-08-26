@@ -1236,7 +1236,7 @@ class MapNode(Node):
                 self.get_logger().info(f"Relocalization candidate timing ms: {'; '.join(candidate_timing_summaries)}")
                 return self._relocalization_failed(
                     f"solvePnPRansac failed or insufficient inliers: success={success}, "
-                    f"inliers={inlier_count}<20, landmarks={len(point_3d_in_world_list)}, "
+                    f"inliers={inlier_count}<{self.reloc_min_inliers}, landmarks={len(point_3d_in_world_list)}, "
                     f"candidates=[{'; '.join(candidate_summaries)}]",
                     "pnp_inliers",
                 )

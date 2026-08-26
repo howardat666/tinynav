@@ -342,11 +342,14 @@ class PlanningNode(Node):
         # 0.5 -> 1.2 m。0.5 时 front_clearance 的 p90 就是 0.50，是饱和值 —— 看不到更远，
         # 也就无法支撑一个随速度变大的门限。1.2 m 覆盖 max_vx=0.5 需要的 0.80 m。
         self.front_probe_max_m = 1.2
-        # 从"承诺一条轨迹"到"能改指令"之间车会走 v x reaction_time_s。实测规划周期 p50
-        # 1.11 s + 位姿滞后 stamp_lag p50 0.43 s = 1.54 s，取 1.6 s 留一点余量。
-        # 旧的固定 30 cm 门限比这个距离还短，所以它在物理上拦不住车 —— 2026-08-25 实测
-        # 从 front>0.50 到 front=0.12 只用了 3 秒，车是自己开进楔死点的。
-        self.reaction_time_s = 1.6
+        # 从"承诺一条轨迹"到"能改指令"之间车会走 v x reaction_time_s。
+        # 这个值由闭环仿真定，不是由"周期 + 滞后"直接推 —— tool/sim_front_gate.py 用真的
+        # run_raycasting_loopy + build_obstacle_map 让相机以 0.5 m/s 撞向一堵墙，扫出来：
+        #   reaction<=1.0 撞上 / 1.2 剩 0.03 m / 1.6 剩 0.09 m / 2.0 剩 0.11 m
+        # 而把控制滞后调到 0.8 s（板子排队时的 p90~max）后，1.6 只剩 0.03 m、2.0 仍有 0.09 m。
+        # 取 2.0：代价是全速要 1.0 m 净空（探针 1.2 m 够），换来负载高时余量不塌。
+        # ⚠️ 别用"实测周期 0.30 + 滞后 0.37 = 0.67"去设它 —— 仿真里 0.67 直接撞上。
+        self.reaction_time_s = 2.0
         self._last_loop_ns = 0
         self._loop_period_s = None
         # How long /control/target_pose must go quiet before proximity to it counts as
