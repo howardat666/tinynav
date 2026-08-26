@@ -106,6 +106,10 @@ class DiffCarControlNode(Node):
         # only applies to a hand-launched node.
         p("camera_offset_xyz", [0.05, 0.05, 0.18])
         p("cmd_vel_topic", "/cmd_vel")
+        # 遥控的专用话题。空字符串＝关掉优先，回到"两股都发 /cmd_vel、取最后一条"的老行为。
+        p("teleop_cmd_vel_topic", "/teleop/cmd_vel")
+        # 松手之后多久把控制权还给导航。比 cmd_timeout_s 短：还权要快，刹车要慢。
+        p("teleop_priority_s", 0.4)
         p("odom_topic", "/wheel/odometry")
         p("camera_pose_topic", "/wheel/camera_pose")
         p("cmd_timeout_s", 0.5)
@@ -133,9 +137,21 @@ class DiffCarControlNode(Node):
         pose_topic = str(g("camera_pose_topic").value)
         self.pose_pub = self.create_publisher(PoseStamped, pose_topic, 10) if pose_topic else None
         self.create_subscription(Twist, str(g("cmd_vel_topic").value), self._on_cmd, 10)
+        # 遥控走自己的话题并在这里优先。以前遥控和导航都发 /cmd_vel，而 cmd_vel_control 的
+        # 25 Hz 定时器**无条件**发（跟不上就发零速，连按了 Pause 也照发"nav paused"的零速），
+        # 遥控 20 Hz，两股交替进来，取最后一条的结果是约 56% 的指令是导航的零 —— 就是手感
+        # 上那个"推了也不走的阻尼"。仲裁放在执行器这一层：它是唯一的消费者，而且导航节点
+        # 死了遥控照样能用。
+        teleop_topic = str(g("teleop_cmd_vel_topic").value)
+        if teleop_topic:
+            self.create_subscription(Twist, teleop_topic, self._on_teleop, 10)
+        self.teleop_priority_s = float(g("teleop_priority_s").value)
 
         self._cmd = (0.0, 0.0)
         self._cmd_stamp = 0.0
+        self._teleop = (0.0, 0.0)
+        self._teleop_stamp = 0.0
+        self._teleop_held = False
         self._pose = None
         self.create_timer(1.0 / TICK_HZ, self._tick)
 
@@ -233,12 +249,27 @@ class DiffCarControlNode(Node):
         )
         self._cmd_stamp = time.monotonic()
 
+    def _on_teleop(self, msg: Twist) -> None:
+        self._teleop = (
+            float(np.clip(msg.linear.x, -self.max_vx, self.max_vx)),
+            float(np.clip(msg.angular.z, -self.max_yaw, self.max_yaw)),
+        )
+        self._teleop_stamp = time.monotonic()
+
     def _tick(self) -> None:
         # Stale commands must become zero here, not just stop being refreshed: the
         # firmware's 2 s failsafe is far too slow to be the only brake.
         if time.monotonic() - self._cmd_stamp > self.cmd_timeout:
             self._cmd = (0.0, 0.0)
-        v, w = self._cmd
+        # 遥控在窗口内就完全接管，导航这一路连零速都不参与。窗口用 teleop_priority_s 而不是
+        # cmd_timeout：松手之后要多久把控制权还给导航，和"多久算失联该刹车"是两件事。
+        teleop_fresh = (self._teleop_stamp > 0.0
+                        and time.monotonic() - self._teleop_stamp <= self.teleop_priority_s)
+        if teleop_fresh != self._teleop_held:
+            self._teleop_held = teleop_fresh
+            self.get_logger().info(
+                f"teleop {'takes over' if teleop_fresh else 'released, navigation resumes'}")
+        v, w = self._teleop if teleop_fresh else self._cmd
         self.link.send(f"u {v:.3f} {w:.3f}")
         # Poll rather than wait for a reply: the firmware's `y` telemetry carries wheel
         # speeds but not the pose, and a blocking read would stall this timer.

@@ -646,6 +646,7 @@ class BackendNode(Ros2NodeManager):
 
         # Publisher for teleop velocity commands
         self._cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self._teleop_cmd_vel_pub = self.create_publisher(Twist, '/teleop/cmd_vel', 10)
 
         # Sensor mode detection and image subscriptions
         self._sensor_mode: str = 'unknown'  # 'looper' | 'realsense' | 'unknown'
@@ -2376,6 +2377,11 @@ class BackendNode(Ros2NodeManager):
         msg.linear.y = float(linear_y)
         msg.angular.z = float(angular_z)
         self._cmd_vel_pub.publish(msg)
+        # 同一条也发到遥控专用话题，执行器据此把导航整个让开(见 diffcar_control 的
+        # teleop_priority_s)。/cmd_vel 那一路保留不动：LeKiwi 的 wheel_odometry_node 只订阅
+        # /cmd_vel，改成单发会静默地让那个平台的遥控失效。
+        if self._teleop_cmd_vel_pub is not None:
+            self._teleop_cmd_vel_pub.publish(msg)
 
 
 class NodeRunner:
