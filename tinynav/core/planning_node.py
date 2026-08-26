@@ -3,6 +3,7 @@ import array
 from collections import deque
 import json
 import os
+import dataclasses
 import threading
 import time
 
@@ -294,7 +295,11 @@ class PlanningNode(Node):
         # 地面在相机下方 0.18 m，往下留 1 层余量够了；省下的层全给上方。
         self.grid_offset = np.array([0.0, 0.0, 0.15])
         self.origin = np.array(self.grid_shape) * self.resolution / -2. + self.grid_offset
-        self.step = 10
+        # 深度图取样步长。10 时前方 1~3 m 的占据格单帧只召回 42~56%（以 step=2 为参考真值，
+        # 2026-08-26 板上实测），而一个格子要连续两帧才越过阈值 —— 于是墙上全是洞。
+        # 5 把召回提到 68~72%，代价 4.3 -> 14.0 ms（250 ms 周期的 4%）。这是填洞的正路：
+        # 用膨胀填洞每格要付 0.1 m/侧的过道净宽，而这里付的是 CPU。
+        self.step = int(os.environ.get('TINYNAV_RAYCAST_STEP', '5'))
         self.occupancy_grid = np.zeros(self.grid_shape)
         # 每个 2D 格子最后一次"是障碍"的时刻。占据栅格没有任何时间衰减 —— 只有射线穿过时
         # 才 -0.05，所以一个走出视野的格子会一直留着。热力图上"障碍物停留很久"就是这个，
@@ -331,7 +336,18 @@ class PlanningNode(Node):
         # The robot's own, whole. Rebuilding it field by field wired three of five
         # through, so min_wall_span_m and occ_threshold silently kept the class default
         # no matter what a platform asked for.
-        self.obstacle_config = self.robot.obstacle
+        # 三个最常调的门限做成环境变量，好在板上直接 A/B，不用改代码重推。
+        self.obstacle_config = dataclasses.replace(
+            self.robot.obstacle,
+            min_wall_span_m=float(os.environ.get(
+                'TINYNAV_MIN_WALL_SPAN_M', self.robot.obstacle.min_wall_span_m)),
+            dilation_cells=int(os.environ.get(
+                'TINYNAV_DILATION_CELLS', self.robot.obstacle.dilation_cells)),
+        )
+        self.get_logger().info(
+            f"obstacle: raycast step={self.step} "
+            f"span>={self.obstacle_config.min_wall_span_m} "
+            f"dilation={self.obstacle_config.dilation_cells}")
         self.stamp = None
         self.current_pose = None  # Store the latest pose from odometry
 
