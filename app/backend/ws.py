@@ -337,6 +337,11 @@ async def ws_preview(ws: WebSocket, topic: str = Query(...)):
 # timer would not.
 _TELEOP_REPEAT_HZ = 20.0
 _TELEOP_REPEAT_PERIOD = 1.0 / _TELEOP_REPEAT_HZ
+# 重发的有效期。客户端非零时按 10 Hz 发心跳（operate_tab.dart 的 _teleopHeartbeat），
+# 所以 0.5 s 等于连丢 5 条才刹车。没有这个上限时，松手那一条被链路延迟卡住的整段时间里
+# 重发线程会一直发上一条非零指令 —— 实测链路 ping 会跳到 2 s，那就是 2 s 的"后摇"。
+# WebSocket 走 TCP，消息不会丢只会迟，所以这里判的是"操作者还在不在说话"，不是丢包。
+_TELEOP_STALE_S = 0.5
 
 
 @router.websocket('/ws/teleop')
@@ -348,18 +353,27 @@ async def ws_teleop(ws: WebSocket):
         return
 
     last = (0.0, 0.0, 0.0)
+    last_at = 0.0
     stop = asyncio.Event()
 
     async def repeat():
-        """Re-publish the latest command until the socket closes."""
+        """Re-publish the latest command until it goes stale or the socket closes."""
+        nonlocal last
         while not stop.is_set():
             # Zero is the resting state, which the watchdog already produces;
             # republishing it would only race a real command arriving.
             if last != (0.0, 0.0, 0.0):
-                try:
-                    node.publish_cmd_vel(*last)
-                except Exception:
-                    pass
+                if time.monotonic() - last_at > _TELEOP_STALE_S:
+                    last = (0.0, 0.0, 0.0)
+                    try:
+                        node.publish_cmd_vel(0.0, 0.0, 0.0)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        node.publish_cmd_vel(*last)
+                    except Exception:
+                        pass
             await asyncio.sleep(_TELEOP_REPEAT_PERIOD)
 
     repeater = asyncio.create_task(repeat())
@@ -372,6 +386,7 @@ async def ws_teleop(ws: WebSocket):
                 float(msg.get('linear_y', 0.0)),
                 float(msg.get('angular_z', 0.0)),
             )
+            last_at = time.monotonic()
             node.publish_cmd_vel(*last)
     except WebSocketDisconnect:
         pass

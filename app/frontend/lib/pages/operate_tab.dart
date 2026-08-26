@@ -38,6 +38,11 @@ class _OperateTabState extends ConsumerState<OperateTab> {
   double _linearX = 0, _linearY = 0, _angularZ = 0;
   DateTime _lastTeleopSend = DateTime.fromMillisecondsSinceEpoch(0);
   Timer? _teleopTimer;
+  // 摇杆非零时按固定周期持续发，不只在变化时发。旧行为下按住鼠标不动就一条都不发，
+  // 后端的 20 Hz 重发因此无法给"上一条指令"设陈旧期 —— 一设就变成"按住半秒就停"。
+  // 有了心跳，后端才能在链路卡住时判定"操作者已经没在说话"并刹车（后摇的根因是那条
+  // 松手指令被 WiFi 延迟卡住，实测链路 ping 会跳到 2 s，而重发线程一直在发上一条）。
+  Timer? _teleopHeartbeat;
 
   bool _showObstacle = true;
   bool _showEsdf = true;
@@ -87,6 +92,31 @@ class _OperateTabState extends ConsumerState<OperateTab> {
         'angular_z': _angularZ,
       }));
     } catch (_) {}
+    _updateHeartbeat();
+  }
+
+  /// 非零时开心跳，回零时关掉。回零那一条本身是 force 发的，不需要心跳再补。
+  void _updateHeartbeat() {
+    final moving = _linearX != 0 || _linearY != 0 || _angularZ != 0;
+    if (moving) {
+      _teleopHeartbeat ??= Timer.periodic(_teleopSendInterval, (_) {
+        if (_linearX == 0 && _linearY == 0 && _angularZ == 0) {
+          _updateHeartbeat();
+          return;
+        }
+        try {
+          _teleopChannel?.sink.add(jsonEncode({
+            'linear_x': _linearX,
+            'linear_y': _linearY,
+            'angular_z': _angularZ,
+          }));
+        } catch (_) {}
+        _lastTeleopSend = DateTime.now();
+      });
+    } else {
+      _teleopHeartbeat?.cancel();
+      _teleopHeartbeat = null;
+    }
   }
 
   // x used to drive linear_y, which is a LeKiwi leftover: that chassis was three-wheel
@@ -116,6 +146,7 @@ class _OperateTabState extends ConsumerState<OperateTab> {
   @override
   void dispose() {
     _teleopTimer?.cancel();
+    _teleopHeartbeat?.cancel();
     _teleopChannel?.sink.close();
     super.dispose();
   }
