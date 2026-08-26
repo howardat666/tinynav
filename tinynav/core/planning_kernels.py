@@ -184,7 +184,21 @@ def score_trajectories_by_ESDF(trajectories, ESDF_map, origin, resolution,
     scores = []
     occ_points = []
     ESDF_rows, ESDF_cols = ESDF_map.shape
-    n_samples = 1 if is_circle else 5
+    # 方形底盘按"间距不超过一格"铺满车体，而不是只取中心加四角。0.28x0.35 的车体在 0.1 m
+    # 栅格上，前缘两角相距 0.35 m 却中间不取样 —— 一个 0.1 m 的障碍能整个坐在空隙里，五个点
+    # 全读"空"。上游平台是靠膨胀 2 格盖住这件事的，所以过去把膨胀关掉就等于把盖子拿走而没
+    # 换东西（2026-08 实车撞过）。铺满之后膨胀才敢归零，而膨胀每格要多 0.1 m 的过道净宽。
+    # 4x5=20 个点，间距 0.093 / 0.088 m 都小于一格；代价是取样量 4 倍。
+    if is_circle:
+        n_along = 1
+        n_across = 1
+    else:
+        n_along = int(np.ceil((front_len + rear_len) / resolution)) + 1
+        n_across = int(np.ceil(2.0 * half_w / resolution)) + 1
+        if n_along < 2:
+            n_along = 2
+        if n_across < 2:
+            n_across = 2
 
     for t in range(len(trajectories)):
         traj = trajectories[t]
@@ -207,30 +221,27 @@ def score_trajectories_by_ESDF(trajectories, ESDF_map, origin, resolution,
             left_x = -fwd_y
             left_y = fwd_x
 
-            # center + 4 corners, unrolled for numba
-            check_xs = (
-                x_world,
-                x_world + fwd_x * front_len + left_x * half_w,
-                x_world + fwd_x * front_len - left_x * half_w,
-                x_world - fwd_x * rear_len  + left_x * half_w,
-                x_world - fwd_x * rear_len  - left_x * half_w,
-            )
-            check_ys = (
-                y_world,
-                y_world + fwd_y * front_len + left_y * half_w,
-                y_world + fwd_y * front_len - left_y * half_w,
-                y_world - fwd_y * rear_len  + left_y * half_w,
-                y_world - fwd_y * rear_len  - left_y * half_w,
-            )
-
-            for k in range(n_samples):
-                x_img = int((check_xs[k] - origin[0]) / resolution)
-                y_img = int((check_ys[k] - origin[1]) / resolution)
-                if 0 <= x_img < ESDF_rows and 0 <= y_img < ESDF_cols:
-                    dist = ESDF_map[x_img, y_img]
-                    if dist < min_dist_for_traj:
-                        min_dist_for_traj = dist
-                        closest_step_for_traj = i
+            span_along = front_len + rear_len
+            span_across = 2.0 * half_w
+            for ia in range(n_along):
+                if n_along == 1:
+                    off_a = 0.0
+                else:
+                    off_a = -rear_len + span_along * ia / (n_along - 1)
+                for ic in range(n_across):
+                    if n_across == 1:
+                        off_c = 0.0
+                    else:
+                        off_c = -half_w + span_across * ic / (n_across - 1)
+                    px = x_world + fwd_x * off_a + left_x * off_c
+                    py = y_world + fwd_y * off_a + left_y * off_c
+                    x_img = int((px - origin[0]) / resolution)
+                    y_img = int((py - origin[1]) / resolution)
+                    if 0 <= x_img < ESDF_rows and 0 <= y_img < ESDF_cols:
+                        dist = ESDF_map[x_img, y_img]
+                        if dist < min_dist_for_traj:
+                            min_dist_for_traj = dist
+                            closest_step_for_traj = i
 
         if min_dist_for_traj < hard_clearance:  # collision
             scores.append(float('inf'))

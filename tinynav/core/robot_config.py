@@ -269,7 +269,11 @@ DIFFCAR_CONFIG = RobotConfig(
     # 从下面过，把它算成障碍会把整条走廊封掉。两边各留约 0.12 m 余量。
     # 1.0 试过，2026-08-25 实测把桌面之类的悬空物全投影成地面障碍：front_clearance 掉到
     # 0.11 m、106 条轨迹 101 条被拒，车原地左右打转 10 s 才脱困。0.2 又低于椅面。
-    obstacle=ObstacleConfig(robot_z_bottom=-0.3, robot_z_top=0.4, dilation_cells=1),
+    # 膨胀归零，配套 score_trajectories_by_ESDF 的取样点铺满（2026-08-26）。膨胀每格要多
+    # 0.1 m 的过道净宽：仿真扫描下，膨胀 1 格时 0.9 m 过道抖动、1.1 m 才好用；归零之后
+    # 0.7 m 一次穿过、零原地转零倒车。膨胀过去存在的唯一理由是盖住五点取样的空隙，
+    # 那个洞现在被 4x5 铺满的取样点堵上了，所以这两处必须成对，别只改一个。
+    obstacle=ObstacleConfig(robot_z_bottom=-0.3, robot_z_top=0.4, dilation_cells=0),
     # 0.6, and the reaction-budget argument that held it at 0.3 was mostly wrong: the
     # library samples 7 speeds from 0 to vx_max and collision-checks each over its whole
     # 3 s extent, so raising the ceiling adds fast options rather than forcing speed --
