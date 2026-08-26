@@ -136,6 +136,12 @@ CFGS = {
                  vx_cont_w=40.0, escape=True, retreat=True, retreat_max_s=4.0,
                  omega_max=1.05, grid=(100,100,9), goffset=(0.0,0.0,0.15),
                  real_gate=True, multi_reverse=True),
+    # 新门限但余量只留"别在障碍格里"。膨胀已经给了 0.1 m，再叠 0.1 m 是重复收费。
+    "pm02": dict(max_vx=0.5, front_blocked_m=0.20, probe_max=1.2, reaction=2.0,
+                 dilation=1, z_bottom=-0.3, z_top=0.4, reverse_speed=0.06,
+                 vx_cont_w=40.0, escape=True, retreat=True, retreat_max_s=4.0,
+                 omega_max=1.05, grid=(100,100,9), goffset=(0.0,0.0,0.15),
+                 real_gate=True, multi_reverse=True, prefix_margin=0.02),
     # 只把膨胀关掉，其余同 new。仿真里墙是实心的，所以关掉膨胀不会暴露五点取样的漏洞
     # —— 这一栏量的是**纯几何**代价，真车上要配套把取样点加密才安全。
     "nodil": dict(max_vx=0.5, front_blocked_m=0.20, probe_max=1.2, reaction=2.0,

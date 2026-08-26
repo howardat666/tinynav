@@ -121,11 +121,11 @@ class Teleop(Node):
             return None
         x0, y0, t0 = self.ref_odom
         dx, dy = self.odom[0] - x0, self.odom[1] - y0
+        # 不绕回 ±180。以前这里绕，而 VIO 侧的 rotvec 量程是 ±360（2*atan2(n, w)），
+        # 两个约定一比就凭空多出一个整 360 度 —— 2026-08-26 两趟实测差 +361.31 和 +358.54，
+        # 解绕后其实只差 1.31 和 -1.46 度。转超过半圈的动作(比如走矩形)必然踩到。
+        # 固件积分的 theta 本身是连续累加的，所以直接相减就是真实累计转角。
         dt = self.odom[2] - t0
-        while dt > np.pi:
-            dt -= 2 * np.pi
-        while dt < -np.pi:
-            dt += 2 * np.pi
         return (dx * np.cos(t0) + dy * np.sin(t0), -dx * np.sin(t0) + dy * np.cos(t0), dt)
 
     def _latch(self, w):
@@ -238,12 +238,20 @@ def main():
                     print("  轮速里程计   " + fmt(wr, node.path_o))
                     print("  VIO          " + fmt(vr, node.path_v, wr))
                     if wr and vr and vr[0] is not None:
-                        print("  差(轮-VIO)   前进 %+8.4f  左偏 %+8.4f  转角 %+7.2f"
-                              % (wr[0] - vr[0], wr[1] - vr[1], np.degrees(wr[2] - vr[2])))
+                        # VIO 的转角量程是 ±360，轮速是连续累加：比较前把 VIO 解到
+                        # 离轮速最近的那一支，否则差值里会混进整圈。
+                        dv = np.degrees(vr[2])
+                        dw = np.degrees(wr[2])
+                        while dv - dw > 180.0:
+                            dv -= 360.0
+                        while dw - dv > 180.0:
+                            dv += 360.0
+                        print("  差(轮-VIO)   前进 %+8.4f  左偏 %+8.4f  转角 %+7.2f  (VIO 解绕后 %+7.2f)"
+                              % (wr[0] - vr[0], wr[1] - vr[1], dw - dv, dv))
                         if abs(vr[0]) > 0.05:
-                            print("  轮/VIO 前进比 = %.4f   转角比 = %s"
+                            print("  轮/VIO 前进比 = %.4f   转角比(解绕后) = %s"
                                   % (wr[0] / vr[0],
-                                     "%.4f" % (wr[2] / vr[2]) if abs(vr[2]) > 1e-3 else "转角太小"))
+                                     "%.4f" % (dw / dv) if abs(dv) > 0.1 else "转角太小"))
                     print("  电池 %.2f V (最低 %.2f V)" % (node.batt or 0, node.batt_min))
                     print("  卷尺量：起点 -> 车体左后角")
                 elif k in "wsad":
