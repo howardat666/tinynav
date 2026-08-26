@@ -29,6 +29,7 @@ import cv2
 from tinynav.core.math_utils import quat_to_matrix, matrix_to_quat, pose_msg2np, rotvec_to_matrix
 from tinynav.core.planning_kernels import (
     generate_trajectory_library_3d,
+    low_obstacle_hits,
     run_raycasting_loopy,
     score_trajectories_by_ESDF,
 )
@@ -189,6 +190,23 @@ def roll_occupancy_grid(occupancy_grid, old_origin, new_origin, resolution):
     return rolled, updated_origin
 
 
+def _roll_2d(grid, shift_voxels):
+    """xy roll 的 2D 版本，语义与 roll_occupancy_grid 一致：挪出去的边清零。"""
+    if np.all(shift_voxels == 0):
+        return grid
+    rolled = np.roll(grid, shift=tuple(-shift_voxels), axis=(0, 1))
+    sx, sy = int(shift_voxels[0]), int(shift_voxels[1])
+    if sx > 0:
+        rolled[-sx:, :] = 0.0
+    elif sx < 0:
+        rolled[:-sx, :] = 0.0
+    if sy > 0:
+        rolled[:, -sy:] = 0.0
+    elif sy < 0:
+        rolled[:, :-sy] = 0.0
+    return rolled
+
+
 # === PlanningNode class ===
 class PlanningNode(Node):
     def __init__(self):
@@ -306,6 +324,24 @@ class PlanningNode(Node):
         # 而以前没有任何数字能区分"它确实还在"和"它只是没人再看它一眼"。
         self._obstacle_first_seen = np.zeros(self.grid_shape[:2], dtype=np.float64)
         self._obstacle_last_seen = np.zeros(self.grid_shape[:2], dtype=np.float64)
+        # 矮障碍（办公椅星形底盘、门槛、趴着的狗）的独立 2D 证据。z 跨度判据结构上看不见
+        # 它们：0.1 m 的体素里 4~8 cm 的椅子腿和地面同层，跨度恒为 0，而体素层和地面的
+        # 相位由 VIO 的 z 决定、会漂。所以这一路直接拿「离地高度」判，绕开体素量化。
+        self.camera_height_m = float(os.environ.get('TINYNAV_CAMERA_HEIGHT_M', '0.18'))
+        self.low_obs_h_lo = float(os.environ.get('TINYNAV_LOW_OBS_H_LO', '0.05'))
+        # 0.25 以上交给跨度判据，这一路只管它看不见的那一段。
+        self.low_obs_h_hi = float(os.environ.get('TINYNAV_LOW_OBS_H_HI', '0.25'))
+        # 1.5 m 不是保守，是量出来的：2 m 之外拟合地面自己就抬高 4.5 cm，门限会开始误报。
+        self.low_obs_max_range_m = float(os.environ.get('TINYNAV_LOW_OBS_RANGE_M', '1.5'))
+        # 每格最少命中点数。板上实测 step=5 下，1.5 m 内 71 个空地格在 1~8 点、4~8 cm
+        # 各档组合下误报全为 0，椅子底盘稳定给出 31 个格，所以 5 是宽松取值不是紧的。
+        self.low_obs_min_pts = int(os.environ.get('TINYNAV_LOW_OBS_MIN_PTS', '5'))
+        # 0 关掉这一路。
+        self.low_obs_enabled = os.environ.get('TINYNAV_LOW_OBS', '1') != '0'
+        # 衰减 0.9 + 每帧 +0.1，判据 >0.1：和占据栅格一样要连续两帧，但会自己清掉 ——
+        # 相机在 0.18 m 处向下只能看到身前 0.18 m 以外，车头前 13 cm 是盲区，靠这段记忆
+        # （0.9^n，约 1.4 s / 0.3 m/s 下 0.42 m）盖过去。
+        self._low_obstacle = np.zeros(self.grid_shape[:2], dtype=np.float64)
         self.K = None
         self.baseline = None
         self.last_T = None
@@ -347,7 +383,10 @@ class PlanningNode(Node):
         self.get_logger().info(
             f"obstacle: raycast step={self.step} "
             f"span>={self.obstacle_config.min_wall_span_m} "
-            f"dilation={self.obstacle_config.dilation_cells}")
+            f"dilation={self.obstacle_config.dilation_cells} "
+            f"low_obs={'on' if self.low_obs_enabled else 'off'} "
+            f"({self.low_obs_h_lo}~{self.low_obs_h_hi} m, <{self.low_obs_max_range_m} m, "
+            f">={self.low_obs_min_pts} pts, cam_h={self.camera_height_m})")
         self.stamp = None
         self.current_pose = None  # Store the latest pose from odometry
 
@@ -1118,7 +1157,9 @@ class PlanningNode(Node):
                 new_center = robot_pos
                 new_origin = (new_center - np.array(self.grid_shape) * self.resolution / 2
                               + self.grid_offset)
+                shift_xy = np.round((new_origin[:2] - self.origin[:2]) / self.resolution).astype(int)
                 self.occupancy_grid, self.origin = roll_occupancy_grid(self.occupancy_grid, self.origin, new_origin, self.resolution)
+                self._low_obstacle = _roll_2d(self._low_obstacle, shift_xy)
             new_occ = run_raycasting_loopy(depth, T, self.grid_shape, fx, fy, cx, cy, self.origin, self.step, self.resolution)
             self.occupancy_grid *= 0.99
             self.occupancy_grid += new_occ
@@ -1127,6 +1168,15 @@ class PlanningNode(Node):
             # that is already the latency bottleneck, and the bus loss measurements
             # (docs/x5/servo_bus.md) make memory bandwidth a suspect in its own right.
             np.clip(self.occupancy_grid, -0.2, 0.2, out=self.occupancy_grid)
+
+            if self.low_obs_enabled:
+                hits = low_obstacle_hits(
+                    depth, T, self.grid_shape, fx, fy, cx, cy, self.origin,
+                    self.step, self.resolution, T[2, 3] - self.camera_height_m,
+                    self.low_obs_h_lo, self.low_obs_h_hi, self.low_obs_max_range_m)
+                self._low_obstacle *= 0.9
+                self._low_obstacle[hits >= self.low_obs_min_pts] += 0.1
+                np.clip(self._low_obstacle, 0.0, 0.2, out=self._low_obstacle)
 
             # Nothing but the app's 3D local view consumes this, so it follows the same
             # gate as the overlays below rather than get_subscription_count() -- see
@@ -1143,6 +1193,8 @@ class PlanningNode(Node):
                 self.occupancy_grid, self.origin, self.resolution,
                 robot_z=T[2, 3], config=self.obstacle_config,
             )
+            if self.low_obs_enabled:
+                obstacle_mask = obstacle_mask | (self._low_obstacle > 0.1)
             self._track_obstacle_age(obstacle_mask)
             ESDF_map = distance_transform_edt(~obstacle_mask).astype(np.float32) * self.resolution
             # Before the no-target return below, so the UI keeps reading a clearance

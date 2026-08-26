@@ -94,6 +94,43 @@ def run_raycasting_loopy(depth_image, T_cam_to_world, grid_shape, fx, fy, cx, cy
 
 
 @njit(cache=True)
+def low_obstacle_hits(depth_image, T_cam_to_world, grid_shape, fx, fy, cx, cy,
+                      origin, step, resolution, floor_z, h_lo, h_hi, max_range):
+    """Per-cell count of depth returns h_lo..h_hi above the floor plane.
+
+    Exists because the z-span test in build_obstacle_map structurally cannot see an
+    office chair's star base: at 0.1 m voxels its 4-8 cm legs share a layer with the
+    floor, so their span is 0 no matter what the threshold is, and the phase between
+    the voxel lattice and the floor is set by VIO z and drifts. Measured on the board
+    2026-08-26: floor residuals are p99 1.2 cm within 1 m and 2.6 cm at 1-2 m, while
+    the chair base sits at 3-12 cm -- but beyond 2 m the fitted floor itself rises
+    4.5 cm, which is why max_range exists.
+    """
+    h, w = grid_shape[0], grid_shape[1]
+    hits = np.zeros((h, w), dtype=np.int32)
+    depth_height, depth_width = depth_image.shape
+    origin_x, origin_y = origin[0], origin[1]
+    for v in range(0, depth_height, step):
+        for u in range(0, depth_width, step):
+            d = depth_image[v, u]
+            if (not np.isfinite(d)) or d <= 0 or d > max_range:
+                continue
+            px = (u - cx) * d / fx
+            py = (v - cy) * d / fy
+            pw_x = T_cam_to_world[0, 0] * px + T_cam_to_world[0, 1] * py + T_cam_to_world[0, 2] * d + T_cam_to_world[0, 3]
+            pw_y = T_cam_to_world[1, 0] * px + T_cam_to_world[1, 1] * py + T_cam_to_world[1, 2] * d + T_cam_to_world[1, 3]
+            pw_z = T_cam_to_world[2, 0] * px + T_cam_to_world[2, 1] * py + T_cam_to_world[2, 2] * d + T_cam_to_world[2, 3]
+            height = pw_z - floor_z
+            if height < h_lo or height > h_hi:
+                continue
+            i = int(np.floor((pw_x - origin_x) / resolution))
+            j = int(np.floor((pw_y - origin_y) / resolution))
+            if 0 <= i < h and 0 <= j < w:
+                hits[i, j] += 1
+    return hits
+
+
+@njit(cache=True)
 def generate_trajectory_library_3d(
     num_samples=15, duration=3.0, dt=0.1,
     init_p=np.zeros(3), init_q=np.array([0, 0, 0, 1]), vx_max=0.5, omega_max=np.pi / 3
