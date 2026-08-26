@@ -224,6 +224,22 @@ _MAP_SKIP_TOPICS_LOOPER = (
     '/camera/camera/vio_100hz',
 )
 
+# 彩色两路，只在 TINYNAV_MAP_SAVE_VIDEOS=0 时追加。彩色是 bag 里频率最高的图像话题
+# （实测 7671 帧 / 30.0 Hz，红外 5111 / 20 Hz），跳过 imu 和 vio_100hz 之后它占剩余
+# 消息的 32%，而它喂的三样东西 —— rgb_images_db、rgb_camera_intrinsics.npy、
+# T_rgb_to_infra1.npy —— 只有 tool/convert_to_nerf_format.py 和 convert_to_colmap_format.py
+# 读，两者都是 PC 上的离线导出工具，且都还需要 rgb_images_db 本身。也就是说
+# --no-rgb-video 一开，这三样就一起没用了，没有"只留内参"这种中间态。
+_MAP_SKIP_TOPICS_RGB = (
+    '/camera/camera/color/image_rect_raw/compressed',
+    '/camera/camera/color/camera_info',
+)
+
+
+
+def _map_skip_topics() -> tuple:
+    return _MAP_SKIP_TOPICS_LOOPER + (() if _MAP_SAVE_VIDEOS else _MAP_SKIP_TOPICS_RGB)
+
 
 def _build_map_argv(map_save_path: str, bag_file: str, skip_topics: tuple = ()) -> list[str]:
     """build_map_node argv, with the board's resource limits applied if set."""
@@ -2116,7 +2132,7 @@ class BackendNode(Ros2NodeManager):
         )
         build_argv = _build_map_argv(
             self.map_path, bag_file,
-            skip_topics=_MAP_SKIP_TOPICS_LOOPER if self._sensor_mode == 'looper' else (),
+            skip_topics=_map_skip_topics() if self._sensor_mode == 'looper' else (),
         )
         self.get_logger().info(f'map build: {" ".join(build_argv[2:])}')
         self.processes['build_map'] = self._launch_proc_tee(

@@ -120,11 +120,11 @@ def build_one(source: str, bag: str, map_path: str, log_path: str) -> dict:
     """Runs in a child process whose TINYNAV_MAP_ODOM_SOURCE is already set."""
     sys.path.insert(0, _TINYNAV_ROOT)
     from app.backend.node_manager import (  # noqa: E402
-        _bridge_argv, _build_map_argv, _MAP_SKIP_TOPICS_LOOPER, _POSE_TOPIC_WHEEL,
+        _bridge_argv, _build_map_argv, _map_skip_topics, _POSE_TOPIC_WHEEL,
     )
 
     bridge_argv = _bridge_argv(for_map_build=True)
-    build_argv = _build_map_argv(map_path, bag, skip_topics=_MAP_SKIP_TOPICS_LOOPER)
+    build_argv = _build_map_argv(map_path, bag, skip_topics=_map_skip_topics())
     expect = _POSE_TOPIC_WHEEL if source == 'wheel' else '/camera/camera/vio_image'
     if expect not in bridge_argv:
         raise SystemExit(f'bridge argv does not use {expect}: {bridge_argv}')

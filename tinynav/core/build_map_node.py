@@ -1021,7 +1021,12 @@ class BuildMapNode(Node):
         self.depth_sub = Subscriber(self, Image, '/slam/keyframe_depth')
         self.keyframe_image_sub = Subscriber(self, Image, '/slam/keyframe_image')
         self.keyframe_odom_sub = Subscriber(self, Odometry, '/slam/keyframe_odom')
-        self.rgb_image_sub = Subscriber(self, Image, '/camera/camera/color/image_raw')
+        # 彩色只喂 rgb_images_db，而它归 --no-rgb-video 管。不存就别订阅：这一路是 30 Hz，
+        # 是 bag 里频率最高的图像话题（7671 帧，红外才 5111），每帧都要 JPEG 解码 + 以原始图
+        # 重发 + 参与同步，最后一个字节都不写进地图。
+        self.sync_rgb = save_rgb_video
+        self.rgb_image_sub = (Subscriber(self, Image, '/camera/camera/color/image_raw')
+                              if self.sync_rgb else None)
         self.continuous_odom_sub = self.create_subscription(Odometry, '/slam/odometry', self.continuous_odom_callback, 100)
 
         self.marker_pub = self.create_publisher(MarkerArray, '/mapping/pointcloud_markers', 10)
@@ -1042,10 +1047,10 @@ class BuildMapNode(Node):
         # 544x640 that is roughly 1.4 MB per slot and 280 MB of headroom handed to a
         # producer that, unpaced, will use all of it. On the X5 (1307 MB, no swap)
         # that alone is the difference between a build and an OOM kill.
-        self.ts = ApproximateTimeSynchronizer(
-            [self.keyframe_image_sub, self.keyframe_odom_sub, self.depth_sub, self.rgb_image_sub],
-            sync_queue_size, 0.02,
-        )
+        sync_subs = [self.keyframe_image_sub, self.keyframe_odom_sub, self.depth_sub]
+        if self.rgb_image_sub is not None:
+            sync_subs.append(self.rgb_image_sub)
+        self.ts = ApproximateTimeSynchronizer(sync_subs, sync_queue_size, 0.02)
         self.ts.registerCallback(self.keyframe_callback)
 
         self.K = None
@@ -1185,13 +1190,13 @@ class BuildMapNode(Node):
                 save_finished_msg.data = False
                 self.mapping_save_finished_pub.publish(save_finished_msg)
 
-    def keyframe_callback(self, keyframe_image_msg:Image, keyframe_odom_msg:Odometry, depth_msg:Image, rgb_image_msg:Image):
+    def keyframe_callback(self, keyframe_image_msg:Image, keyframe_odom_msg:Odometry, depth_msg:Image, rgb_image_msg:Image = None):
         with self.stage_timer.timed("mapping_loop"):
             if self.K is None:
                 return
             self.process(keyframe_image_msg, keyframe_odom_msg, depth_msg, rgb_image_msg)
 
-    def process(self, keyframe_image_msg:Image, keyframe_odom_msg:Odometry, depth_msg:Image, rgb_image_msg:Image):
+    def process(self, keyframe_image_msg:Image, keyframe_odom_msg:Odometry, depth_msg:Image, rgb_image_msg:Image = None):
         with self.stage_timer.timed("msg_decode"):
             keyframe_image_timestamp = int(keyframe_image_msg.header.stamp.sec * 1e9) + int(keyframe_image_msg.header.stamp.nanosec)
             keyframe_odom_timestamp = int(keyframe_odom_msg.header.stamp.sec * 1e9) + int(keyframe_odom_msg.header.stamp.nanosec)
@@ -1202,7 +1207,8 @@ class BuildMapNode(Node):
             depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding="32FC1")
             odom, _ = msg2np(keyframe_odom_msg)
             infra1_image = self.bridge.imgmsg_to_cv2(keyframe_image_msg, desired_encoding="mono8")
-            rgb_image = self.bridge.imgmsg_to_cv2(rgb_image_msg, desired_encoding="bgr8")
+            rgb_image = (None if rgb_image_msg is None
+                         else self.bridge.imgmsg_to_cv2(rgb_image_msg, desired_encoding="bgr8"))
 
         with self.stage_timer.timed("save_image_and_depth"):
             self.db.set_entry(keyframe_image_timestamp, depth = depth, infra1_image = infra1_image, rgb_image = rgb_image)
@@ -1647,10 +1653,13 @@ def main(args=None):
         save_infra1_video=parsed_args.save_infra1_video,
         save_rgb_video=parsed_args.save_rgb_video,
     )
-    image_transports_node = ImageTransportsNode()
+    # 这个节点存在的唯一理由是把压缩彩色解成原始图喂给 map_node。不存彩色就别起它，
+    # 否则 7671 次 JPEG 解码 + 重发全落在这个已经被占满的单线程里。
+    image_transports_node = (ImageTransportsNode() if parsed_args.save_rgb_video else None)
     exec_.add_node(player_node)
     exec_.add_node(map_node)
-    exec_.add_node(image_transports_node)
+    if image_transports_node is not None:
+        exec_.add_node(image_transports_node)
     while rclpy.ok() and player_node.play_next():
         exec_.spin_once(timeout_sec=0.001)
     player_node._publish_percent(100.0)
