@@ -21,10 +21,17 @@ WHY IT IMPORTS node_manager INSTEAD OF SPELLING OUT THE ARGV
     the one thing being compared. That variable is read at import, so each source
     runs in its own child process with the environment already set.
 
-WHY THE APP MUST BE STOPPED
-    The board has 1338 MB and no swap. The vocabulary alone peaks at 407 MB and the
-    running app holds ~950 MB during navigation, so a build alongside it is an
-    OOM kill rather than a slow build.
+WHY THE APP IS STOPPED
+    Not because a build needs the room -- measured 2026-08-26, a build peaks at 527 MB
+    (351 build_map_node + 176 bridge) against 1787 MB total, and available memory never
+    fell below 959 MB. The three numbers this used to cite are all stale: the board saw
+    1338 MB before the ion_cma resize, the 407 MB vocabulary was DBoW3's and VLAD's
+    centres are 256 KB, and the app's ~950 MB is what *navigation* holds. Building from
+    the app is a supported path and does not stop being one.
+
+    What must not run alongside is *navigation*, which does hold ~950 MB and would leave
+    a build without headroom on a board with no swap. app_running() cannot tell the two
+    apart, so it stops the app and errs on the safe side; --force skips it.
 """
 
 from __future__ import annotations
@@ -227,7 +234,8 @@ def main():
         print(f'no such bag: {args.bag}')
         return 1
     if app_running() and not args.force:
-        print('the app is running; a build alongside it is OOM-killed on this board.\n'
+        print('the app is running. A build itself fits alongside it (527 MB peak), but\n'
+              'navigation does not -- and this check cannot tell whether nav is up.\n'
               '  bash tool/x5_board/app_start.sh stop      (or pass --force)')
         return 1
 
