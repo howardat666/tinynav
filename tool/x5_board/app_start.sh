@@ -162,6 +162,20 @@ do_start() {
     # derives it from the mask's OccupancyGrid metadata. Set to 0 only to buy CPU back.
     export TINYNAV_PUBLISH_PLANNING_OVERLAYS="${TINYNAV_PUBLISH_PLANNING_OVERLAYS:-1}"
     export TINYNAV_VERBOSE_TIMER="${TINYNAV_VERBOSE_TIMER:-0}"
+    # 障碍感知。step 5 而不是 10：前方 1~3 m 的占据格单帧召回 42~56% -> 68~72%
+    # (2026-08-26 板上实测)，代价 4.3 -> 14.0 ms。膨胀 0：膨胀每格要付 0.1 m/侧的过道
+    # 净宽，而窄过道正好最缺这 0.2 m，填洞交给 step。span 留 0.2：0.1 在实测的一帧里
+    # 多出的格子分不清是地面还是椅子腿，矮障碍这件事交给下面按离地高度判的那一路。
+    export TINYNAV_RAYCAST_STEP="${TINYNAV_RAYCAST_STEP:-5}"
+    export TINYNAV_MIN_WALL_SPAN_M="${TINYNAV_MIN_WALL_SPAN_M:-0.2}"
+    export TINYNAV_DILATION_CELLS="${TINYNAV_DILATION_CELLS:-0}"
+    # 矮障碍：办公椅星形底盘那类 4~8 cm 的东西在 0.1 m 体素里和地面同层，z 跨度恒为 0，
+    # 所以走一条按离地高度判的独立通路。量程 1.5 m 是量出来的（2 m 外拟合地面自己抬 4.5 cm）。
+    export TINYNAV_LOW_OBS="${TINYNAV_LOW_OBS:-1}"
+    export TINYNAV_LOW_OBS_H_LO="${TINYNAV_LOW_OBS_H_LO:-0.05}"
+    export TINYNAV_LOW_OBS_RANGE_M="${TINYNAV_LOW_OBS_RANGE_M:-1.5}"
+    export TINYNAV_LOW_OBS_MIN_PTS="${TINYNAV_LOW_OBS_MIN_PTS:-5}"
+    export TINYNAV_CAMERA_HEIGHT_M="${TINYNAV_CAMERA_HEIGHT_M:-0.18}"
 
     # 检索方案。vlad = VLAD over BPU SuperPoint（默认），bow = DBoW3 over ORB。
     # 地图和重定位必须同一个值，一个模式建的图在另一个模式下每次查询都落空。
@@ -196,6 +210,7 @@ do_start() {
         echo "⚠️ 地图必须用同一个 retrieval 建，换了就得重建"
         echo "map build     : rate=${TINYNAV_MAP_PLAY_RATE} queue=${TINYNAV_MAP_SYNC_QUEUE} vis=${TINYNAV_MAP_VISUALIZATION} videos=${TINYNAV_MAP_SAVE_VIDEOS} db_sync=${TINYNAV_DB_SYNC_EVERY}"
         echo "diagnostics   : planning_overlays=${TINYNAV_PUBLISH_PLANNING_OVERLAYS} verbose_timer=${TINYNAV_VERBOSE_TIMER}"
+        echo "obstacle      : step=${TINYNAV_RAYCAST_STEP} span=${TINYNAV_MIN_WALL_SPAN_M} dilation=${TINYNAV_DILATION_CELLS} low_obs=${TINYNAV_LOW_OBS} (h>=${TINYNAV_LOW_OBS_H_LO}m <${TINYNAV_LOW_OBS_RANGE_M}m)"
         echo "=============================================================="
     } >> "${LOGFILE}"
 
