@@ -25,7 +25,7 @@ import sensor_msgs_py.point_cloud2 as pc2
 from std_msgs.msg import Bool, Header, String
 from codetiming import Timer
 import cv2
-from tinynav.core.math_utils import quat_to_matrix, matrix_to_quat, pose_msg2np
+from tinynav.core.math_utils import quat_to_matrix, matrix_to_quat, pose_msg2np, rotvec_to_matrix
 from tinynav.core.planning_kernels import (
     generate_trajectory_library_3d,
     run_raycasting_loopy,
@@ -134,21 +134,25 @@ def generate_predefined_trajectory_vocabularies(
     #     即"退一点点就能转了"，根本不需要 0.6 m。
     # 速度小还有一层：车后方的格子从来没被观测过，0.06 m/s 撞上去的动能是 0.2 m/s 的 1/11。
     reverse_speed = 0.06
-    p = init_p.copy()
-    q = quat_to_matrix(init_q)
-    # omega is zero for this vocabulary, so the orientation never changes: the
-    # quaternion and the world velocity are loop invariants. They used to be
-    # recomputed on every step to produce the same value 31 times.
-    quat = matrix_to_quat(q)
-    step = (q @ np.array([0.0, 0.0, -reverse_speed])) * dt
-    traj = np.empty((num_steps, 7), dtype=np.float64)
-    for i in range(num_steps):
-        p += step
-        traj[i, :3] = p
-        traj[i, 3:] = quat
-    traj[:, 2] = traj[0, 2]
-    trajectories.append(traj)
-    params.append(np.array([-reverse_speed, 0.0], dtype=np.float64))
+    # 倒车不再只有直退一条。车被楔住时朝向已经偏离到达朝向 40~60 度(2026-08-25 实测)，
+    # 直退等于沿着"歪掉的"朝向退，落点离来路越退越远 —— 而 _retreat_index 要求整条轨迹都
+    # 压在走过的地方，于是直退经常是唯一的候选却又必然被拒。人把方形小车从角落里弄出来
+    # 靠的正是打着方向倒。3 s x 0.25 rad/s = 43 度、x 0.5 = 86 度，覆盖那个偏离区间。
+    R_init = quat_to_matrix(init_q)
+    for omega in (0.0, 0.25, -0.25, 0.5, -0.5):
+        p = init_p.copy()
+        q = R_init
+        dq = rotvec_to_matrix(np.array([0.0, omega * dt, 0.0]))
+        v_body = np.array([0.0, 0.0, -reverse_speed])
+        traj = np.empty((num_steps, 7), dtype=np.float64)
+        for i in range(num_steps):
+            q = q @ dq
+            p = p + (q @ v_body) * dt
+            traj[i, :3] = p
+            traj[i, 3:] = matrix_to_quat(q)
+        traj[:, 2] = traj[0, 2]
+        trajectories.append(traj)
+        params.append(np.array([-reverse_speed, omega], dtype=np.float64))
 
     return np.asarray(trajectories), np.asarray(params)
 
@@ -342,6 +346,8 @@ class PlanningNode(Node):
         # 0.5 -> 1.2 m。0.5 时 front_clearance 的 p90 就是 0.50，是饱和值 —— 看不到更远，
         # 也就无法支撑一个随速度变大的门限。1.2 m 覆盖 max_vx=0.5 需要的 0.80 m。
         self.front_probe_max_m = 1.2
+        # 一格。障碍图已经膨胀过 1 格(dilation_cells=1)，这一格是在那之上的余量。
+        self.prefix_margin_m = 0.10
         # 从"承诺一条轨迹"到"能改指令"之间车会走 v x reaction_time_s。
         # 这个值由闭环仿真定，不是由"周期 + 滞后"直接推 —— tool/sim_front_gate.py 用真的
         # run_raycasting_loopy + build_obstacle_map 让相机以 0.5 m/s 撞向一堵墙，扫出来：
@@ -594,11 +600,45 @@ class PlanningNode(Node):
         return scores, occ_points
 
     def _front_gate_m(self):
-        """前进被完全禁掉的净空阈值。取"最慢一档前进所需视距"和配置下限的较大者。"""
+        """界面提示用的净空阈值。规划器已不用它，见 _prefix_clearance。"""
         return max(self.robot.front_blocked_m,
                    (self.robot.max_vx / 6.0) * self.reaction_time_s)
 
-    def _motion_gate_penalty(self, param, front_clearance, front_blocked):
+    def _prefix_clearance(self, trajectories, esdf):
+        """每条轨迹在它**将要执行的那一段**上，车体五点的最小 ESDF。
+
+        为什么不是沿当前朝向的一条直线：转开的弧线在自己那条路上是空的，直线探针却因为
+        正前方有东西把它一起禁掉 —— 2026-08-26 闭环仿真里，0.9 m 宽的缝在直线探针下
+        「转 102 次、变向 25 次、超时」，换成这个判据后「13.5 s 到达，0 转 0 退 0 变向」，
+        其余四个场景逐位不变。
+
+        只取前 reaction_time_s 那一段而不是整条：重规划周期 p50 0.28 s，承诺出去的只有
+        到下一次能改指令为止的那一截，再往后的部分下个周期会重新判。"""
+        n_pref = max(2, min(trajectories.shape[1],
+                            int(round(self.reaction_time_s / self.dt)) + 1))
+        P = trajectories[:, :n_pref, :]
+        fl, rl, hw = self.robot.footprint_from_control()
+        qx, qy, qz, qw = P[..., 3], P[..., 4], P[..., 5], P[..., 6]
+        fx = 2.0 * (qx * qz + qw * qy)
+        fy = 2.0 * (qy * qz - qw * qx)
+        nrm = np.hypot(fx, fy)
+        nrm[nrm < 1e-6] = 1.0
+        fx, fy = fx / nrm, fy / nrm
+        lx, ly = -fy, fx
+        xs = np.stack([P[..., 0],
+                       P[..., 0] + fx * fl + lx * hw, P[..., 0] + fx * fl - lx * hw,
+                       P[..., 0] - fx * rl + lx * hw, P[..., 0] - fx * rl - lx * hw], axis=-1)
+        ys = np.stack([P[..., 1],
+                       P[..., 1] + fy * fl + ly * hw, P[..., 1] + fy * fl - ly * hw,
+                       P[..., 1] - fy * rl + ly * hw, P[..., 1] - fy * rl - ly * hw], axis=-1)
+        ii = ((xs - self.origin[0]) / self.resolution).astype(np.int32)
+        jj = ((ys - self.origin[1]) / self.resolution).astype(np.int32)
+        inb = ((ii >= 0) & (ii < esdf.shape[0]) & (jj >= 0) & (jj < esdf.shape[1]))
+        d = np.where(inb, esdf[np.clip(ii, 0, esdf.shape[0] - 1),
+                               np.clip(jj, 0, esdf.shape[1] - 1)], np.inf)
+        return d.min(axis=(1, 2))
+
+    def _motion_gate_penalty(self, param, idx, forward_ok, front_blocked):
         """1e9 on any motion this sensor cannot vouch for, 0.0 otherwise.
 
         The occupancy grid is written only by forward raycasting, so a reverse
@@ -606,11 +646,7 @@ class PlanningNode(Node):
         camera never looked at. Measured 2026-08-10 19:19: 40 s of vx=-0.2 straight
         into an obstacle while up to 100 of the 106 trajectories were collision-free,
         because the old gate made reverse the *only* admissible option whenever the
-        front was blocked and the library holds exactly one reverse.
-
-        前进不再一刀切。每条轨迹按**它自己的速度**要求视距：承诺它到能改指令之间车会走
-        v x reaction_time_s，那段距离内不能有东西。这才是"宽敞跑快、窄处爬慢"—— 旧的
-        二值门限在 0.3 m 处把所有速度一起禁掉，于是要么全速要么完全不许前进。"""
+        front was blocked and the library holds exactly one reverse."""
         is_reverse = param[0] < 0.0
         if is_reverse:
             return 0.0 if (front_blocked and self.robot.allow_reverse) else 1e9
@@ -618,7 +654,7 @@ class PlanningNode(Node):
             # Turning in place is the only motion whose swept volume the camera has
             # already observed, so the front probe does not gate it.
             return 0.0
-        return 0.0 if front_clearance >= param[0] * self.reaction_time_s else 1e9
+        return 0.0 if forward_ok[idx] else 1e9
 
     def _record_centre(self, centre, now_ns):
         """车体中心的近期轨迹，供 _retreat_index 判断"后面走过没有"。
@@ -642,7 +678,7 @@ class PlanningNode(Node):
             h.popleft()
 
     def _retreat_index(self, params, trajectories, now_ns):
-        """直线后退轨迹的下标，若此刻后退不可证明安全则 None。
+        """最贴合来路的那条后退轨迹的下标，若此刻后退不可证明安全则 None。
 
         占据栅格只由前向射线写入，所以车后方的格子从来没被观测过 —— 对后退做碰撞检查是
         拿没看过的格子在打分，这正是 _motion_gate_penalty 里那段历史（40 s 的 vx=-0.2 直接
@@ -654,19 +690,30 @@ class PlanningNode(Node):
         if not self._centre_history:
             return None
         hist = list(self._centre_history)
+        # 词汇表现在有 5 条后退(直退 + 4 条带转向)，所以要**逐条评分再挑最好的**，
+        # 不能像以前那样第一条不合格就整个放弃 —— 那时只有一条，两种写法等价。
+        best_i, best_worst = None, None
         for i, param in enumerate(params):
-            if not (param[0] < 0.0 and abs(param[1]) < 1e-6):
+            if param[0] >= 0.0:
                 continue
             pts = trajectories[i][:, :2]
             # 每 5 个点抽一个：0.1 s 步长下相邻点只差 2 cm，逐点查是白花钱。
+            worst = 0.0
             for x, y in pts[::5]:
-                if not any(math.hypot(x - hx, y - hy) <= self._retreat_match_m
-                           for _, hx, hy in hist):
-                    return None
-            if not self._retreat_start_ns:
-                self._retreat_start_ns = now_ns
-            return i
-        return None
+                d = min((math.hypot(x - hx, y - hy) for _, hx, hy in hist), default=1e9)
+                if d > worst:
+                    worst = d
+                if worst > self._retreat_match_m:
+                    break
+            if worst > self._retreat_match_m:
+                continue
+            if best_worst is None or worst < best_worst:
+                best_i, best_worst = i, worst
+        if best_i is None:
+            return None
+        if not self._retreat_start_ns:
+            self._retreat_start_ns = now_ns
+        return best_i
 
     def _escape_reason(self, front_blocked, stand_dist, heading_err_abs, best_gain):
         """Why the robot should turn in place instead of following the ranking, or "".
@@ -944,6 +991,9 @@ class PlanningNode(Node):
             'frontClearanceM': (None if front_clearance > self.front_probe_max_m
                                 else round(float(front_clearance), 2)),
             'frontProbeMaxM': round(float(self.front_probe_max_m), 2),
+            # 只是给界面看的提示，**不再是规划器的判据** —— 规划器现在按每条轨迹自己
+            # 那段路判(见 _prefix_clearance)，「堵住」等于一条前进轨迹都不可行。这里保留
+            # 直线探针的口径是因为诊断在轨迹库生成之前就发布了，那时还没有轨迹可判。
             'frontBlocked': bool(front_clearance <= self._front_gate_m()),
             'frontBlockedAtM': round(float(self._front_gate_m()), 2),
             'obstacleCells': int(np.count_nonzero(obstacle_mask)),
@@ -1224,11 +1274,18 @@ class PlanningNode(Node):
             # "前方堵住" = 连最慢的那档前进都过不了视距门限。轨迹库把速度采成
             # linspace(0, max_vx, 7)，所以最慢的非零档是 max_vx/6。留一个下限：低于它就
             # 别再试前进了，交给转向/后退。
-            front_blocked = front_clearance <= self._front_gate_m()
+            # 「前方堵住」= 一条前进轨迹都不可行，不再是一条直线探针跨过某个数字。
+            # 这同时去掉了一个抖动源：旧判据在阈值附近来回跨越，堵/不堵两个状态的可行集
+            # 完全不同，于是车在两套动作之间跳（2026-08-25 实测摆了 10 s）。
+            prefix_clear = self._prefix_clearance(trajectories, ESDF_map)
+            forward_ok = prefix_clear >= self.prefix_margin_m
+            front_blocked = not any(
+                forward_ok[i] for i in range(len(params))
+                if params[i][0] > 0.0 and not self._is_turn_in_place(params[i]))
 
-            def cost_function(traj, param, score, target_pose):
+            def cost_function(traj, param, score, target_pose, idx):
                 gate_penalty = self._motion_gate_penalty(
-                    param, front_clearance, front_blocked)
+                    param, idx, forward_ok, front_blocked)
 
                 # regular trajectory penalty
                 traj_end = np.array(traj[-1,:3])
@@ -1274,7 +1331,7 @@ class PlanningNode(Node):
             yaw_to_target = math.atan2(float(to_t[1]), float(to_t[0]))
 
             top_k = 1
-            costs = np.array([cost_function(trajectories[i], params[i], scores[i], self.target_pose)
+            costs = np.array([cost_function(trajectories[i], params[i], scores[i], self.target_pose, i)
                               for i in range(len(trajectories))])
             top_indices = np.argsort(costs, kind='stable')[:top_k]
             turned_in_place = False
