@@ -154,7 +154,36 @@ def sysline():
             temps.append("%.1f" % (int(t) / 1000.0))
     if temps:
         out.append("temp=%s" % "/".join(temps))
+    # 相机固件的 pid 和存活秒数。2026-08-27 那次 VIO 位姿跳变（z 从 -0.76 到 +0.00）分不出
+    # 是「VIO 内部重新初始化」还是「insight_full 进程崩了重起」—— 两者修法完全不同，而事后
+    # 无从回溯。有了这两个数，下次只要看它们在跳变时刻有没有变就能定性。
+    out.append("insight=%s" % insight_state())
     return " ".join(out)
+
+
+def insight_state():
+    """<pid>/<存活秒> ，取不到就 none。只读 /proc，不 fork。
+
+    比的是 /proc/PID/comm（可执行名），不是 cmdline —— 拿 cmdline 匹配会命中**执行诊断命令
+    的那个 shell 自己**，因为它的命令行里就带着这个字符串。这就是 `pgrep -f` 那个老坑，
+    自测时当场踩到了。comm 上限 15 字节，"insight_full" 是 12，装得下。
+    """
+    try:
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            if read("/proc/%s/comm" % pid).strip() != "insight_full":
+                continue
+            st = read("/proc/%s/stat" % pid).rsplit(") ", 1)
+            if len(st) < 2:
+                return pid
+            starttime = float(st[1].split()[19])          # 单位是 clock tick
+            up = float(read("/proc/uptime").split()[0])
+            hz = float(os.sysconf("SC_CLK_TCK") or 100)
+            return "%s/%.0f" % (pid, max(0.0, up - starttime / hz))
+    except (OSError, ValueError, IndexError):
+        pass
+    return "none"
 
 
 def emit(line):
