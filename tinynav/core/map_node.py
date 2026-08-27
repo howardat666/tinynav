@@ -6,6 +6,7 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path, Odometry
 from std_msgs.msg import Bool, String
 import numpy as np
+import math
 import sys
 import json
 
@@ -342,6 +343,11 @@ class MapNode(Node):
         self.odom = {}
         self.pose_graph_used_pose = {}
         self.relative_pose_constraint = []
+        # 每次成功重定位的「质量」：(候选跨度秒, 内点率)。存下来才能在解算那一步说清
+        # 100 条约束里有几条是干净的 —— 2026-08-27 的跳变分析全靠事后从日志里重建，
+        # 而日志里既没有位姿也没有质量，只能推断。
+        self.relocalization_pose_quality = {}
+        self._last_T_map_to_odom_logged = None
         self.last_keyframe_timestamp = None
 
         (self.loop_similarity_threshold, self.loop_top_k,
@@ -738,6 +744,13 @@ class MapNode(Node):
         t_stage = mark_stage("pose_cache_update", t_stage)
 
         if success:
+            # 和上面的 reloc pose 配对：同一个时间戳下 VIO 说车在哪。两行相减就是这一次
+            # 观测给出的 map->odom，不必再从 T 反推。
+            self.get_logger().info(
+                f"reloc odom: t={keyframe_image_timestamp_ns} "
+                f"cam_odom=[{odom[0,3]:+.2f},{odom[1,3]:+.2f},{odom[2,3]:+.2f}] "
+                f"yaw_odom={self._ground_yaw_deg(odom):+.1f}deg"
+            )
             self.compute_transform_from_map_to_odom()
         t_stage = mark_stage("tf_update", t_stage)
 
@@ -1384,6 +1397,29 @@ class MapNode(Node):
             self.relocation_pub.publish(np2msg(pose_in_world, timestamp, "world", "camera"))
             self.relocalization_poses[timestamp_ns] = pose_in_world
             self.relocalization_pose_weights[timestamp_ns] = pose_cov_weight
+            # 候选跨度：检索对不对的干净判据（对的时候前 3 名是地图里相邻的关键帧）。
+            st = self.last_relocalization_stats or {}
+            cand_ts = st.get("cand_ts") or []
+            span_s = ((max(cand_ts) - min(cand_ts)) / 1e9) if len(cand_ts) > 1 else 0.0
+            self.relocalization_pose_quality[timestamp_ns] = (span_s, float(pose_cov_weight))
+            # 位姿本身以前从来没进过日志，所以「停着时是不是定位对了」只能靠推断 ——
+            # 2026-08-27 分析那次 5.34 m 跳变时就卡在这里。ref 是最佳候选在地图里的位置，
+            # 它和 cam_map 的距离就是「解出来的位置离它参考的关键帧有多远」。
+            ref_txt = "-"
+            if cand_ts and st.get("cand_matches"):
+                best_i = int(np.argmax(st["cand_matches"]))
+                ref_pose = (self.map_poses.get(cand_ts[best_i])
+                            if best_i < len(cand_ts) else None)
+                if ref_pose is not None:
+                    rp = np.asarray(ref_pose)[:3, 3]
+                    ref_txt = f"[{rp[0]:+.2f},{rp[1]:+.2f},{rp[2]:+.2f}]"
+            cm = pose_in_world[:3, 3]
+            self.get_logger().info(
+                f"reloc pose: t={timestamp_ns} "
+                f"cam_map=[{cm[0]:+.2f},{cm[1]:+.2f},{cm[2]:+.2f}] "
+                f"yaw_map={self._ground_yaw_deg(pose_in_world):+.1f}deg "
+                f"ref_map={ref_txt} cand_span={span_s:.1f}s ratio={pose_cov_weight:.2f}"
+            )
             timings["publish"] = (time.perf_counter() - t0) * 1000.0
             timings["unaccounted"] = max(0.0, (time.perf_counter() - loop_t0) * 1000.0 - sum(timings.values()))
             self.last_relocalization_timing = dict(timings)
@@ -1438,6 +1474,12 @@ class MapNode(Node):
             pass
 
 
+    @staticmethod
+    def _ground_yaw_deg(T):
+        """Ground-plane heading of a camera-optical pose. Body +z is forward."""
+        fwd = np.asarray(T)[:3, :3] @ np.array([0.0, 0.0, 1.0])
+        return math.degrees(math.atan2(float(fwd[1]), float(fwd[0])))
+
     def compute_transform_from_map_to_odom(self):
         """
         Solve the optmization problem.
@@ -1448,8 +1490,10 @@ class MapNode(Node):
             1 : np.eye(4),
         }
         constant_pose_index_dict = { 1: True }
+        used_timestamps = []
         for timestamp, pose in self.relocalization_poses.items():
             if timestamp in self.pose_graph_used_pose:
+                used_timestamps.append(timestamp)
                 camera_in_map_world = pose
                 camera_in_odom_world = self.pose_graph_used_pose[timestamp]
                 observation_T_from_map_to_odom =  camera_in_odom_world @ se3_inv(camera_in_map_world)
@@ -1459,6 +1503,28 @@ class MapNode(Node):
         relative_pose_constraint = relative_pose_constraint[-100:]
         optimized_parameters = pose_graph_solve(optimized_parameters, relative_pose_constraint, constant_pose_index_dict, max_iteration_num = 1000)
         self.T_from_map_to_odom = optimized_parameters[0]
+
+        # 这条是位姿跳变的直接证据：跳的是 T，不是位姿，而 T 只在这里变。附上约束成分是
+        # 因为解由成分决定 —— 只按时间取最近 100 条、又没有鲁棒核，陈旧低质约束占多数时
+        # 解会在两个盆地之间翻（2026-08-27 实测 5.34 m + 51 度）。
+        T = self.T_from_map_to_odom
+        prev = self._last_T_map_to_odom_logged
+        d_t = float(np.linalg.norm(T[:3, 3] - prev[:3, 3])) if prev is not None else 0.0
+        d_yaw = (self._ground_yaw_deg(T) - self._ground_yaw_deg(prev)) if prev is not None else 0.0
+        d_yaw = (d_yaw + 180.0) % 360.0 - 180.0
+        self._last_T_map_to_odom_logged = T.copy()
+        used = [self.relocalization_pose_quality.get(ts) for ts in used_timestamps[-100:]]
+        used = [q for q in used if q is not None]
+        clean = sum(1 for sp, r in used if sp <= 2.0 and r >= 0.70)
+        spans = sorted(sp for sp, _ in used) or [0.0]
+        ratios = sorted(r for _, r in used) or [0.0]
+        self.get_logger().info(
+            f"map->odom: t=[{T[0,3]:+.2f},{T[1,3]:+.2f},{T[2,3]:+.2f}] "
+            f"yaw={self._ground_yaw_deg(T):+.1f}deg "
+            f"d_t={d_t:.3f}m d_yaw={d_yaw:+.1f}deg "
+            f"constraints={len(relative_pose_constraint)} clean={clean}/{len(used)} "
+            f"span_p50={spans[len(spans)//2]:.1f}s ratio_p50={ratios[len(ratios)//2]:.2f}"
+        )
 
     def try_publish_nav_path(self, timestamp: int):
         t_start = time.perf_counter()
