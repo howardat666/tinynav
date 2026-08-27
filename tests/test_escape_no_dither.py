@@ -50,7 +50,7 @@ def run(node, mask, centre, yaw0, omegas, dt=0.1, steps=30, cycles=40):
         err = node._wrap(node._escape_goal_yaw - yaw)
         turns = list(range(len(omegas)))
         params = np.array([[0.0, w] for w in omegas])
-        k = node._pick_turn_toward(turns, params, err)
+        k, _long = node._pick_turn_toward(turns, params, err)
         if k is None:
             continue
         w = omegas[k]

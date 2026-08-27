@@ -77,9 +77,10 @@ def run(name, sc, poll_hz=5.0):
     cfg["objects"] = sc["objects"]
     # 相机高度按实车：Looper 装在 0.18 m，仿真默认 0.45 会看不到矮东西。
     cfg["camera"]["mount_height"] = 0.18
-    # update-config(reset=True) 自己就会重启 planning_node，再叫一次 start-ros-loop 等于
-    # 连着杀两遍，实测会留下一个「一直不动」的假失败。
-    api("/api/update-config", {"config": cfg, "reset": True})
+    # restart_all：planning **和** control 都必须换新的。planning 带着上一个场景的障碍图、
+    # control 带着上一个场景累积的路径参考，都会让下一个场景「单独跑过、连着跑不动」——
+    # 看着像规划器的 bug，实际是测试台没隔离。
+    api("/api/update-config", {"config": cfg, "reset": True, "restart_all": True})
 
     # 等仿真环真的转起来再开始计时：planning_node 重启要付一次 numba 编译，把那段算进
     # 预算就会把「起得慢」误判成「走不动」。判据是它发出了非退化的轨迹。
@@ -92,6 +93,7 @@ def run(name, sc, poll_hz=5.0):
             time.sleep(0.5)
             continue
         if len(f.get("selected_trajectory_xy") or []) > 1:
+            time.sleep(2.0)     # 再让它稳一拍：第一条轨迹往往是障碍图还空着时发的
             ready = True
             break
         time.sleep(0.5)

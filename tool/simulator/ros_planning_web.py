@@ -409,6 +409,9 @@ class RosPlanningSimNode(Node):
 class RunRequest(BaseModel):
     config: dict[str, Any]
     reset: bool | None = None
+    # 整环重启：planning 和 control 都换新的。跑成套场景时必须用，否则 cmd_vel_control 的
+    # 时间参数化路径参考会跨场景累积（实测 idx 涨到 500 多），表现是下一个场景「一直不动」。
+    restart_all: bool | None = None
 
 
 class LoadMapRequest(BaseModel):
@@ -604,14 +607,15 @@ def update_config(request: RunRequest) -> dict[str, Any]:
     if not isinstance(request.config, dict):
         raise HTTPException(status_code=400, detail="config must be an object")
     reset = bool(request.reset)
+    restart_all = bool(request.restart_all)
     prev_robot = node.config.get("robot", {}).get("name")
     node.set_config(copy.deepcopy(request.config), reset=reset)
     robot_changed = prev_robot != node.config.get("robot", {}).get("name")
-    if robot_changed:
+    if robot_changed or restart_all:
         _stop_script("tinynav/platforms/cmd_vel_control.py")
-    if reset or robot_changed:
-        ensure_ros_loop(reset_planning=True, force=robot_changed)
-    return {"ok": True, "robot_changed": robot_changed}
+    if reset or robot_changed or restart_all:
+        ensure_ros_loop(reset_planning=True, force=robot_changed or restart_all)
+    return {"ok": True, "robot_changed": robot_changed, "restart_all": restart_all}
 
 
 @app.post("/api/start-ros-loop")

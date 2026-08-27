@@ -172,7 +172,7 @@ def report(title, node, T, center, p, q, target, mask, front_clearance):
             if goal is None:
                 side = 1.0 if node._wrap(yaw_to_target - yaw_now) >= 0.0 else -1.0
                 goal = node._wrap(yaw_now + side * np.pi / 2.0)
-            k = node._pick_turn_toward(turns, params, node._wrap(goal - yaw_now))
+            k, _long = node._pick_turn_toward(turns, params, node._wrap(goal - yaw_now))
             print(f"    goal heading: {np.degrees(goal):+.0f}deg "
                   f"clear={node._fmt_clearance(clear)}")
             if k is None:
