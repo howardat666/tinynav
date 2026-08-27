@@ -347,6 +347,16 @@ class MapNode(Node):
         # 100 条约束里有几条是干净的 —— 2026-08-27 的跳变分析全靠事后从日志里重建，
         # 而日志里既没有位姿也没有质量，只能推断。
         self.relocalization_pose_quality = {}
+        self._last_kf_odom = None
+        self._odom_resets = 0
+        # VIO 自恢复时会把里程计原点重置，而这一侧的位姿是喂给 map->odom 约束的：重置之后
+        # 旧约束用的是另一个坐标系，混在一起解出来的 T 必然是错的。2026-08-27 实测：原地
+        # 快速旋转 21.6 s 里重定位全失败（内点 0~12），恢复时位姿跳 0.97 m、其中 z 从
+        # -0.76 跳到 +0.00，随后 T 的朝向阶跃 94 度。
+        # 判据用 z 而不是速度：平地上轮式车 z 逐帧应当不动（实测正常行驶 <=0.02 m），
+        # 而重置那次是 0.75 m；速度判据反而漏（那次跨了 21.6 s，等效速度很小）。
+        self.odom_reset_dz_m = float(os.environ.get('TINYNAV_ODOM_RESET_DZ_M', '0.15'))
+        self.odom_reset_speed = float(os.environ.get('TINYNAV_ODOM_RESET_SPEED', '2.0'))
         self._last_T_map_to_odom_logged = None
         self.last_keyframe_timestamp = None
 
@@ -738,6 +748,29 @@ class MapNode(Node):
 
         odom, _ = msg2np(keyframe_odom_msg)
         t_stage = mark_stage("odom_msg_decode", t_stage)
+
+        prev = self._last_kf_odom
+        if prev is not None:
+            dt_s = max(1e-3, (keyframe_image_timestamp_ns - prev[0]) / 1e9)
+            step = odom[:3, 3] - prev[1][:3, 3]
+            dz = abs(float(step[2]))
+            speed = float(np.linalg.norm(step)) / dt_s
+            if dz > self.odom_reset_dz_m or speed > self.odom_reset_speed:
+                self._odom_resets += 1
+                self.get_logger().error(
+                    f"odometry discontinuity #{self._odom_resets}: dz={dz:.2f}m "
+                    f"speed={speed:.2f}m/s over {dt_s:.1f}s "
+                    f"({prev[1][0,3]:+.2f},{prev[1][1,3]:+.2f},{prev[1][2,3]:+.2f}) -> "
+                    f"({odom[0,3]:+.2f},{odom[1,3]:+.2f},{odom[2,3]:+.2f}) -- "
+                    f"dropping {len(self.relocalization_poses)} relocalization constraints and "
+                    "refitting map->odom from scratch"
+                )
+                self.relocalization_poses.clear()
+                self.relocalization_pose_weights.clear()
+                self.relocalization_pose_quality.clear()
+                self.T_from_map_to_odom = None
+                self._last_T_map_to_odom_logged = None
+        self._last_kf_odom = (keyframe_image_timestamp_ns, odom.copy())
 
         self.pose_graph_used_pose[keyframe_image_timestamp_ns] = odom
         self.odom[keyframe_image_timestamp_ns] = odom
