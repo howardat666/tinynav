@@ -39,6 +39,8 @@ def main():
                     help="报告超过这个距离的位置跳变")
     ap.add_argument("--context-s", type=float, default=3.0,
                     help="跳变前后多少秒内的重定位记录算作相关")
+    ap.add_argument("--window", action="store_true",
+                    help="打印 map->odom 约束窗口的成分随时间的变化")
     a = ap.parse_args()
 
     rows = parse(a.log)
@@ -58,6 +60,36 @@ def main():
     ok = sum(1 for r in relocs if r[2])
     print(f"解析到 {len(positions)} 条位置、{len(relocs)} 次重定位（成功 {ok}，"
           f"失败 {len(relocs)-ok}）\n")
+
+    # compute_transform_from_map_to_odom 只取最近 100 个约束，没有鲁棒核。所以「这 100 条
+    # 里有几条是干净的」才是位姿跳变的直接解释 —— 单次重定位再健康，10/100 也拉不动解。
+    clean = []
+    for wall, _ts, succ, extra in relocs:
+        if not succ:
+            continue
+        cs = CAND.findall(extra)
+        spread = ((max(int(c[0]) for c in cs) - min(int(c[0]) for c in cs)) / 1e9
+                  if len(cs) > 1 else 0.0)
+        i = re.search(r"inliers=(\d+)/(\d+)", extra)
+        ratio = int(i.group(1)) / max(1, int(i.group(2))) if i else 0.0
+        clean.append((wall, spread <= 2.0 and ratio >= 0.70))
+    if clean:
+        good_now = sum(1 for c in clean[-100:] if c[1])
+        print(f"约束窗口（最近 100 条成功重定位）现在有 {good_now}/100 条是干净的"
+              f"（候选跨度 ≤2 s 且内点率 ≥70%）")
+        if good_now < 30:
+            print(f"   ⚠ 干净约束不足 30% —— map->odom 的最小二乘由陈旧/低质约束主导，"
+                  f"位姿会在两个解之间跳。鲁棒核救不了这种情况（离群点是多数）。")
+        print()
+        if a.window:
+            print("=== 约束窗口成分随时间 ===")
+            print("  墙钟        干净/100")
+            step = max(1, len(clean) // 25)
+            for k in range(99, len(clean), step):
+                g = sum(1 for c in clean[max(0, k - 99):k + 1] if c[1])
+                bar = "#" * (g // 2)
+                print(f"  {clean[k][0]:.1f}  {g:3d}   {bar}")
+            print()
 
     jumps = []
     for i in range(1, len(positions)):
