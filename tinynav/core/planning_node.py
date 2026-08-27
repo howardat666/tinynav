@@ -402,6 +402,8 @@ class PlanningNode(Node):
         # 这一条让它一直选转向，yaw 在 -59° 到 -131° 之间摆了近一分钟也没出来。
         self._escape_before_retreat_s = 3.0
         self._escape_episode_ns = 0
+        self._escape_last_ns = 0            # 上一个脱困周期的时刻，用来判断 episode 断没断
+        self._escape_episode_gap_s = 1.5    # 规划周期约 1.1 s，隔一拍就算新的一次脱困
         # The robot's own, whole. Rebuilding it field by field wired three of five
         # through, so min_wall_span_m and occ_threshold silently kept the class default
         # no matter what a platform asked for.
@@ -802,6 +804,18 @@ class PlanningNode(Node):
         if not self._retreat_start_ns:
             self._retreat_start_ns = now_ns
         return best_i
+
+    def _should_retreat(self, front_blocked, escape_clear, escape_age_s):
+        """原地转脱困该不该改成倒车。
+
+        `front_blocked` 是硬前提：倒车治不了朝向错和没进展，只能治"前面堵住"。少了这个
+        前提，2026-08-27 实测出现连续 36 s 的倒车，其间 front_clearance 一路涨到 >1.20 m
+        —— 目标在身后、正确动作是原地转，结果车倒着开向目标。
+        """
+        if not front_blocked:
+            return False
+        return (escape_clear < self.escape_min_clearance_m
+                or escape_age_s > self._escape_before_retreat_s)
 
     def _escape_reason(self, front_blocked, stand_dist, heading_err_abs, best_gain):
         """Why the robot should turn in place instead of following the ranking, or "".
@@ -1642,8 +1656,13 @@ class PlanningNode(Node):
                     abs(self._wrap(yaw_to_target - yaw_now)), best_gain)
 
                 if escape_reason and turns:
-                    if not self._escape_episode_ns:
+                    # 连续计时，不是"上次脱困以来"。全灭/无解那两条分支是提前 return 的，
+                    # 不经过下面的清零，于是这个时钟能跨过 22 分钟的冻结一直涨 —— 实测涨到
+                    # 1360 s，车一解冻就直接判"摆太久了，退"。
+                    if (not self._escape_episode_ns
+                            or (now_ns - self._escape_last_ns) / 1e9 > self._escape_episode_gap_s):
                         self._escape_episode_ns = now_ns
+                    self._escape_last_ns = now_ns
                     escape_age_s = (now_ns - self._escape_episode_ns) / 1e9
                     pick, escape_clear = self._pick_escape_turn(
                         self.camera_to_robot_center(T), turns, trajectories,
@@ -1653,8 +1672,7 @@ class PlanningNode(Node):
                     # 退回自己刚走过的地方 —— main 对「前方堵住」的答案本来就是倒车
                     # （硬互斥门 front_clearance<=0.3 时只准倒车），它缺的只是「后面能不能
                     # 走」的凭据，那正是 _retreat_index 提供的。
-                    if (escape_clear < self.escape_min_clearance_m
-                            or escape_age_s > self._escape_before_retreat_s):
+                    if self._should_retreat(front_blocked, escape_clear, escape_age_s):
                         retreat_idx = self._retreat_index(params, trajectories, now_ns)
                         if retreat_idx is not None:
                             top_indices = np.array([retreat_idx])
