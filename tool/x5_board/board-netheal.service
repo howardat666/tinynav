@@ -7,8 +7,10 @@ Type=simple
 ExecStart=/usr/bin/python3 -u /usr/local/sbin/board_netheal.py
 Restart=always
 RestartSec=10
-# 想让它在整条梯度都无效时自动重启，就把下面这行的注释去掉
-#Environment=NETHEAL_ALLOW_REBOOT=1
+# 2026-08-27 实测定案后打开：整条四级梯度对"关联死亡"完全无效（跑两遍全败，
+# 连固件自己的 wifi-connect.sh 也关联不上），重启是唯一能救的手段。不会重启循环 ——
+# netheal 只在"曾经通过一次"之后才布防，所以 AP/网关那头挂了不会触发。
+Environment=NETHEAL_ALLOW_REBOOT=1
 
 [Install]
 WantedBy=multi-user.target
