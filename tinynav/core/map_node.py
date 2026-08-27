@@ -349,6 +349,17 @@ class MapNode(Node):
         self.relocalization_pose_quality = {}
         self._last_kf_odom = None
         self._odom_resets = 0
+        # 里程计一致性门。实测重定位会在两个长得像的工位之间翻：车停着不动(里程计 0.00 m)
+        # 而解出的地图位置在相距 2.5 m 的两簇间来回跳，且解始终紧贴它拿到的候选(差 0.1~1.1 m)
+        # —— 翻的是检索，不是 PnP，也不是 VIO。而里程计是可靠的(停 18 分钟漂移 <0.5 cm，
+        # 固件开着 zupt)，所以拿它当先验拒掉不可能的跳变。
+        # 门限量出来的：397 个静止样本里正常的全 <=1.8 m、翻转的全 >=2.22 m，1.2 m 误拒 0.5%、
+        # 抓住 100%。⚠️ 我原本按推理提的 0.3 m 会误拒 37.7%。
+        self.reloc_gate_m = float(os.environ.get('TINYNAV_RELOC_GATE_M', '1.2'))
+        self.reloc_gate_streak_n = int(os.environ.get('TINYNAV_RELOC_GATE_STREAK', '5'))
+        self._last_accepted_reloc = None
+        self._reloc_gate_streak = []
+        self._reloc_rejects = 0
         # VIO 自恢复时会把里程计原点重置，而这一侧的位姿是喂给 map->odom 约束的：重置之后
         # 旧约束用的是另一个坐标系，混在一起解出来的 T 必然是错的。2026-08-27 实测：原地
         # 快速旋转 21.6 s 里重定位全失败（内点 0~12），恢复时位姿跳 0.97 m、其中 z 从
@@ -770,12 +781,16 @@ class MapNode(Node):
                 self.relocalization_pose_quality.clear()
                 self.T_from_map_to_odom = None
                 self._last_T_map_to_odom_logged = None
+                self._last_accepted_reloc = None      # 基准也失效了
+                self._reloc_gate_streak = []
         self._last_kf_odom = (keyframe_image_timestamp_ns, odom.copy())
 
         self.pose_graph_used_pose[keyframe_image_timestamp_ns] = odom
         self.odom[keyframe_image_timestamp_ns] = odom
         t_stage = mark_stage("pose_cache_update", t_stage)
 
+        if success and not self._reloc_agrees_with_odom(keyframe_image_timestamp_ns, odom):
+            success = False
         if success:
             # 和上面的 reloc pose 配对：同一个时间戳下 VIO 说车在哪。两行相减就是这一次
             # 观测给出的 map->odom，不必再从 T 反推。
@@ -808,6 +823,62 @@ class MapNode(Node):
             self.get_logger().warning(msg)
         else:
             self.get_logger().info(msg)
+
+    def _reloc_agrees_with_odom(self, ts, odom):
+        """里程计说不可能的地图跳变就丢掉，不让它进约束集。判据见 __init__ 里的注释。"""
+        pose = self.relocalization_poses.get(ts)
+        if pose is None:
+            return True
+        cur = (np.asarray(pose)[:3, 3].copy(), odom[:3, 3].copy())
+        prev = self._last_accepted_reloc
+        if prev is None:
+            self._last_accepted_reloc = cur
+            return True
+        d_map = float(np.linalg.norm(cur[0] - prev[0]))
+        d_odom = float(np.linalg.norm(cur[1] - prev[1]))
+        limit = self.reloc_gate_m + d_odom
+        if d_map <= limit:
+            self._reloc_gate_streak = []
+            self._last_accepted_reloc = cur
+            return True
+
+        # 必须有恢复通道：连续多次被拒的解如果彼此一致，说明是我们锁错了地方而不是它在跳。
+        # 没有这条，第一次锁错就永远回不来。
+        self._reloc_gate_streak.append(cur)
+        if not all(float(np.linalg.norm(c[0] - cur[0])) <= self.reloc_gate_m
+                   for c in self._reloc_gate_streak):
+            self._reloc_gate_streak = [cur]
+        self._reloc_rejects += 1
+        if len(self._reloc_gate_streak) >= self.reloc_gate_streak_n:
+            keep = (self.relocalization_poses[ts],
+                    self.relocalization_pose_weights.get(ts),
+                    self.relocalization_pose_quality.get(ts))
+            self.get_logger().warning(
+                f"reloc gate: {len(self._reloc_gate_streak)} consecutive rejects agree on "
+                f"[{cur[0][0]:+.2f},{cur[0][1]:+.2f}] -- re-locking there and dropping "
+                f"{len(self.relocalization_poses)} constraints")
+            self.relocalization_poses.clear()
+            self.relocalization_pose_weights.clear()
+            self.relocalization_pose_quality.clear()
+            self.T_from_map_to_odom = None
+            self._last_T_map_to_odom_logged = None
+            self.relocalization_poses[ts] = keep[0]
+            if keep[1] is not None:
+                self.relocalization_pose_weights[ts] = keep[1]
+            if keep[2] is not None:
+                self.relocalization_pose_quality[ts] = keep[2]
+            self._reloc_gate_streak = []
+            self._last_accepted_reloc = cur
+            return True
+
+        self.get_logger().warning(
+            f"reloc rejected #{self._reloc_rejects}: map jumped {d_map:.2f}m but odom moved "
+            f"{d_odom:.2f}m (limit {limit:.2f}m) streak={len(self._reloc_gate_streak)}/"
+            f"{self.reloc_gate_streak_n} at [{cur[0][0]:+.2f},{cur[0][1]:+.2f}]")
+        self.relocalization_poses.pop(ts, None)
+        self.relocalization_pose_weights.pop(ts, None)
+        self.relocalization_pose_quality.pop(ts, None)
+        return False
 
     def keyframe_mapping_with_timer(self, keyframe_image_msg:Image, keyframe_odom_msg:Odometry, depth_msg:Image):
         with Timer(name="Mapping Loop", text="\n\n[{name}] Elapsed time: {milliseconds:.0f} ms", logger=self.timer_logger):
