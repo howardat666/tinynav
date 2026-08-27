@@ -223,7 +223,7 @@ HOST=root@192.168.19.218 ./tool/x5_board/sync_board_time.sh
 | **PC→板（收）** | 4.13–9.99 Mbit/s | **2.043** | 1.67 | 2–5× |
 
 ⚠️ **对照必须同口径**：08-18 基线是裸 TCP（iperf3），所以先用裸 TCP 复测才有意义。
-测法：`python3 tput.py sink <port>` / `source <host> <port> <MB>`，**取接收端的计时** ——
+测法：`python3 tput.py recv 0.0.0.0 <port>` / `send <host> <port> <字节数>`（**模式名就是 `recv`/`send`；写错它两个分支都不进、exit 0 且零输出**），**取接收端的计时** ——
 发送端 `sendall` 只写进 socket 缓冲就返回，实测两端差 7 s（12.33 vs 19.20 s）。
 
 **排除掉的三个嫌疑：**
