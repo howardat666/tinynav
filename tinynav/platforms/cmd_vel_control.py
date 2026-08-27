@@ -3,6 +3,7 @@ import csv
 import json
 import math
 import logging
+import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -225,6 +226,9 @@ class CmdVelControlNode(Node):
         # Well under the 3 s trajectory span, well over the sensing latency.
         self._path_lag_warn_s = 1.0
         self._vx_gain_comp = 1.2
+        # 反馈允许超出参考速度多少。给一点余量让它能追上，但远小于一个规划周期能走的距离。
+        self._vx_feedback_slack = float(os.environ.get("TINYNAV_VX_FEEDBACK_SLACK", "0.05"))
+        self._vx_clamped = 0
 
         # The pose this controller closes its loop on. A parameter rather than a
         # literal because /insight/vio_100hz does not exist on current Looper
@@ -520,6 +524,19 @@ class CmdVelControlNode(Node):
         k = 2.0 * zeta * math.sqrt(w_ref * w_ref + b * v_ref * v_ref)
         v = v_ref * math.cos(heading_err) + k * tx
         wz = w_ref + k * heading_err + b * v_ref * self._sinc(heading_err) * ty
+        # 反馈项不得把速度推出参考值。规划器是按轨迹自己的速度做碰撞检查的，开得比它快
+        # 就等于离开了被检查过的走廊 —— 这是正确性而不是调参。2026-08-27 撞击复盘：规划器
+        # 选 vx=0.250，跟踪点落在车前约 0.65 m 让 k*tx 把这里顶到 0.5(cap)，一个周期走
+        # 0.55 m，而当时前缘余量只有 0.065~0.2 m。夹在增益之前：夹的是意图速度，增益补的
+        # 是轮子欠输出。
+        v_cap = abs(v_ref) + self._vx_feedback_slack
+        if abs(v) > v_cap:
+            self._vx_clamped += 1
+            if self._vx_clamped % 20 == 1:
+                self.logger.warning(
+                    f"vx feedback clamped #{self._vx_clamped}: {v:+.3f} -> "
+                    f"{math.copysign(v_cap, v):+.3f} (v_ref={v_ref:+.3f} tx={tx:+.3f}m)")
+            v = math.copysign(v_cap, v)
         v *= self._vx_gain_comp
         v = float(np.clip(v, -self.robot.max_reverse_vx, self.robot.max_vx))
         wz = float(np.clip(wz, -self.robot.max_yaw, self.robot.max_yaw))
