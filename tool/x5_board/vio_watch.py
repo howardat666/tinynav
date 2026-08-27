@@ -10,6 +10,7 @@
   nohup setsid python3 /userdata/x5/vio_watch.py >/dev/null 2>&1 &
 日志：/userdata/x5/logs/vio_watch.log
 """
+import collections
 import importlib.util
 import math
 import os
@@ -27,14 +28,28 @@ DZ_M = float(os.environ.get("VIO_WATCH_DZ_M", "0.15"))
 HEARTBEAT_S = float(os.environ.get("VIO_WATCH_HEARTBEAT", "5"))
 
 
-def insight():
-    """哪个 insight_full、活了多久 —— 用来分开"固件进程重起"和"VIO 内部重初始化"。
-    比 /proc/PID/comm 不比 cmdline：后者会命中执行诊断命令的 shell 自己。"""
+def _load_bh():
+    """只加载一次。每次心跳都 exec_module 一遍是 13% 一个核的主要来源 ——
+    这块板子 CPU 本来就是瓶颈，监视器不能自己成为扰动源。"""
     try:
         spec = importlib.util.spec_from_file_location("bh", "/usr/local/sbin/board_health.py")
         m = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(m)
-        return m.insight_state()
+        return m
+    except Exception:
+        return None
+
+
+_BH = _load_bh()
+
+
+def insight():
+    """哪个 insight_full、活了多久 —— 用来分开"固件进程重起"和"VIO 内部重初始化"。
+    比 /proc/PID/comm 不比 cmdline：后者会命中执行诊断命令的 shell 自己。"""
+    if _BH is None:
+        return "?"
+    try:
+        return _BH.insight_state()
     except Exception:
         return "?"
 
@@ -58,7 +73,7 @@ class Watch(Node):
         self.t_last_msg = 0.0
         # 固件的 rotation_prior_max_interval=0.15：帧间隔超过它就不用 IMU 旋转先验，
         # 而快速转头最依赖那个先验。所以帧间隔的尾部本身就是"会不会丢跟踪"的判据。
-        self.gaps = []
+        self.gaps = collections.deque(maxlen=600)   # 无上界的 list 会一直长
         self.over_prior = 0
         self.create_subscription(
             PoseStamped, TOPIC, self.cb,
@@ -108,7 +123,7 @@ class Watch(Node):
         if gap > 2.0:
             # Publisher count 归零是 insight_full 被丢跟踪卡死的判据，和原点重置是两回事
             flag = "  🔴 已 %.1fs 没有新帧（VIO 可能停发了）" % gap
-        g = sorted(self.gaps[-600:])
+        g = sorted(self.gaps)
         def q(f):
             return g[min(len(g) - 1, int(f * (len(g) - 1)))] * 1000 if g else -1
         self.say("pos=[%+.2f,%+.2f,%+.2f] yaw=%+.1f  %.1f Hz  帧间隔 p50=%.0f p95=%.0f "

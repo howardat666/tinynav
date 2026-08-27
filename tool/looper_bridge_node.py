@@ -103,6 +103,12 @@ class LooperBridgeNode(Node):
         self.misc_group = MutuallyExclusiveCallbackGroup()
 
         self._exact_pose_prefixes = ("/camera/camera/vio",)
+        # VIO 原点重置会毒化 map->odom：约束跨了两个坐标系，解出来的 yaw 会阶跃几十度。
+        # 判据用 z 不用速度 —— 触发场景是原地快转，线速度本来就小。
+        self._vio_prev = None
+        self._vio_resets = 0
+        self._vio_gaps = 0
+        self._vio_dz_m = float(os.environ.get("TINYNAV_VIO_RESET_DZ_M", "0.15"))
 
         self.camera_info_sub = self.create_subscription(
             CameraInfo, "/camera/camera/infra1/camera_info", self.camera_info_callback,
@@ -323,7 +329,40 @@ class LooperBridgeNode(Node):
 
     def pose_visual_callback(self, pose_msg: PoseStamped):
         T_world_camera = pose_msg2np(pose_msg)
+        self._check_vio_continuity(T_world_camera, pose_msg.header.stamp)
         self.odom_visual_pub.publish(self.build_odom(T_world_camera, pose_msg.header.stamp))
+
+    def _check_vio_continuity(self, T, stamp):
+        """检测在这里做，因为本回调已经收到每一帧 —— 单开一个 Python 订阅者在这块板上
+        实测要 15% 一个核（rclpy 没有零拷贝）。"""
+        t_ns = stamp.sec * 10**9 + stamp.nanosec
+        z = float(T[2, 3])
+        if self._vio_prev is not None:
+            pt, pz = self._vio_prev
+            dt = (t_ns - pt) / 1e9
+            # z 恰好归零是实测到的重置签名，但固件开着 use_zupt（零速更新），有可能
+            # 自己把 z 吸到 0 —— 所以它只报 WARNING，够门限的真跳变才报 ERROR。
+            # 只有相邻两帧（没丢帧）才能判跳变。本节点的位姿 QoS 是 depth=1 而执行器只有
+            # 2 线程，实测会丢到 150~400 ms 的洞 —— 跨洞采样平滑运动也像跳变。
+            contiguous = dt < 0.12
+            big = contiguous and abs(z - pz) > self._vio_dz_m
+            snapped = contiguous and abs(z) < 1e-9 and abs(pz) > 0.05
+            if big or snapped:
+                self._vio_resets += 1
+                where = (f"z={pz:+.3f}->{z:+.3f} pos=[{T[0, 3]:+.2f},{T[1, 3]:+.2f},{z:+.2f}] "
+                         f"yaw={np.degrees(np.arctan2(T[1, 0], T[0, 0])):+.1f}deg dt={dt:.3f}s")
+                if big:
+                    self.get_logger().error(f"vio origin reset #{self._vio_resets}: {where}")
+                else:
+                    self.get_logger().warning(
+                        f"vio z snapped to zero #{self._vio_resets}: {where}")
+            # 固件的 rotation_prior_max_interval=0.15：超过它就丢 IMU 旋转先验，
+            # 而快速转头最依赖那个先验
+            if dt > 0.15:
+                self._vio_gaps += 1
+                self.get_logger().warning(
+                    f"vio frame gap {dt * 1000:.0f}ms (#{self._vio_gaps})")
+        self._vio_prev = (t_ns, z)
 
     def depth_callback(self, depth_msg: Image):
         # Forwarded in the camera's own mono16 millimetres, not converted to 32FC1
