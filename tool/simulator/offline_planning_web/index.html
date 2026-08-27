@@ -31,6 +31,11 @@
       <section class="panel controls" id="controlsPanel">
         <h2>Robot</h2>
         <p class="robot-note">Presets from <code>robot_specs.py</code>. Switching type restarts planning.</p>
+        <label class="map-select-label">Scene
+          <select id="scenePreset"></select>
+        </label>
+        <div class="scene-preset-note" id="scenePresetNote"></div>
+        <button id="loadScene" class="primary">Load scene</button>
         <label class="map-select-label">Preset
           <select id="robotPreset"></select>
         </label>

@@ -55,6 +55,8 @@ const fields = {
   objectSZ: $("objectSZ"),
   configText: $("configText"),
   robotPreset: $("robotPreset"),
+  scenePreset: $("scenePreset"),
+  scenePresetNote: $("scenePresetNote"),
   robotSummary: $("robotSummary"),
   cameraSummary: $("cameraSummary"),
 };
@@ -861,6 +863,75 @@ async function toggleRealtime() {
   realtimeTick();
 }
 
+function beginRealtimePolling() {
+  realtimeRunning = true;
+  realtimeBusy = false;
+  realtimePending = false;
+  realtimePath = [config.start.xy.slice()];
+  currentFrame = null;
+  realtimeButton.textContent = "Stop";
+  realtimeButton.classList.remove("primary");
+  realtimeTick();
+}
+
+let scenePresets = {};
+
+async function fetchScenePresets() {
+  if (!fields.scenePreset) return;
+  try {
+    const data = await (await fetch("/api/scene-presets")).json();
+    scenePresets = Object.fromEntries((data.scenes || []).map((s) => [s.name, s]));
+    const select = fields.scenePreset;
+    select.innerHTML = "";
+    (data.scenes || []).forEach((s) => {
+      const option = document.createElement("option");
+      option.value = s.name;
+      option.textContent = s.title || s.name;
+      select.appendChild(option);
+    });
+    if (config?.scene_name && scenePresets[config.scene_name]) {
+      select.value = config.scene_name;
+    }
+    showSceneNote();
+  } catch (error) {
+    statusEl.textContent = "Scene preset load error";
+  }
+}
+
+function showSceneNote() {
+  if (!fields.scenePresetNote) return;
+  const s = scenePresets[fields.scenePreset?.value];
+  fields.scenePresetNote.textContent = s ? s.note : "";
+}
+
+async function loadScenePreset() {
+  const name = fields.scenePreset?.value;
+  if (!name) return;
+  stopRealtime();
+  statusEl.textContent = `Loading scene ${name}...`;
+  try {
+    const response = await fetch("/api/load-scene", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || "Scene load failed");
+    config = data.config;
+    setMapBackground(null);
+    updateLabViewBounds(config.start.xy);
+    selectedIndex = 0;
+    currentFrame = null;
+    realtimePath = [config.start.xy.slice()];
+    refreshFields();
+    // 场景一换就自动跑起来：打开页面就要能直接看效果，不用再点一次 Realtime。
+    beginRealtimePolling();
+    statusEl.textContent = `Scene: ${scenePresets[name]?.title || name}`;
+  } catch (error) {
+    statusEl.textContent = `Scene error: ${error.message}`;
+  }
+}
+
 async function fetchRobotPresets() {
   try {
     const data = await (await fetch("/api/robot-presets")).json();
@@ -999,6 +1070,10 @@ fields.robotPreset.addEventListener("change", () => {
 });
 
 realtimeButton.addEventListener("click", toggleRealtime);
+if (fields.scenePreset) {
+  fields.scenePreset.addEventListener("change", showSceneNote);
+}
+document.getElementById("loadScene")?.addEventListener("click", loadScenePreset);
 controlsToggle.addEventListener("click", () => setControlsVisible(controlsPanel.classList.contains("is-hidden")));
 $("resetScene").addEventListener("click", loadDefault);
 $("loadMap").addEventListener("click", loadMapFromSelection);
@@ -1137,7 +1212,7 @@ mapCanvas.addEventListener("pointerup", (event) => handleCanvasPointerUp(event, 
 mapCanvas.addEventListener("pointercancel", (event) => handleCanvasPointerUp(event, mapCanvas));
 
 loadDefault().then(async () => {
-  await Promise.all([fetchMapCatalog(), fetchRobotPresets()]);
+  await Promise.all([fetchMapCatalog(), fetchRobotPresets(), fetchScenePresets()]);
 });
 syncControlsLayout();
 window.addEventListener("resize", () => {

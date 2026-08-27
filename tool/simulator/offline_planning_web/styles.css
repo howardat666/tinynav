@@ -329,3 +329,11 @@ textarea {
     grid-template-columns: 1fr;
   }
 }
+
+/* 场景预设的说明文字：一行放不下就折行，别把控件挤走 */
+.scene-preset-note {
+  font-size: 12px;
+  line-height: 1.4;
+  opacity: 0.75;
+  margin: 2px 0 6px;
+}

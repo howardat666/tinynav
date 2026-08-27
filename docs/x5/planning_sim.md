@@ -22,12 +22,36 @@
 
 ```bash
 scripts/run_planning_sim_docker.sh &          # 起仿真（宿主机没有 uv，走 docker）
+# 浏览器开 http://localhost:8766 —— 已经预载好场景在跑，左边 Scene 下拉框换场景
 python3 tool/simulator/scenarios.py           # 无头跑全部场景，打印判据
 python3 tool/simulator/scenarios.py wall_ahead   # 只跑一个
 ```
 
-浏览器开 `http://localhost:8766` 能看到俯视图、深度图、障碍栅格和选中的轨迹，
-可以拖着改场景 —— 调参时比看数字快。
+起来就已经是**板上那一套**，不用手工配：
+
+- 规划参数取自 `app_start.sh`（`x5_presets.BOARD_ENV`）：`span>=0.2`、`dilation=0`、
+  `low_obs=on (0.05~0.25 m, <1.5 m, >=2 pts)`、`cam_h=0.18`、`TINYNAV_ALLOW_REVERSE=0`。
+  启动日志里 `obstacle: raycast ...` 和 `reverse: ...` 两行可以核对。
+- 机器人默认 `diffcar`，几何和板上一致。
+- 相机默认 `match` 档，见下。
+- 预载场景默认 `wall_ahead`，用 `TINYNAV_SIM_SCENE=chair_legs` 换。
+
+浏览器里能看到俯视图、深度图、障碍栅格和选中的轨迹，可以拖着改场景 —— 调参时比看数字快。
+换场景选下拉框再点 **Load scene**，它会把 planning 和 control 都换新的并自动跑起来。
+
+## 相机：对齐的是角分辨率，不是像素数
+
+实机深度 544×640、fx=fy=309.5，板上 `TINYNAV_RAYCAST_STEP=5` —— 也就是每
+`5/309.5 = 0.01615 rad` 取一条射线。**决定障碍图有多少洞的是角分辨率**（见
+`dilation-is-patching-raycast-holes`），所以缩放渲染时必须让 step 跟着变。
+
+| `TINYNAV_SIM_CAMERA` | 分辨率 | step | 角分辨率 | 渲染 | 用途 |
+|---|---|---|---|---|---|
+| `match`（默认） | 218×256 fx=123.8 | 2 | 0.9256 °/射线 | 25 ms/帧 | 和板上逐位一致，日常用这个 |
+| `full` | 544×640 fx=309.5 | 5 | 0.9256 °/射线 | 263 ms/帧 | 逐像素一致，仿真掉到约 3.8 Hz，复核用 |
+| `fast` | 160×100 fx=80/50 | 5 | 3.5810 °/射线 | 6 ms/帧 | 上游默认，只适合看流程通不通 |
+
+板上是 `0.9256 °/射线`，`match` 就是照这个数配出来的。
 
 ## 场景与判据
 
@@ -38,6 +62,11 @@ python3 tool/simulator/scenarios.py wall_ahead   # 只跑一个
 | `narrow_gap` | 0.9 m 的缝 | 必须到达 |
 | `wall_ahead` | 前方 0.2 m 一堵宽墙、两侧开阔、目标在右后方 | 到达**且变向 ≤ 2 次** |
 | `dead_end` | 三面围住 | 不许倒车、变向 ≤ 4 次（倒车默认关，正确行为是停住报无解） |
+| `chair_legs` | 五条 5 cm 的椅子腿，离地 0~0.35 m | 必须到达。专门压 `low_obs` 那条按离地高度判的通路 |
+| `doorway_turn` | 0.9 m 门洞，出去之后目标在右侧 | 必须到达。贪心的终点距离在门里就想往右切 |
+
+场景定义在 `tool/simulator/x5_presets.py`，**web 下拉框和无头套件共用这一份** ——
+两份定义迟早分叉。每个场景自带 `max_flips`（变向上限）。
 
 `wall_ahead` 就是 2026-08-27 板上摆头那一幕的复刻，`dead_end` 是楔住那一幕。
 变向次数是摆头的判据 —— 摆头的特征就是 `omega` 反复换号。
@@ -62,3 +91,15 @@ python3 tool/simulator/scenarios.py wall_ahead   # 只跑一个
   「探测距离/召回率」类结论必须在实车 bag 上复核（见 `dilation-is-patching-raycast-holes` 的教训）。
 - **没有板子的 CPU 排队**。周期、时间戳滞后、关键帧饿死这些都测不出来。
 - 仿真里默认相机高 0.18 m（和 Looper 实装一致），上游默认 0.45 m。
+
+## 一个测试台自己的坑（踩过两次）
+
+**成套跑必须把 planning 和 control 都换新的。** `planning_node` 会带着上一个场景的
+障碍图，`cmd_vel_control` 会带着上一个场景累积的时间参数化路径参考（实测 `idx` 涨到
+500 多）。少了这个隔离，下一个场景表现成「一直不动」或「130 次变向」，**看着完全像
+规划器的 bug**。`/api/load-scene` 已经包含这个隔离。
+
+**预热期间要冻住车。** 规划器重启要付一次 numba 编译，那几秒里车已经开走一米多，
+场景之间的用时和路程就不可比了。`load-scene` 带 `freeze: true`，等它发出第一条非退化
+轨迹之后再 `POST /api/freeze {"frozen": false}` 放行。加上冻结之后 `doorway_turn`
+从「通过」变成「141 次变向、到不了」—— 之前是预热期间蒙过去的。

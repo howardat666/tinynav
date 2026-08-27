@@ -17,6 +17,10 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from tool.simulator import x5_presets  # noqa: E402
 
 BASE = "http://127.0.0.1:8766"
 
@@ -30,57 +34,14 @@ def api(path, payload=None, timeout=20):
         return json.load(r)
 
 
-def box(name, center, size):
-    return {"name": name, "kind": "box", "center": center, "size": size}
-
-
-# 场景。墙用长方体拼，坐标是世界系米，z 中心 0.3 / 高 0.6 表示一堵到腰的墙。
-def scenes():
-    wall_z, wall_h = 0.3, 0.6
-    return {
-        # 基线：空地直行。任何改动都不许把它弄坏。
-        "open_run": dict(
-            start=[0.0, 0.0], yaw=0.0, target=[3.0, 0.0],
-            objects=[], budget_s=45, need_reach=True),
-        # 走廊：净宽 0.8 m，直着穿过去。
-        "corridor": dict(
-            start=[0.0, 0.0], yaw=0.0, target=[3.0, 0.0],
-            objects=[box("l", [1.5, 0.6, wall_z], [3.0, 0.2, wall_h]),
-                     box("r", [1.5, -0.6, wall_z], [3.0, 0.2, wall_h])],
-            budget_s=60, need_reach=True),
-        # 0.9 m 的缝。代码注释里说这是旧直线探针「转 102 次、超时」的那个场景。
-        "narrow_gap": dict(
-            start=[0.0, 0.0], yaw=0.0, target=[3.0, 0.0],
-            objects=[box("wl", [1.5, 1.15, wall_z], [0.2, 1.7, wall_h]),
-                     box("wr", [1.5, -1.15, wall_z], [0.2, 1.7, wall_h])],
-            budget_s=75, need_reach=True),
-        # 2026-08-27 板上摆头的那一幕：正前方 0.2 m 一堵宽墙，两侧开阔，目标在右后方。
-        # 判据是「变向次数」而不是「到不到」—— 摆头的特征就是来回变向。
-        "wall_ahead": dict(
-            start=[0.0, 0.0], yaw=0.0, target=[-0.5, -1.8],
-            objects=[box("w", [0.5, 0.0, wall_z], [0.2, 3.0, wall_h])],
-            budget_s=75, need_reach=True),
-        # 死角：三面围住，只能从来路出去。倒车关着时应当「停住报无解」而不是撞。
-        "dead_end": dict(
-            start=[0.0, 0.0], yaw=0.0, target=[3.0, 0.0],
-            objects=[box("f", [0.55, 0.0, wall_z], [0.2, 1.4, wall_h]),
-                     box("l", [0.0, 0.7, wall_z], [1.4, 0.2, wall_h]),
-                     box("r", [0.0, -0.7, wall_z], [1.4, 0.2, wall_h])],
-            budget_s=40, need_reach=False),
-    }
+SCENES = x5_presets.SCENES
 
 
 def run(name, sc, poll_hz=5.0):
-    cfg = api("/api/default-config")
-    cfg["start"] = {"xy": list(sc["start"]), "yaw_deg": float(sc["yaw"])}
-    cfg["target"] = [float(sc["target"][0]), float(sc["target"][1]), 0.0]
-    cfg["objects"] = sc["objects"]
-    # 相机高度按实车：Looper 装在 0.18 m，仿真默认 0.45 会看不到矮东西。
-    cfg["camera"]["mount_height"] = 0.18
-    # restart_all：planning **和** control 都必须换新的。planning 带着上一个场景的障碍图、
-    # control 带着上一个场景累积的路径参考，都会让下一个场景「单独跑过、连着跑不动」——
-    # 看着像规划器的 bug，实际是测试台没隔离。
-    api("/api/update-config", {"config": cfg, "reset": True, "restart_all": True})
+    # 场景由服务端按 x5_presets 那一份定义生成，且 load-scene 会把 planning 和 control
+    # 都换新的。少了这个隔离，planning 带着上一个场景的障碍图、control 带着累积的路径
+    # 参考，下一个场景会「单独跑过、连着跑不动」—— 看着像规划器的 bug，实际不是。
+    cfg = api("/api/load-scene", {"name": name, "freeze": True})["config"]
 
     # 等仿真环真的转起来再开始计时：planning_node 重启要付一次 numba 编译，把那段算进
     # 预算就会把「起得慢」误判成「走不动」。判据是它发出了非退化的轨迹。
@@ -94,6 +55,7 @@ def run(name, sc, poll_hz=5.0):
             continue
         if len(f.get("selected_trajectory_xy") or []) > 1:
             time.sleep(2.0)     # 再让它稳一拍：第一条轨迹往往是障碍图还空着时发的
+            api("/api/freeze", {"frozen": False})   # 热完了再放行，用时和路程才可比
             ready = True
             break
         time.sleep(0.5)
@@ -129,11 +91,10 @@ def run(name, sc, poll_hz=5.0):
     revs = [s[4] for s in samples if s[4] < -0.06]
     path_len = sum(math.hypot(b[1] - a[1], b[2] - a[2]) for a, b in zip(samples, samples[1:]))
     ok = (reached_at is not None) if sc["need_reach"] else True
-    if name == "wall_ahead":
-        ok = ok and flips <= 2
-    if name == "dead_end":
-        # 倒车关着：不许倒、也不许在死角里左右摆头（摆头是 2026-08-27 的原病）
-        ok = len(revs) == 0 and flips <= 4
+    # 变向次数是摆头的判据，每个场景给的上限不同（见 x5_presets.SCENES）。
+    ok = ok and flips <= int(sc.get("max_flips", 6))
+    # 倒车默认关，所以任何真正的倒车指令都是问题（-0.06 以内是跟踪律的反馈余量，不算）
+    ok = ok and len(revs) == 0
     return dict(name=name, ok=ok, reached_at=reached_at, flips=flips,
                 stalled_frac=stalled / len(samples), n=len(samples),
                 path_len=path_len, reverse_cmds=len(revs),
@@ -147,7 +108,7 @@ def main():
     ap.add_argument("--base", default=BASE)
     a = ap.parse_args()
     BASE = a.base
-    all_sc = scenes()
+    all_sc = SCENES
     todo = a.only or list(all_sc)
     bad = 0
     print(f"{'场景':<12} {'到达':>7} {'变向':>4} {'静止占比':>8} {'路程':>6} {'倒车指令':>8} {'末距':>6}  结果")

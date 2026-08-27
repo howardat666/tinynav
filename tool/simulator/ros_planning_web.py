@@ -41,6 +41,14 @@ from std_msgs.msg import Bool
 from tinynav.core.robot_config import DIFFCAR_CONFIG as DEFAULT_ROBOT
 from tinynav.core import robot_config as robot_specs_mod
 from tool.simulator.map_volume import MapVolume
+from tool.simulator.x5_presets import (
+    BOARD_ENV,
+    DEFAULT_CAMERA,
+    DEFAULT_SCENE,
+    apply_scene,
+    camera_and_step,
+    scene_catalog,
+)
 from tool.simulator.planning_scene import (
     SimObject,
     cam_size,
@@ -65,14 +73,8 @@ def _default_tinynav_db_path() -> Path:
 
 
 MAPS_ROOT = _default_tinynav_db_path() / "maps"
-CAMERA_DEFAULTS = {
-    "width": 160,
-    "image_height": 100,
-    "fx": 80.0,
-    "fy": 50.0,
-    "max_range": 15.0,
-    "mount_height": 0.45,
-}
+SIM_CAMERA_NAME = os.environ.get("TINYNAV_SIM_CAMERA", DEFAULT_CAMERA)
+CAMERA_DEFAULTS, RAYCAST_STEP = camera_and_step(SIM_CAMERA_NAME)
 ROBOT_PRESETS = {
     name.removesuffix("_CONFIG").lower(): asdict(getattr(robot_specs_mod, name))
     for name in dir(robot_specs_mod)
@@ -235,6 +237,9 @@ class RosPlanningSimNode(Node):
         self.last_obstacle_mask: dict[str, Any] | None = None
         self.last_esdf_grid: dict[str, Any] | None = None
         self.running = True
+        # 冻结时照常发深度和位姿，但不积分 cmd_vel —— 让规划器付完 numba 编译再放行，
+        # 否则预热那几秒车已经开走一米多，场景之间的「用时/路程」就不可比了。
+        self.frozen = False
 
         self.depth_pub = self.create_publisher(Image, "/slam/depth", 10)
         self.odom_visual_pub = self.create_publisher(Odometry, "/slam/odometry_visual", 10)
@@ -362,7 +367,8 @@ class RosPlanningSimNode(Node):
             now = time.monotonic()
             dt = max(1e-3, min(0.2, now - self.last_update))
             self.last_update = now
-            self.integrate_cmd(dt)
+            if not self.frozen:
+                self.integrate_cmd(dt)
             config = copy.deepcopy(self.config)
             config.setdefault("start", {})["xy"] = [float(self.control_xy[0]), float(self.control_xy[1])]
             config["start"]["yaw_deg"] = float(self.yaw_deg)
@@ -461,6 +467,11 @@ def _child_env() -> dict[str, str]:
     env = os.environ.copy()
     for key in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         env.setdefault(key, "1")
+    # 板上 app_start.sh 那套规划参数。setdefault 而不是覆盖，这样外面还能临时改一个来对照。
+    for key, value in BOARD_ENV.items():
+        env.setdefault(key, value)
+    # step 必须跟着相机缩放走：决定障碍图有多少洞的是**角分辨率**，不是像素数。
+    env.setdefault("TINYNAV_RAYCAST_STEP", str(RAYCAST_STEP))
     env["ROBOT_TYPE"] = _active_robot_type()
     return env
 
@@ -531,6 +542,14 @@ def stop_children() -> None:
 @app.on_event("startup")
 def startup() -> None:
     start_ros()
+    # 预载一个场景：浏览器一打开就该有东西在动，不用先手动搭场景。
+    name = os.environ.get("TINYNAV_SIM_SCENE", DEFAULT_SCENE)
+    try:
+        load_scene(SceneRequest(name=name))
+    except HTTPException:
+        load_scene(SceneRequest(name=DEFAULT_SCENE))
+    if SIM_NODE is not None:
+        SIM_NODE.running = True
 
 
 @app.on_event("shutdown")
@@ -616,6 +635,50 @@ def update_config(request: RunRequest) -> dict[str, Any]:
     if reset or robot_changed or restart_all:
         ensure_ros_loop(reset_planning=True, force=robot_changed or restart_all)
     return {"ok": True, "robot_changed": robot_changed, "restart_all": restart_all}
+
+
+class SceneRequest(BaseModel):
+    name: str
+    camera: str | None = None
+    freeze: bool | None = None
+
+
+@app.get("/api/scene-presets")
+def scene_presets() -> dict[str, Any]:
+    return {"scenes": scene_catalog(), "camera": SIM_CAMERA_NAME,
+            "raycast_step": RAYCAST_STEP}
+
+
+@app.post("/api/load-scene")
+def load_scene(request: SceneRequest) -> dict[str, Any]:
+    """换场景：整环重启，planning 和 control 都换新的。
+
+    不重启 control 的话它会带着上一个场景累积的时间参数化路径参考，下一个场景表现成
+    「一直不动」—— 看着像规划器的 bug，实际是没隔离。
+    """
+    node = _require_sim()
+    try:
+        cfg = apply_scene(default_config(_active_robot_type()), request.name,
+                          request.camera or SIM_CAMERA_NAME)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"unknown scene: {request.name}")
+    _stop_script("tinynav/platforms/cmd_vel_control.py")
+    node.set_config(cfg, reset=True)
+    node.frozen = bool(request.freeze)
+    ensure_ros_loop(reset_planning=True, force=True)
+    return {"ok": True, "config": node.config, "scene": request.name,
+            "frozen": node.frozen}
+
+
+class FreezeRequest(BaseModel):
+    frozen: bool
+
+
+@app.post("/api/freeze")
+def set_freeze(request: FreezeRequest) -> dict[str, Any]:
+    node = _require_sim()
+    node.frozen = bool(request.frozen)
+    return {"ok": True, "frozen": node.frozen}
 
 
 @app.post("/api/start-ros-loop")
