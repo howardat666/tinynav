@@ -342,10 +342,17 @@ class PlanningNode(Node):
         # 梯度脱困：当前位姿本身已在碰撞里时用的兜底。速度压得很低，且累计位移有预算 ——
         # 后方没有任何传感，长时间盲退比楔住更危险。
         self.escape_speed = float(os.environ.get('TINYNAV_ESCAPE_SPEED', '0.08'))
-        self.escape_budget_m = float(os.environ.get('TINYNAV_ESCAPE_BUDGET_M', '0.25'))
         self.escape_grad_min = float(os.environ.get('TINYNAV_ESCAPE_GRAD_MIN', '0.30'))
-        self._escape_travel_m = 0.0
-        self._escape_anchor = None      # 脱困起点，预算按离它的净位移算
+        # 倒车总开关。默认关：车后方没有任何传感器，而 2026-08-27 之前控制器把倒车指令
+        # 一路执行成前进（见 tests/test_reverse_v_ref.py），所以整套"退"的阈值从来没有在
+        # 真的会退的车上验证过。关掉之后楔住就停住并报无解，这比朝障碍开安全。
+        self.allow_reverse = (self.robot.allow_reverse
+                              and os.environ.get('TINYNAV_ALLOW_REVERSE', '0') == '1')
+        # 一次脱困里允许倒的**净位移**上限，退够了就不再退。这是结构上的上限，不是阈值：
+        # 无论哪条分支选了倒车、无论时钟怎么算，一次脱困最多只能倒这么远。
+        self.reverse_budget_m = float(os.environ.get('TINYNAV_REVERSE_BUDGET_M', '0.30'))
+        self._reverse_anchor = None
+        self._reverse_spent_m = 0.0
         self._grad_escapes = 0
         self.occupancy_grid = np.zeros(self.grid_shape)
         # 每个 2D 格子最后一次"是障碍"的时刻。栅格确实每周期 x0.99，但那是慢的：饱和在
@@ -422,6 +429,11 @@ class PlanningNode(Node):
             f"low_obs={'on' if self.low_obs_enabled else 'off'} "
             f"({self.low_obs_h_lo}~{self.low_obs_h_hi} m, <{self.low_obs_max_range_m} m, "
             f">={self.low_obs_min_pts} pts, cam_h={self.camera_height_m})")
+        # 单独打一行：robot.describe() 里的 reverse= 是平台配置，不是这次实际生效的值。
+        self.get_logger().info(
+            f"reverse: {'ENABLED' if self.allow_reverse else 'disabled'} "
+            f"(TINYNAV_ALLOW_REVERSE, 一次脱困上限 {self.reverse_budget_m:.2f}m) —— "
+            f"{'楔住时会倒车脱困' if self.allow_reverse else '楔住时停住并报无解，绝不倒车'}")
         self.stamp = None
         self.current_pose = None  # Store the latest pose from odometry
 
@@ -739,7 +751,7 @@ class PlanningNode(Node):
         front was blocked and the library holds exactly one reverse."""
         is_reverse = param[0] < 0.0
         if is_reverse:
-            return 0.0 if (front_blocked and self.robot.allow_reverse) else 1e9
+            return 0.0 if (front_blocked and self.allow_reverse) else 1e9
         if self._is_turn_in_place(param):
             # Turning in place is the only motion whose swept volume the camera has
             # already observed, so the front probe does not gate it.
@@ -774,6 +786,8 @@ class PlanningNode(Node):
         拿没看过的格子在打分，这正是 _motion_gate_penalty 里那段历史（40 s 的 vx=-0.2 直接
         撞上去）的由来。这里不检查栅格，而是检查**这条后退路径的每个采样点，车体中心是否
         在最近几秒真的待过那里** —— 待过就说明能走。"""
+        if not self.allow_reverse:
+            return None
         if (self._retreat_start_ns
                 and (now_ns - self._retreat_start_ns) / 1e9 > self._retreat_max_s):
             return None                     # 退够久了就停手，不能一路倒回起点
@@ -804,6 +818,27 @@ class PlanningNode(Node):
         if not self._retreat_start_ns:
             self._retreat_start_ns = now_ns
         return best_i
+
+    def _reverse_ok(self, init_p):
+        """这一拍还能不能倒。总开关关着、或本次脱困已经倒够了，就不能。"""
+        if not self.allow_reverse:
+            return False
+        if self._reverse_anchor is None:
+            return True
+        self._reverse_spent_m = float(np.linalg.norm(
+            np.asarray(init_p[:2], dtype=np.float64) - self._reverse_anchor))
+        return self._reverse_spent_m <= self.reverse_budget_m
+
+    def _reverse_mark(self, init_p):
+        """记下这次脱困的起点；预算按离它的净位移算，不按发出去的路径长度。"""
+        if self._reverse_anchor is None:
+            self._reverse_anchor = np.asarray(init_p[:2], dtype=np.float64).copy()
+            self._reverse_spent_m = 0.0
+
+    def _reverse_release(self):
+        """有非倒车的动作可做了，预算复位。"""
+        self._reverse_anchor = None
+        self._reverse_spent_m = 0.0
 
     def _should_retreat(self, front_blocked, escape_clear, escape_age_s):
         """原地转脱困该不该改成倒车。
@@ -1147,22 +1182,19 @@ class PlanningNode(Node):
         gx, gy = self._esdf_gradient(esdf_map, pt)
         if gx is None:
             return None
-        # 预算按**实际净位移**算，不按发出去的路径长度：每周期都发一条 0.24 m 的路径，
-        # 按路径长度记账两个周期就把 0.25 m 花完了，而车根本没动（实测 0.48m/0.25m）。
-        if self._escape_anchor is None:
-            self._escape_anchor = np.asarray(init_p[:2], dtype=np.float64).copy()
-        self._escape_travel_m = float(
-            np.linalg.norm(np.asarray(init_p[:2], dtype=np.float64) - self._escape_anchor))
-        if self._escape_travel_m > self.escape_budget_m:
-            self.get_logger().warning(
-                f"gradient escape: 预算用完 ({self._escape_travel_m:.2f}m > "
-                f"{self.escape_budget_m:.2f}m) 仍未脱困，保持静止")
-            return None
         fwd = self._forward_of(init_q)
         # 上坡方向离障碍更远；取它在车头方向的投影决定进还是退。投影太小说明障碍在正侧方，
         # 平移帮不上，仍选倒车 —— 它是方形底盘唯一不扫角的动作。
         s = gx * fwd[0] + gy * fwd[1]
         v = self.escape_speed if s > self.escape_grad_min else -self.escape_speed
+        if v < 0.0:
+            if not self._reverse_ok(init_p):
+                if self.allow_reverse:
+                    self.get_logger().warning(
+                        f"gradient escape: 已倒 {self._reverse_spent_m:.2f}m "
+                        f"(上限 {self.reverse_budget_m:.2f}m) 仍未脱困，保持静止")
+                return None
+            self._reverse_mark(init_p)
         num_steps = max(2, int(num_steps))
         path = Path()
         path.header = Header()
@@ -1188,7 +1220,7 @@ class PlanningNode(Node):
                 f"gradient escape #{self._grad_escapes}: "
                 f"{'forward' if v > 0 else 'reverse'} {abs(v):.2f}m/s "
                 f"uphill.fwd={s:+.2f} esdf_at_robot={self._esdf_at(esdf_map, init_p):.2f}m "
-                f"spent={self._escape_travel_m:.2f}m/{self.escape_budget_m:.2f}m")
+                f"spent={self._reverse_spent_m:.2f}m/{self.reverse_budget_m:.2f}m")
         return path
 
     def _forward_of(self, q):
@@ -1575,13 +1607,12 @@ class PlanningNode(Node):
                 )
                 return
 
-            # 走到这里说明至少有一条轨迹可选，脱困预算复位。
-            if self._escape_travel_m > 0.0:
+            # 走到这里说明至少有一条轨迹可选。真正的复位放到选定动作之后 —— 这里还不知道
+            # 选出来的会不会又是倒车。
+            if self._reverse_anchor is not None and self._reverse_spent_m > 0.0:
                 self.get_logger().info(
-                    f"gradient escape 结束：共退 {self._escape_travel_m:.2f}m，"
+                    f"gradient escape 结束：共退 {self._reverse_spent_m:.2f}m，"
                     f"现在有 {len(scores) - n_blocked}/{len(scores)} 条可行轨迹")
-                self._escape_travel_m = 0.0
-            self._escape_anchor = None
             stand_dist = target_dist_xy
             yaw_now = self._yaw_of(init_q)
             to_t = target_pose[:2] - init_p[:2]
@@ -1619,7 +1650,8 @@ class PlanningNode(Node):
                 # 走到这里说明前进被门掉、原地转也全撞（方形底盘的原地转是要做碰撞检查的，
                 # 圆形才豁免）。2026-08-25 18:50 实测这个状态连续 15 s，车就站着不动 ——
                 # 而它其实是从后面开进来的，退回去必然有路。
-                retreat_idx = self._retreat_index(params, trajectories, now_ns)
+                retreat_idx = (self._retreat_index(params, trajectories, now_ns)
+                               if self._reverse_ok(init_p) else None)
                 if retreat_idx is None:
                     # 车站得越久，来路证据越少（_centre_history 收缩成一个点），最需要退的
                     # 时候恰好退不了。ESDF 梯度不依赖来路，所以这里也走一次脱困。
@@ -1647,6 +1679,7 @@ class PlanningNode(Node):
                 escape_reason = "retreat"
                 best_gain = float('nan')
                 self._escape_turn_sign = None
+                self._reverse_mark(init_p)
             else:
                 ends_xy = np.array([trajectories[i][-1, :2] for i in admissible])
                 best_gain = stand_dist - float(np.min(np.linalg.norm(
@@ -1672,13 +1705,15 @@ class PlanningNode(Node):
                     # 退回自己刚走过的地方 —— main 对「前方堵住」的答案本来就是倒车
                     # （硬互斥门 front_clearance<=0.3 时只准倒车），它缺的只是「后面能不能
                     # 走」的凭据，那正是 _retreat_index 提供的。
-                    if self._should_retreat(front_blocked, escape_clear, escape_age_s):
+                    if (self._should_retreat(front_blocked, escape_clear, escape_age_s)
+                            and self._reverse_ok(init_p)):
                         retreat_idx = self._retreat_index(params, trajectories, now_ns)
                         if retreat_idx is not None:
                             top_indices = np.array([retreat_idx])
                             retreating = True
                             escape_reason = "retreat"
                             self._escape_turn_sign = None
+                            self._reverse_mark(init_p)
                     if not retreating:
                         top_indices = np.array([pick])
                         turned_in_place = True
@@ -1691,6 +1726,8 @@ class PlanningNode(Node):
 
             self.last_param = params[top_indices[0]]
             best_idx = int(top_indices[0])
+            if params[best_idx][0] >= 0.0:
+                self._reverse_release()
             if now_ns - self._last_static_log_ns.get("decision", 0) >= 1_000_000_000:
                 cycle_s = (now_ns - self._last_cycle_ns) / 1e9 if self._last_cycle_ns else float('nan')
                 self._last_static_log_ns["decision"] = now_ns
@@ -1701,6 +1738,8 @@ class PlanningNode(Node):
                     f"front_clearance={self._fmt_clearance(front_clearance, self.front_probe_max_m)} "
                     f"gate={'turn-only' if front_blocked else 'forward'} "
                     f"escape={escape_reason or 'off'} turns={len(turns)} "
+                    f"rev={'on' if self.allow_reverse else 'OFF'}"
+                    f"{'' if self._reverse_anchor is None else f'({self._reverse_spent_m:.2f}/{self.reverse_budget_m:.2f}m)'} "
                     f"escape_age={((now_ns - self._escape_episode_ns) / 1e9) if self._escape_episode_ns else 0.0:.1f}s "
                     f"hist={len(self._centre_history)}pts "
                     f"best_gain={best_gain:+.2f}m escape_clear={self._fmt_clearance(escape_clear)} "
