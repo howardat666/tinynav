@@ -229,6 +229,9 @@ class CmdVelControlNode(Node):
         # 反馈允许超出参考速度多少。给一点余量让它能追上，但远小于一个规划周期能走的距离。
         self._vx_feedback_slack = float(os.environ.get("TINYNAV_VX_FEEDBACK_SLACK", "0.05"))
         self._vx_clamped = 0
+        # 低于这个剩余长度就认定规划器发的是"无解"的静态路径，而不是真的走完了。
+        self._no_solution_remain_m = float(
+            os.environ.get("TINYNAV_NO_SOLUTION_REMAIN_M", "0.02"))
 
         # The pose this controller closes its loop on. A parameter rather than a
         # literal because /insight/vio_100hz does not exist on current Looper
@@ -554,8 +557,12 @@ class CmdVelControlNode(Node):
             remain = (float(np.linalg.norm(np.diff(tail, axis=0), axis=1).sum())
                       if len(tail) > 1 else 0.0)
             end = self._path_ref[-1]
+            # remain 已经能分开两者了，之前只写在日志正文里，reason 仍是"到达" —— 于是
+            # 被困住 30 秒被报成 131 次"到达"。零长度轨迹是规划器在说"无解"，不是车走完了。
+            stuck = remain < self._no_solution_remain_m
             self._publish_zero(
-                "local trajectory endpoint reached",
+                "planner reported no solution (zero-length path)" if stuck
+                else "local trajectory endpoint reached",
                 f"dist_to_end={dist_to_end:.3f}m heading_err={heading_to_goal:+.3f}rad "
                 f"remain={remain:.2f}m idx={self._track_idx}/{len(self._path_ref)} "
                 f"robot=({robot_pos[0]:+.2f},{robot_pos[1]:+.2f}) "

@@ -339,6 +339,13 @@ class PlanningNode(Node):
         # 5 把召回提到 68~72%，代价 4.3 -> 14.0 ms（250 ms 周期的 4%）。这是填洞的正路：
         # 用膨胀填洞每格要付 0.1 m/侧的过道净宽，而这里付的是 CPU。
         self.step = int(os.environ.get('TINYNAV_RAYCAST_STEP', '5'))
+        # 梯度脱困：当前位姿本身已在碰撞里时用的兜底。速度压得很低，且累计位移有预算 ——
+        # 后方没有任何传感，长时间盲退比楔住更危险。
+        self.escape_speed = float(os.environ.get('TINYNAV_ESCAPE_SPEED', '0.08'))
+        self.escape_budget_m = float(os.environ.get('TINYNAV_ESCAPE_BUDGET_M', '0.25'))
+        self.escape_grad_min = float(os.environ.get('TINYNAV_ESCAPE_GRAD_MIN', '0.30'))
+        self._escape_travel_m = 0.0
+        self._grad_escapes = 0
         self.occupancy_grid = np.zeros(self.grid_shape)
         # 每个 2D 格子最后一次"是障碍"的时刻。栅格确实每周期 x0.99，但那是慢的：饱和在
         # 0.2 的格子要 69 个周期(4.3 Hz 下约 16 s)才掉到阈值 0.1 以下。相比之下被射线穿过
@@ -1114,6 +1121,96 @@ class PlanningNode(Node):
         }, separators=(',', ':'))
         self.diag_pub.publish(msg)
 
+    def _gradient_escape(self, esdf_map, init_p, init_q, header, base_time, num_steps):
+        """当前位姿本身已在碰撞里时，从 ESDF 场解出脱困方向，而不是从 110 条预制弧里挑
+        （那时全是 inf，挑不出东西 -> 发静态路径 -> 控制器判"到达" -> 零速 -> 下一周期
+        还是全灭，自我维持）。方向是解出来的不是选出来的，所以永远有答案。
+
+        只做纯平移：楔住时旋转会把车角扫进障碍（方形底盘扫过半径 0.202 m > 前缘 0.10 m）。
+        """
+        pt = self._worst_footprint_point(esdf_map, init_p, init_q)
+        gx, gy = self._esdf_gradient(esdf_map, pt)
+        if gx is None:
+            return None
+        if self._escape_travel_m > self.escape_budget_m:
+            self.get_logger().warning(
+                f"gradient escape: 预算用完 ({self._escape_travel_m:.2f}m > "
+                f"{self.escape_budget_m:.2f}m) 仍未脱困，保持静止")
+            return None
+        fwd = self._forward_of(init_q)
+        # 上坡方向离障碍更远；取它在车头方向的投影决定进还是退。投影太小说明障碍在正侧方，
+        # 平移帮不上，仍选倒车 —— 它是方形底盘唯一不扫角的动作。
+        s = gx * fwd[0] + gy * fwd[1]
+        v = self.escape_speed if s > self.escape_grad_min else -self.escape_speed
+        num_steps = max(2, int(num_steps))
+        path = Path()
+        path.header = Header()
+        path.header.stamp = header.stamp
+        path.header.frame_id = "world"
+        for j in range(num_steps):
+            d = v * float(j) * self.dt
+            pose = PoseStamped()
+            pose.header = Header()
+            pose.header.stamp = (base_time + Duration(seconds=float(j) * self.dt)).to_msg()
+            pose.header.frame_id = "world"
+            pose.pose.position.x = float(init_p[0] + fwd[0] * d)
+            pose.pose.position.y = float(init_p[1] + fwd[1] * d)
+            pose.pose.position.z = float(init_p[2])
+            pose.pose.orientation.x = float(init_q[0])
+            pose.pose.orientation.y = float(init_q[1])
+            pose.pose.orientation.z = float(init_q[2])
+            pose.pose.orientation.w = float(init_q[3])
+            path.poses.append(pose)
+        self._escape_travel_m += abs(v) * self.dt * (num_steps - 1)
+        self._grad_escapes += 1
+        if self._grad_escapes % 10 == 1:
+            self.get_logger().warning(
+                f"gradient escape #{self._grad_escapes}: "
+                f"{'forward' if v > 0 else 'reverse'} {abs(v):.2f}m/s "
+                f"uphill.fwd={s:+.2f} esdf_at_robot={self._esdf_at(esdf_map, init_p):.2f}m "
+                f"spent={self._escape_travel_m:.2f}m/{self.escape_budget_m:.2f}m")
+        return path
+
+    def _forward_of(self, q):
+        x, y, z, w = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+        fx = 2.0 * (x * z + w * y)
+        fy = 2.0 * (y * z - w * x)
+        n = math.hypot(fx, fy)
+        return (fx / n, fy / n) if n > 1e-6 else (1.0, 0.0)
+
+    def _worst_footprint_point(self, esdf_map, init_p, init_q):
+        """车体取样点里 ESDF 最小的那个 —— 侵入最深处，梯度在那里取才有意义。
+        取样铺满方式和 score_trajectories_by_ESDF 一致，别让两处判据不同。"""
+        fl, rl, hw = self.robot.footprint_from_control()
+        fwd = self._forward_of(init_q)
+        left = (-fwd[1], fwd[0])
+        n_a = max(2, int(math.ceil((fl + rl) / self.resolution)) + 1)
+        n_c = max(2, int(math.ceil(2.0 * hw / self.resolution)) + 1)
+        best, best_d = None, float('inf')
+        for ia in range(n_a):
+            oa = -rl + (fl + rl) * ia / (n_a - 1)
+            for ic in range(n_c):
+                oc = -hw + 2.0 * hw * ic / (n_c - 1)
+                px = float(init_p[0]) + fwd[0] * oa + left[0] * oc
+                py = float(init_p[1]) + fwd[1] * oa + left[1] * oc
+                d = self._esdf_at(esdf_map, (px, py))
+                if not math.isnan(d) and d < best_d:
+                    best_d, best = d, (px, py)
+        return best
+
+    def _esdf_gradient(self, esdf_map, p):
+        """中心差分并归一化。返回 (None, None) 表示点不在格内、贴边、或场是平的。"""
+        if p is None:
+            return None, None
+        i = int((p[0] - self.origin[0]) / self.resolution)
+        j = int((p[1] - self.origin[1]) / self.resolution)
+        if not (1 <= i < esdf_map.shape[0] - 1 and 1 <= j < esdf_map.shape[1] - 1):
+            return None, None
+        gx = (float(esdf_map[i + 1, j]) - float(esdf_map[i - 1, j])) / (2.0 * self.resolution)
+        gy = (float(esdf_map[i, j + 1]) - float(esdf_map[i, j - 1])) / (2.0 * self.resolution)
+        n = math.hypot(gx, gy)
+        return (gx / n, gy / n) if n >= 1e-6 else (None, None)
+
     def _esdf_at(self, esdf_map, p):
         """Clearance under a world point, or nan if it is off the local grid."""
         i = int((p[0] - self.origin[0]) / self.resolution)
@@ -1439,6 +1536,13 @@ class PlanningNode(Node):
 
             n_blocked = int(sum(1 for s in scores if s == float('inf')))
             if n_blocked == len(scores):
+                # 预制弧全灭 != 无路可走。从 ESDF 场解一个脱困方向出来再说。
+                esc = self._gradient_escape(ESDF_map, init_p, init_q, depth_msg.header,
+                                            base_time, len(trajectories[0]))
+                if esc is not None:
+                    self.path_pub.publish(esc)
+                    self._last_cycle_ns = self.get_clock().now().nanoseconds
+                    return
                 self._publish_static_path(
                     init_p, init_q, depth_msg.header, base_time, len(trajectories[0]),
                     f"All {len(scores)} trajectories in collision "
@@ -1451,6 +1555,12 @@ class PlanningNode(Node):
                 )
                 return
 
+            # 走到这里说明至少有一条轨迹可选，脱困预算复位。
+            if self._escape_travel_m > 0.0:
+                self.get_logger().info(
+                    f"gradient escape 结束：共退 {self._escape_travel_m:.2f}m，"
+                    f"现在有 {len(scores) - n_blocked}/{len(scores)} 条可行轨迹")
+                self._escape_travel_m = 0.0
             stand_dist = target_dist_xy
             yaw_now = self._yaw_of(init_q)
             to_t = target_pose[:2] - init_p[:2]
