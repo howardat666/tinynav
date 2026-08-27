@@ -1600,6 +1600,15 @@ class PlanningNode(Node):
                 # 而它其实是从后面开进来的，退回去必然有路。
                 retreat_idx = self._retreat_index(params, trajectories, now_ns)
                 if retreat_idx is None:
+                    # 车站得越久，来路证据越少（_centre_history 收缩成一个点），最需要退的
+                    # 时候恰好退不了。ESDF 梯度不依赖来路，所以这里也走一次脱困。
+                    esc = self._gradient_escape(ESDF_map, init_p, init_q,
+                                                depth_msg.header, base_time,
+                                                len(trajectories[0]))
+                    if esc is not None:
+                        self.path_pub.publish(esc)
+                        self._last_cycle_ns = self.get_clock().now().nanoseconds
+                        return
                     self._publish_static_path(
                         init_p, init_q, depth_msg.header, base_time, len(trajectories[0]),
                         f"No admissible motion: {n_blocked}/{len(scores)} in collision and the rest "
