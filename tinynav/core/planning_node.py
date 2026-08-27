@@ -345,6 +345,7 @@ class PlanningNode(Node):
         self.escape_budget_m = float(os.environ.get('TINYNAV_ESCAPE_BUDGET_M', '0.25'))
         self.escape_grad_min = float(os.environ.get('TINYNAV_ESCAPE_GRAD_MIN', '0.30'))
         self._escape_travel_m = 0.0
+        self._escape_anchor = None      # 脱困起点，预算按离它的净位移算
         self._grad_escapes = 0
         self.occupancy_grid = np.zeros(self.grid_shape)
         # 每个 2D 格子最后一次"是障碍"的时刻。栅格确实每周期 x0.99，但那是慢的：饱和在
@@ -1132,6 +1133,12 @@ class PlanningNode(Node):
         gx, gy = self._esdf_gradient(esdf_map, pt)
         if gx is None:
             return None
+        # 预算按**实际净位移**算，不按发出去的路径长度：每周期都发一条 0.24 m 的路径，
+        # 按路径长度记账两个周期就把 0.25 m 花完了，而车根本没动（实测 0.48m/0.25m）。
+        if self._escape_anchor is None:
+            self._escape_anchor = np.asarray(init_p[:2], dtype=np.float64).copy()
+        self._escape_travel_m = float(
+            np.linalg.norm(np.asarray(init_p[:2], dtype=np.float64) - self._escape_anchor))
         if self._escape_travel_m > self.escape_budget_m:
             self.get_logger().warning(
                 f"gradient escape: 预算用完 ({self._escape_travel_m:.2f}m > "
@@ -1161,7 +1168,6 @@ class PlanningNode(Node):
             pose.pose.orientation.z = float(init_q[2])
             pose.pose.orientation.w = float(init_q[3])
             path.poses.append(pose)
-        self._escape_travel_m += abs(v) * self.dt * (num_steps - 1)
         self._grad_escapes += 1
         if self._grad_escapes % 10 == 1:
             self.get_logger().warning(
@@ -1561,6 +1567,7 @@ class PlanningNode(Node):
                     f"gradient escape 结束：共退 {self._escape_travel_m:.2f}m，"
                     f"现在有 {len(scores) - n_blocked}/{len(scores)} 条可行轨迹")
                 self._escape_travel_m = 0.0
+            self._escape_anchor = None
             stand_dist = target_dist_xy
             yaw_now = self._yaw_of(init_q)
             to_t = target_pose[:2] - init_p[:2]

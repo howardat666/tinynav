@@ -449,8 +449,15 @@ class CmdVelControlNode(Node):
             yaw_u = np.unwrap(xy_yaw[:, 2])
             for i in range(n - 1):
                 dt = max(1e-3, float(t[i + 1] - t[i]))
-                ds = float(np.linalg.norm(xy_yaw[i + 1, :2] - xy_yaw[i, :2]))
-                path_ref[i, 3] = ds / dt
+                step = xy_yaw[i + 1, :2] - xy_yaw[i, :2]
+                ds = float(np.linalg.norm(step))
+                # v_ref 必须带符号。Path 里只有位姿，倒车轨迹的每个位姿朝向和前进的一样，
+                # 所以 |ds|/dt 把倒车也交给跟踪律当前进来跟 —— 2026-08-27 实测 17 条
+                # 规划 vx=-0.060 的 RETREAT 决策全部被执行成 +0.02~+0.26，车朝障碍开。
+                # 行进方向只能靠位移在该位姿朝向上的投影恢复。
+                fwd_i = (math.cos(float(xy_yaw[i, 2])), math.sin(float(xy_yaw[i, 2])))
+                sgn = -1.0 if float(step[0] * fwd_i[0] + step[1] * fwd_i[1]) < 0.0 else 1.0
+                path_ref[i, 3] = sgn * ds / dt
                 path_ref[i, 4] = (yaw_u[i + 1] - yaw_u[i]) / dt
             path_ref[-1, 3] = path_ref[-2, 3]
             path_ref[-1, 4] = path_ref[-2, 4]
