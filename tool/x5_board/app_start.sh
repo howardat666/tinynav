@@ -174,7 +174,7 @@ do_start() {
     export TINYNAV_LOW_OBS="${TINYNAV_LOW_OBS:-1}"
     export TINYNAV_LOW_OBS_H_LO="${TINYNAV_LOW_OBS_H_LO:-0.05}"
     export TINYNAV_LOW_OBS_RANGE_M="${TINYNAV_LOW_OBS_RANGE_M:-1.5}"
-    export TINYNAV_LOW_OBS_MIN_PTS="${TINYNAV_LOW_OBS_MIN_PTS:-5}"
+    export TINYNAV_LOW_OBS_MIN_PTS="${TINYNAV_LOW_OBS_MIN_PTS:-2}"
     export TINYNAV_CAMERA_HEIGHT_M="${TINYNAV_CAMERA_HEIGHT_M:-0.18}"
 
     # 检索方案。vlad = VLAD over BPU SuperPoint（默认），bow = DBoW3 over ORB。

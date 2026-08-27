@@ -340,9 +340,10 @@ class PlanningNode(Node):
         # 用膨胀填洞每格要付 0.1 m/侧的过道净宽，而这里付的是 CPU。
         self.step = int(os.environ.get('TINYNAV_RAYCAST_STEP', '5'))
         self.occupancy_grid = np.zeros(self.grid_shape)
-        # 每个 2D 格子最后一次"是障碍"的时刻。占据栅格没有任何时间衰减 —— 只有射线穿过时
-        # 才 -0.05，所以一个走出视野的格子会一直留着。热力图上"障碍物停留很久"就是这个，
-        # 而以前没有任何数字能区分"它确实还在"和"它只是没人再看它一眼"。
+        # 每个 2D 格子最后一次"是障碍"的时刻。栅格确实每周期 x0.99，但那是慢的：饱和在
+        # 0.2 的格子要 69 个周期(4.3 Hz 下约 16 s)才掉到阈值 0.1 以下。相比之下被射线穿过
+        # 的格子一帧就清掉(0.2x0.99-0.1=0.098)。所以"障碍物停留很久"= 没人再看它一眼，
+        # 而这两种情况以前没有任何数字能区分。
         self._obstacle_first_seen = np.zeros(self.grid_shape[:2], dtype=np.float64)
         self._obstacle_last_seen = np.zeros(self.grid_shape[:2], dtype=np.float64)
         # 矮障碍（办公椅星形底盘、门槛、趴着的狗）的独立 2D 证据。z 跨度判据结构上看不见
@@ -354,9 +355,12 @@ class PlanningNode(Node):
         self.low_obs_h_hi = float(os.environ.get('TINYNAV_LOW_OBS_H_HI', '0.25'))
         # 1.5 m 不是保守，是量出来的：2 m 之外拟合地面自己就抬高 4.5 cm，门限会开始误报。
         self.low_obs_max_range_m = float(os.environ.get('TINYNAV_LOW_OBS_RANGE_M', '1.5'))
-        # 每格最少命中点数。板上实测 step=5 下，1.5 m 内 71 个空地格在 1~8 点、4~8 cm
-        # 各档组合下误报全为 0，椅子底盘稳定给出 31 个格，所以 5 是宽松取值不是紧的。
-        self.low_obs_min_pts = int(os.environ.get('TINYNAV_LOW_OBS_MIN_PTS', '5'))
+        # 每格最少命中点数。2 而不是 5：一个格子收到的采样点数按 1/d^2 掉，而 4 cm 的椅子
+        # 腿本来就只占格子的一小块 —— 1.0 m 处约 6 点、1.2 m 处 4.3 点、1.5 m 处 2.7 点，
+        # 定值 5 等于在 1.1 m 之外把椅子腿整个丢掉。实测那一帧里 0.75~1.25 m 的触发格有
+        # 36~42% 不足 5 点。空地那边不需要这个余量：71 个空地格在 1~8 点各档下误报全是 0，
+        # 而「连续两帧才算」本身已经把单点飞点滤掉了。
+        self.low_obs_min_pts = int(os.environ.get('TINYNAV_LOW_OBS_MIN_PTS', '2'))
         # 0 关掉这一路。
         self.low_obs_enabled = os.environ.get('TINYNAV_LOW_OBS', '1') != '0'
         # 衰减 0.9 + 每帧 +0.1，判据 >0.1：和占据栅格一样要连续两帧，但会自己清掉 ——
