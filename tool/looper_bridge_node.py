@@ -673,7 +673,10 @@ def parse_args():
 def main(args=None):
     rclpy.init(args=args)
     node = LooperBridgeNode(parse_args())
-    executor = MultiThreadedExecutor(num_threads=2)
+    # 4 个回调组（pose / depth / sync / misc）抢 2 个线程时，位姿回调等不到调度，
+    # 而它的队列只有 1 条 -> 等待期间到达的位姿被覆盖。实测丢掉 25.7%%，突发空白 2.15 s。
+    # 工作量没变，变的只是调度。
+    executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
     try:
         executor.spin()

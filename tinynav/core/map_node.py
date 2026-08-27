@@ -1292,11 +1292,17 @@ class MapNode(Node):
                 # 出来的，说"深度地标不够"会把人带去查深度 —— 实测失败的都是这一类：候选
                 # matches 11~23（成功时约 180），sim 0.051~0.061（成功时 0.078~0.085）。
                 #
-                # cand_spread 是检索对不对的干净判据：检索对的时候前 3 名是地图里相邻的关键帧
-                # （实测跨度 <1 s），错的时候散在地图各处（实测 173 s）—— 那是"没有真匹配、
-                # 只是噪声排序"的典型形状。
+                # 🔴 时间跨度不是检索对不对的判据（2026-08-27 推翻）：建图时同一段路可能走了
+                # 多次，相隔很久的两个关键帧完全可能是同一处。实测按跨度分箱，内点率一样
+                # （<=5s 组 0.47 / >60s 组 0.48）。干净的判据是候选在地图里的坐标散布，
+                # 见成功路径上的 cand_spread（米）。这里保留时间只作参考，故改名 cand_span。
                 cand_ts = stats.get("cand_ts") or []
-                spread_s = ((max(cand_ts) - min(cand_ts)) / 1e9) if len(cand_ts) > 1 else 0.0
+                span_s = ((max(cand_ts) - min(cand_ts)) / 1e9) if len(cand_ts) > 1 else 0.0
+                cand_xyz = [np.asarray(self.map_poses[t])[:3, 3]
+                            for t in cand_ts if t in self.map_poses]
+                spread_m = max((float(np.linalg.norm(a - b))
+                                for i, a in enumerate(cand_xyz) for b in cand_xyz[i + 1:]),
+                               default=0.0)
                 best_matches = max(stats["cand_matches"]) if stats["cand_matches"] else 0
                 kept = sum(stats["cand_valid_depth"]) if stats["cand_valid_depth"] else 0
                 # 归因给深度只有在深度真的丢掉了东西时才成立。实测有一例 23 个匹配全部带有效
@@ -1312,7 +1318,7 @@ class MapNode(Node):
                                    f"only {landmark_count} usable 3D landmarks")
                 return self._relocalization_failed(
                     f"{reason_kind} (need >{self.reloc_min_landmarks} landmarks, got {landmark_count}), "
-                    f"cand_spread={spread_s:.1f}s, "
+                    f"cand_spread={spread_m:.2f}m cand_span={span_s:.1f}s, "
                     f"candidates=[{'; '.join(candidate_summaries)}]",
                     "retrieval_miss" if reason_kind.startswith("retrieval") else "few_landmarks",
                 )
@@ -1434,7 +1440,14 @@ class MapNode(Node):
             st = self.last_relocalization_stats or {}
             cand_ts = st.get("cand_ts") or []
             span_s = ((max(cand_ts) - min(cand_ts)) / 1e9) if len(cand_ts) > 1 else 0.0
-            self.relocalization_pose_quality[timestamp_ns] = (span_s, float(pose_cov_weight))
+            # 判据是候选在地图里的坐标散布，不是时间跨度：建图时同一段路可能走了多次，
+            # 相隔很久的两个关键帧完全可能是同一处。实测两者内点率一样(0.47 vs 0.48)。
+            cand_xyz = [np.asarray(self.map_poses[t])[:3, 3]
+                        for t in cand_ts if t in self.map_poses]
+            spread_m = max((float(np.linalg.norm(a - b))
+                            for i, a in enumerate(cand_xyz) for b in cand_xyz[i + 1:]),
+                           default=0.0)
+            self.relocalization_pose_quality[timestamp_ns] = (spread_m, float(pose_cov_weight))
             # 位姿本身以前从来没进过日志，所以「停着时是不是定位对了」只能靠推断 ——
             # 2026-08-27 分析那次 5.34 m 跳变时就卡在这里。ref 是最佳候选在地图里的位置，
             # 它和 cam_map 的距离就是「解出来的位置离它参考的关键帧有多远」。
@@ -1451,7 +1464,8 @@ class MapNode(Node):
                 f"reloc pose: t={timestamp_ns} "
                 f"cam_map=[{cm[0]:+.2f},{cm[1]:+.2f},{cm[2]:+.2f}] "
                 f"yaw_map={self._ground_yaw_deg(pose_in_world):+.1f}deg "
-                f"ref_map={ref_txt} cand_span={span_s:.1f}s ratio={pose_cov_weight:.2f}"
+                f"ref_map={ref_txt} cand_spread={spread_m:.2f}m "
+                f"cand_span={span_s:.1f}s ratio={pose_cov_weight:.2f}"
             )
             timings["publish"] = (time.perf_counter() - t0) * 1000.0
             timings["unaccounted"] = max(0.0, (time.perf_counter() - loop_t0) * 1000.0 - sum(timings.values()))
@@ -1583,7 +1597,7 @@ class MapNode(Node):
         self._last_T_map_to_odom_logged = T.copy()
         used = [self.relocalization_pose_quality.get(ts) for ts in used_timestamps[-100:]]
         used = [q for q in used if q is not None]
-        clean = sum(1 for sp, r in used if sp <= 2.0 and r >= 0.70)
+        clean = sum(1 for sp, r in used if sp <= 0.5 and r >= 0.70)   # sp 现在是米
         spans = sorted(sp for sp, _ in used) or [0.0]
         ratios = sorted(r for _, r in used) or [0.0]
         self.get_logger().info(
@@ -1592,7 +1606,7 @@ class MapNode(Node):
             f"tilt={math.degrees(math.acos(max(-1.0, min(1.0, float(T[2,2]))))):.1f}deg "
             f"d_t={d_t:.3f}m d_yaw={d_yaw:+.1f}deg "
             f"constraints={len(relative_pose_constraint)} clean={clean}/{len(used)} "
-            f"span_p50={spans[len(spans)//2]:.1f}s ratio_p50={ratios[len(ratios)//2]:.2f}"
+            f"spread_p50={spans[len(spans)//2]:.2f}m ratio_p50={ratios[len(ratios)//2]:.2f}"
         )
 
     def try_publish_nav_path(self, timestamp: int):
