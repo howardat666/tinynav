@@ -46,6 +46,13 @@ def bare_node(robot):
     n.rotate_first_min_dist_m = 0.5
     n.min_progress_m = 0.05
     n.force_turn_heading_rad = math.radians(80.0)
+    n.prefix_margin_m = 0.10
+    n.reaction_time_s = 2.0
+    n.dt = 0.1
+    n.allow_reverse = robot.allow_reverse
+    n._escape_scan_step_deg = 15
+    n._escape_goal_yaw = None
+    n._escape_goal_reached_rad = math.radians(12.0)
     return n
 
 
@@ -115,13 +122,19 @@ def report(title, node, T, center, p, q, target, mask, front_clearance):
           f"target=[{target[0]:.2f},{target[1]:.2f}] "
           f"heading_err={np.degrees(node._wrap(yaw_to_target - yaw_now)):+.0f}deg")
     print(f"  front_clearance={node._fmt_clearance(front_clearance)} blocked={front_blocked} "
-          f"allow_reverse={node.robot.allow_reverse} library={len(params)} "
+          f"allow_reverse={node.allow_reverse} library={len(params)} "
           f"in_collision={int(np.count_nonzero(np.isinf(scores)))}/{len(scores)}")
 
     stand_dist = float(np.linalg.norm(target[:2] - p[:2]))
-    for name, gate in (("old", old_gate), ("new", node._motion_gate_penalty)):
+    # 现在的门是按每条轨迹自己那一段判的（_prefix_clearance），不再是一条直线探针，
+    # 所以要先算出 forward_ok 再问门 —— 这个工具停在旧的两参数签名上，早就跑不动了。
+    prefix_clear = node._prefix_clearance(trajs, esdf)
+    forward_ok = prefix_clear >= node.prefix_margin_m
+    for name, gate in (("old", lambda pm, fb, i=None: old_gate(pm, fb)),
+                       ("new", lambda pm, fb, i=0: node._motion_gate_penalty(
+                           pm, i, forward_ok, fb))):
         adm = [i for i in range(len(params))
-               if gate(params[i], front_blocked) < 1e9 and not np.isinf(scores[i])]
+               if gate(params[i], front_blocked, i) < 1e9 and not np.isinf(scores[i])]
         turns = [i for i in adm if node._is_turn_in_place(params[i])]
         kinds = {"reverse": sum(1 for i in adm if params[i][0] < 0),
                  "turn": len(turns),
@@ -153,7 +166,18 @@ def report(title, node, T, center, p, q, target, mask, front_clearance):
             k = min(adm, key=lambda i: abs(node._wrap(yaw_to_target - node._yaw_of(trajs[i][-1, 3:7]))))
             clear = float('nan')
         else:
-            k, clear = node._pick_escape_turn(center, turns, trajs, yaw_to_target, mask)
+            # 现在锁的是朝向：先扫一圈找空的朝向，再挑朝那一侧转得最快的可行原地转。
+            yaw_now = node._yaw_of(q)
+            goal, clear = node._open_heading(center, mask, yaw_now, yaw_to_target)
+            if goal is None:
+                side = 1.0 if node._wrap(yaw_to_target - yaw_now) >= 0.0 else -1.0
+                goal = node._wrap(yaw_now + side * np.pi / 2.0)
+            k = node._pick_turn_toward(turns, params, node._wrap(goal - yaw_now))
+            print(f"    goal heading: {np.degrees(goal):+.0f}deg "
+                  f"clear={node._fmt_clearance(clear)}")
+            if k is None:
+                print("    朝该方向的原地转这一拍全撞 -> 保持朝向不动")
+                continue
         end_yaw = node._yaw_of(trajs[k][-1, 3:7])
         print(f"    hatch picks: vx={params[k][0]:+.3f} omega={params[k][1]:+.3f} "
               f"end_yaw={np.degrees(end_yaw):+.0f}deg "

@@ -386,10 +386,14 @@ class PlanningNode(Node):
         self.baseline = None
         self.last_T = None
         self.last_param = (0.0, 0.0) # acc and gyro
-        # 脱困转向锁定的方向与起始时刻。见 _pick_escape_turn 里的滞回说明。
-        self._escape_turn_sign = None
-        self._escape_turn_ns = 0
-        self._escape_lock_max_s = 4.0
+        # 锁定的是**朝向**，不是转向符号。锁符号的版本会被"这一拍恰好没有同号的可行原地转"
+        # 打断，然后立刻反向重锁 —— 2026-08-27 实测每 0.9 s 变一次向、累计只转 13° 就回头，
+        # 而当时车周围 12 个方向有 10 个在 0.5 m 内是空的，只要一直转 40° 就有路。
+        self._escape_goal_yaw = None
+        self._escape_goal_ns = 0
+        self._escape_goal_max_s = 15.0          # 锁死一个转不出去的朝向的上限
+        self._escape_goal_reached_rad = math.radians(12.0)
+        self._escape_scan_step_deg = 15
         # 后退脱困。占据栅格只由前向射线写入，所以车后方的格子从来没被看过 —— 盲退曾经
         # 造成 40 s 的 vx=-0.2 直接撞上去（2026-08-10 19:19），这也是 reverse 一直被门掉的
         # 原因。这里换一个能证明安全的判据：只退到**自己刚刚待过**的位置去。
@@ -876,41 +880,36 @@ class PlanningNode(Node):
             return "no-progress"
         return ""
 
-    def _pick_escape_turn(self, center, turns, trajectories, yaw_to_target, obstacle_mask,
-                          params, now_ns):
-        """Index of the in-place turn to commit to, plus the clearance it buys.
+    def _open_heading(self, center, obstacle_mask, yaw_now, yaw_to_target, min_deg=0):
+        """最近的一个「走廊在探针内是空的」朝向，平手时偏目标那一侧。
 
-        Lexicographic, not a weighted sum: a heading the camera can vouch for beats a
-        better-aimed one it cannot. Falls back to the freest heading when every
-        candidate is tight, so this always yields a turn rather than a standstill."""
-        end_yaws = np.array([self._yaw_of(trajectories[i][-1, 3:7]) for i in turns])
-        clear = np.array([self._clearance_along(center, math.cos(y), math.sin(y), obstacle_mask)
-                          for y in end_yaws])
-        head_err = np.array([abs(self._wrap(yaw_to_target - y)) for y in end_yaws])
-        usable = np.flatnonzero(clear >= self.escape_min_clearance_m)
-        cand = usable if len(usable) else np.arange(len(turns))
+        扫的是整整一圈的候选朝向，而不是那 1~3 条可行原地转的**终点朝向** —— 前方 0.2 m
+        有墙时可行的原地转只剩最小的几条(±13~26°)，它们的终点朝向全都还对着墙，净空一律
+        0.05~0.14 m，于是"哪个更空"完全是噪声，左右都一样。
 
-        # 方向滞回。上面这两条规则在 usable 空/非空之间来回切换，而"最对准目标"和"最空
-        # 方向"经常指反方向 —— 2026-08-25 实测车原地左右摆了 10 s，变号时刻和 escape_clear
-        # 跨过阈值的时刻逐条对齐。一旦开始转就锁定转向，除到期或同方向已无可选项。
-        # 锁有时限：锁死一个永远转不出去的方向会变成一直自转。
-        if (self._escape_turn_sign is not None
-                and (now_ns - self._escape_turn_ns) / 1e9 < self._escape_lock_max_s):
-            same = [int(k) for k in cand
-                    if math.copysign(1.0, params[turns[k]][1]) == self._escape_turn_sign]
-            if same:
-                cand = np.array(same)
-        else:
-            self._escape_turn_sign = None
+        返回 (朝向, 净空)；一圈都没有能证明是空的就返回 (None, 最好的那个净空)。
+        """
+        prefer = 1.0 if self._wrap(yaw_to_target - yaw_now) >= 0.0 else -1.0
+        best_c = float('nan')
+        for step in range(int(min_deg), 181, self._escape_scan_step_deg):
+            for sgn in ((prefer, -prefer) if step else (1.0,)):
+                y = self._wrap(yaw_now + sgn * math.radians(step))
+                c = float(self._clearance_along(center, math.cos(y), math.sin(y),
+                                                obstacle_mask))
+                if c >= self.escape_min_clearance_m:
+                    return y, c
+                if math.isnan(best_c) or c > best_c:
+                    best_c = c
+        return None, best_c
 
-        k = int(cand[int(np.argmin(head_err[cand]))]) if len(usable) \
-            else int(cand[int(np.argmax(clear[cand]))])
-        omega = params[turns[k]][1]
-        if omega != 0.0:
-            if self._escape_turn_sign is None:
-                self._escape_turn_ns = now_ns
-            self._escape_turn_sign = math.copysign(1.0, omega)
-        return turns[k], float(clear[k])
+    def _pick_turn_toward(self, turns, params, err):
+        """朝 err 那一侧转得最快的那条可行原地转；没有同号的就 None（这一拍不转，也不反向）。"""
+        want = math.copysign(1.0, err)
+        cand = [int(i) for i in turns
+                if params[i][1] != 0.0 and math.copysign(1.0, params[i][1]) == want]
+        if not cand:
+            return None
+        return max(cand, key=lambda i: abs(float(params[i][1])))
 
     @staticmethod
     def _fmt_clearance(d, max_dist=0.5):
@@ -1678,7 +1677,6 @@ class PlanningNode(Node):
                 retreating = True
                 escape_reason = "retreat"
                 best_gain = float('nan')
-                self._escape_turn_sign = None
                 self._reverse_mark(init_p)
             else:
                 ends_xy = np.array([trajectories[i][-1, :2] for i in admissible])
@@ -1697,9 +1695,32 @@ class PlanningNode(Node):
                         self._escape_episode_ns = now_ns
                     self._escape_last_ns = now_ns
                     escape_age_s = (now_ns - self._escape_episode_ns) / 1e9
-                    pick, escape_clear = self._pick_escape_turn(
-                        self.camera_to_robot_center(T), turns, trajectories,
-                        yaw_to_target, obstacle_mask, params, now_ns)
+                    centre = self.camera_to_robot_center(T)
+                    expired = (self._escape_goal_ns and
+                               (now_ns - self._escape_goal_ns) / 1e9 > self._escape_goal_max_s)
+                    goal_err = (self._wrap(self._escape_goal_yaw - yaw_now)
+                                if self._escape_goal_yaw is not None else 0.0)
+                    reached = abs(goal_err) < self._escape_goal_reached_rad
+                    if self._escape_goal_yaw is None or expired or reached:
+                        # 转到位了但前面还是堵着，说明这个朝向选错了 —— 重新扫，且要求新朝向
+                        # 至少偏出"已到位"的容差，否则会原地反复选中同一个朝向。
+                        g, escape_clear = self._open_heading(
+                            centre, obstacle_mask, yaw_now, yaw_to_target,
+                            min_deg=(math.degrees(self._escape_goal_reached_rad)
+                                     if reached and self._escape_goal_yaw is not None else 0))
+                        if g is None:
+                            # 一圈都没有能证明是空的朝向。朝目标那一侧扫 90°，别站着。
+                            side = (1.0 if self._wrap(yaw_to_target - yaw_now) >= 0.0
+                                    else -1.0)
+                            g = self._wrap(yaw_now + side * math.pi / 2.0)
+                        self._escape_goal_yaw = g
+                        self._escape_goal_ns = now_ns
+                        goal_err = self._wrap(g - yaw_now)
+                    else:
+                        escape_clear = float(self._clearance_along(
+                            centre, math.cos(self._escape_goal_yaw),
+                            math.sin(self._escape_goal_yaw), obstacle_mask))
+                    pick = self._pick_turn_toward(turns, params, goal_err)
                     # 有转向可选 != 转了能出去。2026-08-25 18:50 实测：turns 只剩 1~2 条、
                     # 每条的净空只有 0.04~0.08 m，车在那儿摆了 42 s。净空不够就别摆了，
                     # 退回自己刚走过的地方 —— main 对「前方堵住」的答案本来就是倒车
@@ -1712,15 +1733,27 @@ class PlanningNode(Node):
                             top_indices = np.array([retreat_idx])
                             retreating = True
                             escape_reason = "retreat"
-                            self._escape_turn_sign = None
                             self._reverse_mark(init_p)
-                    if not retreating:
+                    if not retreating and pick is not None:
                         top_indices = np.array([pick])
                         turned_in_place = True
                         self._retreat_start_ns = 0
+                    elif not retreating:
+                        # 朝锁定方向的原地转这一拍都撞。原地不动一拍，下一拍再试 —— 绝不
+                        # 反向：反向正是把累计转角清零、变成左右摆头的那个动作。
+                        self._publish_static_path(
+                            init_p, init_q, depth_msg.header, base_time,
+                            len(trajectories[0]),
+                            f"escape turn toward {math.degrees(self._escape_goal_yaw):+.0f}deg "
+                            f"blocked this cycle (goal_err={math.degrees(goal_err):+.0f}deg, "
+                            f"turns={len(turns)}) -- holding heading rather than reversing the turn",
+                            log_key="escape turn blocked")
+                        self._last_cycle_ns = now_ns
+                        return
                 else:
                     # 脱困结束就松锁，否则下一次脱困会沿用上一次的方向。
-                    self._escape_turn_sign = None
+                    self._escape_goal_yaw = None
+                    self._escape_goal_ns = 0
                     self._retreat_start_ns = 0
                     self._escape_episode_ns = 0
 
@@ -1738,6 +1771,7 @@ class PlanningNode(Node):
                     f"front_clearance={self._fmt_clearance(front_clearance, self.front_probe_max_m)} "
                     f"gate={'turn-only' if front_blocked else 'forward'} "
                     f"escape={escape_reason or 'off'} turns={len(turns)} "
+                    f"goal={'-' if self._escape_goal_yaw is None else f'{math.degrees(self._escape_goal_yaw):+.0f}deg'} "
                     f"rev={'on' if self.allow_reverse else 'OFF'}"
                     f"{'' if self._reverse_anchor is None else f'({self._reverse_spent_m:.2f}/{self.reverse_budget_m:.2f}m)'} "
                     f"escape_age={((now_ns - self._escape_episode_ns) / 1e9) if self._escape_episode_ns else 0.0:.1f}s "
