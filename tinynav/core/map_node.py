@@ -360,6 +360,9 @@ class MapNode(Node):
         self._last_accepted_reloc = None
         self._reloc_gate_streak = []
         self._reloc_rejects = 0
+        # 接受了但位移超过这个值也打清单。0.6m 落在实测常态 p90(0.62m) 上,
+        # 所以打出来的都是偏大的那一侧,不会刷屏。
+        self.reloc_jump_report_m = float(os.environ.get('TINYNAV_RELOC_JUMP_REPORT_M', '0.6'))
         # VIO 自恢复时会把里程计原点重置，而这一侧的位姿是喂给 map->odom 约束的：重置之后
         # 旧约束用的是另一个坐标系，混在一起解出来的 T 必然是错的。2026-08-27 实测：原地
         # 快速旋转 21.6 s 里重定位全失败（内点 0~12），恢复时位姿跳 0.97 m、其中 z 从
@@ -824,6 +827,25 @@ class MapNode(Node):
         else:
             self.get_logger().info(msg)
 
+    def _reloc_gate_margins(self):
+        """一次重定位在每道门上的 实测值/阈值。跳变时打出来才知道该收紧哪一个 ——
+        只知道"它进来了"没法调参。"""
+        st = self.last_relocalization_stats or {}
+        cand_ts = st.get("cand_ts") or []
+        cand_xyz = [np.asarray(self.map_poses[t])[:3, 3] for t in cand_ts if t in self.map_poses]
+        spread_m = max((float(np.linalg.norm(a - b))
+                        for i, a in enumerate(cand_xyz) for b in cand_xyz[i + 1:]), default=0.0)
+        best_matches = max(st.get("cand_matches") or [0])
+        return (
+            f"sim={st.get('top_sim', 0.0):.3f}/{self.relocalization_threshold} "
+            f"matches={best_matches}/{self.reloc_min_matches} "
+            f"landmarks={st.get('landmarks', 0)}/{self.reloc_min_landmarks} "
+            f"inliers={st.get('pnp_inliers', 0)}/{self.reloc_min_inliers} "
+            f"ratio={st.get('inlier_ratio', 0.0):.2f}/{self.reloc_min_inlier_ratio} "
+            f"cand_spread={spread_m:.2f}m/- "
+            f"obs[{st.get('spread_detail', '?')}] map[{st.get('pose_detail', '?')}]"
+        )
+
     def _reloc_agrees_with_odom(self, ts, odom):
         """里程计说不可能的地图跳变就丢掉，不让它进约束集。判据见 __init__ 里的注释。"""
         pose = self.relocalization_poses.get(ts)
@@ -838,6 +860,12 @@ class MapNode(Node):
         d_odom = float(np.linalg.norm(cur[1] - prev[1]))
         limit = self.reloc_gate_m + d_odom
         if d_map <= limit:
+            if d_map > self.reloc_jump_report_m:
+                # 门放进来了但位移已经可疑。要调阈值就得看这一类的清单 ——
+                # 被拒的那些只能告诉你门有用,告诉不了你门该多严。
+                self.get_logger().warning(
+                    f"reloc admitted a {d_map:.2f}m move (odom {d_odom:.2f}m, limit {limit:.2f}m): "
+                    f"{self._reloc_gate_margins()}")
             self._reloc_gate_streak = []
             self._last_accepted_reloc = cur
             return True
@@ -874,7 +902,8 @@ class MapNode(Node):
         self.get_logger().warning(
             f"reloc rejected #{self._reloc_rejects}: map jumped {d_map:.2f}m but odom moved "
             f"{d_odom:.2f}m (limit {limit:.2f}m) streak={len(self._reloc_gate_streak)}/"
-            f"{self.reloc_gate_streak_n} at [{cur[0][0]:+.2f},{cur[0][1]:+.2f}]")
+            f"{self.reloc_gate_streak_n} at [{cur[0][0]:+.2f},{cur[0][1]:+.2f}] | "
+            f"{self._reloc_gate_margins()}")
         self.relocalization_poses.pop(ts, None)
         self.relocalization_pose_weights.pop(ts, None)
         self.relocalization_pose_quality.pop(ts, None)
@@ -1279,6 +1308,7 @@ class MapNode(Node):
                 # translation is completely unobservable. Counting inliers cannot
                 # detect that; measuring the spread of the observations can.
                 spread_ok, spread_detail = self._observations_constrain_pose(point_2d_in_keyframe_list)
+                stats["spread_detail"] = spread_detail
                 if not spread_ok:
                     self.get_logger().info(f"Relocalization candidate timing ms: {'; '.join(candidate_timing_summaries)}")
                     return self._relocalization_failed(
@@ -1307,6 +1337,7 @@ class MapNode(Node):
                 # "更好"，那是 RANSAC 过拟合到少数点的症状，不是解更准。占比才能挡住它。
                 inlier_ratio = (0.0 if inliers is None or len(point_3d_in_world_list) == 0
                                 else len(inliers) / len(point_3d_in_world_list))
+                stats["inlier_ratio"] = float(inlier_ratio)
                 if (success and len(inliers) >= self.reloc_min_inliers
                         and inlier_ratio >= self.reloc_min_inlier_ratio):
                     R, _ = cv2.Rodrigues(rvec)
@@ -1326,6 +1357,7 @@ class MapNode(Node):
                         self._last_reloc_ref_xyz = np.asarray(
                             self.map_poses[int(candidates[0]["timestamp"])])[:3, 3].copy()
                     pose_ok, pose_detail = self._pose_is_within_map(T)
+                    stats["pose_detail"] = pose_detail
                     if not pose_ok:
                         self.get_logger().info(f"Relocalization candidate timing ms: {'; '.join(candidate_timing_summaries)}")
                         return self._relocalization_failed(
