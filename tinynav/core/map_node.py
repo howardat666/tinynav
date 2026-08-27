@@ -1507,7 +1507,42 @@ class MapNode(Node):
         # 这条是位姿跳变的直接证据：跳的是 T，不是位姿，而 T 只在这里变。附上约束成分是
         # 因为解由成分决定 —— 只按时间取最近 100 条、又没有鲁棒核，陈旧低质约束占多数时
         # 解会在两个盆地之间翻（2026-08-27 实测 5.34 m + 51 度）。
+        # 解完之后立刻拿解去核对它自己的约束。2026-08-27 实测：81 条观测彼此一致
+        # （朝向偏差中位 0.4 度、p90 2.9 度），而解出来的 T 在 45~60 条约束时把 odom 位姿
+        # 投回地图的位置残差中位 9.46 m —— 也就是解根本没落在观测的中心。所以这条残差
+        # 必须和 T 一起打出来，否则「约束不好」和「解算不对」在日志里长得一模一样。
+        #
+        # 同时算一个闭式对照：这里只有一个自由参数块（节点 1 固定为单位阵），本质是
+        # 「把 N 个 SE(3) 观测平均起来」，不是位姿图。闭式解是确定性的、不会跑偏，
+        # 拿它当基准就能判断非线性求解器有没有必要留着。
         T = self.T_from_map_to_odom
+        obs = [c[2] for c in relative_pose_constraint]
+        w = np.array([float(c[3][0]) for c in relative_pose_constraint])
+        if obs:
+            def _resid(Tx):
+                te, re_ = [], []
+                for Ob in obs:
+                    E = se3_inv(Tx) @ Ob
+                    te.append(float(np.linalg.norm(E[:3, 3])))
+                    ct = (np.trace(E[:3, :3]) - 1.0) / 2.0
+                    re_.append(math.degrees(math.acos(max(-1.0, min(1.0, ct)))))
+                return np.array(te), np.array(re_)
+            # 闭式：平移按权重加权平均，旋转用 SVD 投影回 SO(3)
+            W = w / max(w.sum(), 1e-9)
+            t_cf = np.sum([W[i] * obs[i][:3, 3] for i in range(len(obs))], axis=0)
+            R_acc = np.sum([W[i] * obs[i][:3, :3] for i in range(len(obs))], axis=0)
+            U, _, Vt = np.linalg.svd(R_acc)
+            R_cf = U @ np.diag([1.0, 1.0, float(np.linalg.det(U @ Vt))]) @ Vt
+            T_cf = np.eye(4); T_cf[:3, :3] = R_cf; T_cf[:3, 3] = t_cf
+            te_s, re_s = _resid(T)
+            te_c, re_c = _resid(T_cf)
+            gap = float(np.linalg.norm(T[:3, 3] - T_cf[:3, 3]))
+            self.get_logger().info(
+                f"map->odom fit: solver resid t_p50={np.median(te_s):.2f}m "
+                f"r_p50={np.median(re_s):.1f}deg | closed-form resid t_p50={np.median(te_c):.2f}m "
+                f"r_p50={np.median(re_c):.1f}deg | gap={gap:.2f}m "
+                f"cf_yaw={self._ground_yaw_deg(T_cf):+.1f}deg"
+            )
         prev = self._last_T_map_to_odom_logged
         d_t = float(np.linalg.norm(T[:3, 3] - prev[:3, 3])) if prev is not None else 0.0
         d_yaw = (self._ground_yaw_deg(T) - self._ground_yaw_deg(prev)) if prev is not None else 0.0
@@ -1521,6 +1556,7 @@ class MapNode(Node):
         self.get_logger().info(
             f"map->odom: t=[{T[0,3]:+.2f},{T[1,3]:+.2f},{T[2,3]:+.2f}] "
             f"yaw={self._ground_yaw_deg(T):+.1f}deg "
+            f"tilt={math.degrees(math.acos(max(-1.0, min(1.0, float(T[2,2]))))):.1f}deg "
             f"d_t={d_t:.3f}m d_yaw={d_yaw:+.1f}deg "
             f"constraints={len(relative_pose_constraint)} clean={clean}/{len(used)} "
             f"span_p50={spans[len(spans)//2]:.1f}s ratio_p50={ratios[len(ratios)//2]:.2f}"
