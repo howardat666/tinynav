@@ -157,8 +157,33 @@ def scene_catalog() -> list[dict[str, Any]]:
              "need_reach": bool(v["need_reach"])} for k, v in SCENES.items()]
 
 
+# 执行误差模型。规划器打分用的是它自己发出去的弧，默认假设完美执行；真机有增益、死区、
+# 滞后。这几档是用来回答"多大的偏差会撞"的。
+ACTUATORS: dict[str, dict[str, Any]] = {
+    "perfect": {"vx_gain": 1.0, "wz_gain": 1.0,
+                "vx_deadband": 0.0, "wz_deadband": 0.0, "latency_s": 0.0},
+    # 你举的那个例子：vx 0.2->0.18，w 0.1->0.08
+    "gain_10_20": {"vx_gain": 0.90, "wz_gain": 0.80,
+                   "vx_deadband": 0.0, "wz_deadband": 0.0, "latency_s": 0.0},
+    "gain_20_40": {"vx_gain": 0.80, "wz_gain": 0.60,
+                   "vx_deadband": 0.0, "wz_deadband": 0.0, "latency_s": 0.0},
+    # 低速转不动：静摩擦让小指令完全没输出，脱困时的原地转最容易踩到
+    "deadband": {"vx_gain": 1.0, "wz_gain": 1.0,
+                 "vx_deadband": 0.06, "wz_deadband": 0.20, "latency_s": 0.0},
+    # 指令排队。板上实测控制滞后 p90~0.8 s
+    "latency_400ms": {"vx_gain": 1.0, "wz_gain": 1.0,
+                      "vx_deadband": 0.0, "wz_deadband": 0.0, "latency_s": 0.4},
+    "latency_800ms": {"vx_gain": 1.0, "wz_gain": 1.0,
+                      "vx_deadband": 0.0, "wz_deadband": 0.0, "latency_s": 0.8},
+    # 全都有
+    "realistic": {"vx_gain": 0.85, "wz_gain": 0.75,
+                  "vx_deadband": 0.04, "wz_deadband": 0.12, "latency_s": 0.3},
+}
+
+
 def apply_scene(cfg: dict[str, Any], name: str,
-                camera: str = DEFAULT_CAMERA) -> dict[str, Any]:
+                camera: str = DEFAULT_CAMERA,
+                actuator: str = "perfect") -> dict[str, Any]:
     """把场景和我们的相机套到一份 default-config 上，返回新的 config。"""
     sc = SCENES.get(name)
     if sc is None:
@@ -174,4 +199,6 @@ def apply_scene(cfg: dict[str, Any], name: str,
     out["scene_name"] = name
     # map_node 会给的那条"已经绕开静态障碍"的全局路线。仿真里没有 map_node，所以手写。
     out["route"] = copy.deepcopy(sc.get("route") or [])
+    out["actuator"] = copy.deepcopy(ACTUATORS.get(actuator, ACTUATORS["perfect"]))
+    out["actuator_name"] = actuator
     return out

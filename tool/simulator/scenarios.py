@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tool.simulator import x5_presets  # noqa: E402
 
 BASE = "http://127.0.0.1:8766"
+ACTUATOR = "perfect"
 
 
 def api(path, payload=None, timeout=20):
@@ -37,11 +38,52 @@ def api(path, payload=None, timeout=20):
 SCENES = x5_presets.SCENES
 
 
+def footprint_points(corners, n=5):
+    """把车体四角双线性铺成 n x n 个点。和规划器碰撞检查的口径一致（铺满，不是只取角）。"""
+    if len(corners) < 4:
+        return []
+    (ax, ay), (bx, by), (cx, cy), (dx, dy) = [tuple(p) for p in corners[:4]]
+    pts = []
+    for i in range(n):
+        u = i / (n - 1)
+        for j in range(n):
+            v = j / (n - 1)
+            # 沿 a->b 和 d->c 插值，再在两者之间插值
+            px = (1 - v) * ((1 - u) * ax + u * bx) + v * ((1 - u) * dx + u * cx)
+            py = (1 - v) * ((1 - u) * ay + u * by) + v * ((1 - u) * dy + u * cy)
+            pts.append((px, py))
+    return pts
+
+
+def clearance_to_objects(corners, objects):
+    """车体到最近障碍的距离，负值表示已经压进去了。仿真不做碰撞响应，所以"撞没撞"必须
+    在这里自己判 —— 少了它，「指令和实际有差距会不会撞」这个问题根本量不出来。"""
+    pts = footprint_points(corners)
+    if not pts:
+        return float("inf")
+    worst = float("inf")
+    for obj in objects:
+        cx, cy, _ = obj["center"]
+        sx, sy, _ = obj["size"]
+        hx, hy = sx / 2.0, sy / 2.0
+        for px, py in pts:
+            dx = abs(px - cx) - hx
+            dy = abs(py - cy) - hy
+            if dx <= 0 and dy <= 0:
+                d = max(dx, dy)              # 在盒子里，负的
+            else:
+                d = math.hypot(max(dx, 0.0), max(dy, 0.0))
+            if d < worst:
+                worst = d
+    return worst
+
+
 def run(name, sc, poll_hz=5.0):
     # 场景由服务端按 x5_presets 那一份定义生成，且 load-scene 会把 planning 和 control
     # 都换新的。少了这个隔离，planning 带着上一个场景的障碍图、control 带着累积的路径
     # 参考，下一个场景会「单独跑过、连着跑不动」—— 看着像规划器的 bug，实际不是。
-    cfg = api("/api/load-scene", {"name": name, "freeze": True})["config"]
+    cfg = api("/api/load-scene", {"name": name, "freeze": True,
+                                  "actuator": ACTUATOR})["config"]
 
     # 等仿真环真的转起来再开始计时：planning_node 重启要付一次 numba 编译，把那段算进
     # 预算就会把「起得慢」误判成「走不动」。判据是它发出了非退化的轨迹。
@@ -75,7 +117,8 @@ def run(name, sc, poll_hz=5.0):
         x, y = f["robot_xy"]
         vx, wz = f["selected_param"]
         d = math.hypot(tgt[0] - x, tgt[1] - y)
-        samples.append((time.monotonic() - t0, x, y, f["robot_yaw_deg"], vx, wz, d))
+        clr = clearance_to_objects(f.get("robot_footprint_xy") or [], cfg.get("objects") or [])
+        samples.append((time.monotonic() - t0, x, y, f["robot_yaw_deg"], vx, wz, d, clr))
         if d < 0.4 and reached_at is None:
             reached_at = time.monotonic() - t0
             break
@@ -84,34 +127,43 @@ def run(name, sc, poll_hz=5.0):
     if not samples:
         return dict(name=name, ok=False, note="仿真器没有回应")
     # 变向：wz 的符号翻转（忽略接近零的）
-    signs = [math.copysign(1, w) for _, _, _, _, _, w, _ in samples if abs(w) > 0.05]
+    signs = [math.copysign(1, s[5]) for s in samples if abs(s[5]) > 0.05]
     flips = sum(1 for a, b in zip(signs, signs[1:]) if a != b)
     stalled = sum(1 for s in samples if abs(s[4]) < 0.01 and abs(s[5]) < 0.05)
     # rev=OFF 时跟踪律反馈仍可能给出 -0.05 以内的小负值（v_cap=|v_ref|+slack），不算倒车
     revs = [s[4] for s in samples if s[4] < -0.06]
     path_len = sum(math.hypot(b[1] - a[1], b[2] - a[2]) for a, b in zip(samples, samples[1:]))
+    clears = [s[7] for s in samples if math.isfinite(s[7])]
+    min_clear = min(clears) if clears else float("nan")
+    hits = sum(1 for c in clears if c < 0.0)
     ok = (reached_at is not None) if sc["need_reach"] else True
     # 变向次数是摆头的判据，每个场景给的上限不同（见 x5_presets.SCENES）。
     ok = ok and flips <= int(sc.get("max_flips", 6))
     # 倒车默认关，所以任何真正的倒车指令都是问题（-0.06 以内是跟踪律的反馈余量，不算）
     ok = ok and len(revs) == 0
+    ok = ok and hits == 0            # 压进障碍就是失败，不管到没到
     return dict(name=name, ok=ok, reached_at=reached_at, flips=flips,
                 stalled_frac=stalled / len(samples), n=len(samples),
                 path_len=path_len, reverse_cmds=len(revs),
-                final_d=samples[-1][6])
+                final_d=samples[-1][6], min_clear=min_clear, hits=hits)
 
 
 def main():
-    global BASE
+    global BASE, ACTUATOR
     ap = argparse.ArgumentParser()
     ap.add_argument("only", nargs="*", help="只跑这些场景")
     ap.add_argument("--base", default=BASE)
+    ap.add_argument("--actuator", default="perfect",
+                    help="执行误差模型：perfect / gain_10_20 / gain_20_40 / deadband / "
+                         "latency_400ms / latency_800ms / realistic")
     a = ap.parse_args()
     BASE = a.base
+    ACTUATOR = a.actuator
     all_sc = SCENES
     todo = a.only or list(all_sc)
     bad = 0
-    print(f"{'场景':<12} {'到达':>7} {'变向':>4} {'静止占比':>8} {'路程':>6} {'倒车指令':>8} {'末距':>6}  结果")
+    print(f"执行误差模型: {ACTUATOR}")
+    print(f"{'场景':<12} {'到达':>7} {'变向':>4} {'最小净空':>8} {'压进障碍':>8} {'路程':>6} {'末距':>6}  结果")
     for name in todo:
         if name not in all_sc:
             print(f"  未知场景 {name}（有：{', '.join(all_sc)}）")
@@ -125,9 +177,9 @@ def main():
             continue
         bad += not r["ok"]
         reach = f"{r['reached_at']:.1f}s" if r["reached_at"] is not None else "未到"
-        print(f"{name:<12} {reach:>7} {r['flips']:>4} {r['stalled_frac']*100:>7.0f}% "
-              f"{r['path_len']:>5.2f}m {r['reverse_cmds']:>8} {r['final_d']:>5.2f}m  "
-              f"{'OK' if r['ok'] else '**FAIL**'}")
+        print(f"{name:<12} {reach:>7} {r['flips']:>4} {r['min_clear']:>7.3f}m "
+              f"{r['hits']:>8} {r['path_len']:>5.2f}m {r['final_d']:>5.2f}m  "
+              f"{'OK' if r['ok'] else '**FAIL**'}", flush=True)
     print("全部通过" if not bad else f"{bad} 个场景不通过", flush=True)
     return 1 if bad else 0
 

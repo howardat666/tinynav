@@ -42,6 +42,7 @@ from tinynav.core.robot_config import DIFFCAR_CONFIG as DEFAULT_ROBOT
 from tinynav.core import robot_config as robot_specs_mod
 from tool.simulator.map_volume import MapVolume
 from tool.simulator.x5_presets import (
+    ACTUATORS,
     BOARD_ENV,
     DEFAULT_CAMERA,
     DEFAULT_SCENE,
@@ -74,6 +75,7 @@ def _default_tinynav_db_path() -> Path:
 
 MAPS_ROOT = _default_tinynav_db_path() / "maps"
 SIM_CAMERA_NAME = os.environ.get("TINYNAV_SIM_CAMERA", DEFAULT_CAMERA)
+SIM_ACTUATOR_NAME = os.environ.get("TINYNAV_SIM_ACTUATOR", "perfect")
 CAMERA_DEFAULTS, RAYCAST_STEP = camera_and_step(SIM_CAMERA_NAME)
 ROBOT_PRESETS = {
     name.removesuffix("_CONFIG").lower(): asdict(getattr(robot_specs_mod, name))
@@ -94,6 +96,8 @@ def default_config(robot_name: str | None = None) -> dict[str, Any]:
         "robot": robot,
         "obstacle": copy.deepcopy(robot.get("obstacle") or {}),
         "camera": copy.deepcopy(CAMERA_DEFAULTS),
+        "actuator": {"vx_gain": 1.0, "wz_gain": 1.0,
+                     "vx_deadband": 0.0, "wz_deadband": 0.0, "latency_s": 0.0},
         "start": {"xy": [0.0, 0.0], "yaw_deg": 0.0},
         "target": [4.0, 0.0, 0.0],
         "map_path": None,
@@ -240,6 +244,8 @@ class RosPlanningSimNode(Node):
         # 冻结时照常发深度和位姿，但不积分 cmd_vel —— 让规划器付完 numba 编译再放行，
         # 否则预热那几秒车已经开走一米多，场景之间的「用时/路程」就不可比了。
         self.frozen = False
+        self._cmd_queue: list[tuple[float, float, float]] = []
+        self._applied_cmd = (0.0, 0.0)
 
         self.depth_pub = self.create_publisher(Image, "/slam/depth", 10)
         self.odom_visual_pub = self.create_publisher(Odometry, "/slam/odometry_visual", 10)
@@ -373,11 +379,41 @@ class RosPlanningSimNode(Node):
         msg.pose.pose.orientation.w = 1.0
         self.target_pub.publish(msg)
 
+    def _actual_cmd(self, vx: float, wz: float) -> tuple[float, float]:
+        """把"发出去的指令"变成"轮子真的执行的量"。
+
+        规划器打分用的是它自己发出去的那条弧，默认执行是完美的。真机不是：增益、死区、
+        滞后都会让实际轨迹偏离被检查过的那条。这个模型让"多大的偏差会撞"变成可测的。
+        """
+        a = self.config.get("actuator") or {}
+        vd = float(a.get("vx_deadband", 0.0))
+        wd = float(a.get("wz_deadband", 0.0))
+        vx = 0.0 if abs(vx) < vd else vx * float(a.get("vx_gain", 1.0))
+        wz = 0.0 if abs(wz) < wd else wz * float(a.get("wz_gain", 1.0))
+        return vx, wz
+
     def integrate_cmd(self, dt: float) -> None:
+        a = self.config.get("actuator") or {}
+        lag = float(a.get("latency_s", 0.0))
+        if lag > 0.0:
+            # 指令排队 lag 秒再生效。轮子在这段时间里执行的是上一条指令。
+            self._cmd_queue.append((time.monotonic() + lag,
+                                    float(self.last_cmd.linear.x),
+                                    float(self.last_cmd.angular.z)))
+            now = time.monotonic()
+            while len(self._cmd_queue) > 1 and self._cmd_queue[1][0] <= now:
+                self._cmd_queue.pop(0)
+            _, vx, wz = self._cmd_queue[0]
+            if self._cmd_queue[0][0] > now:
+                vx, wz = self._applied_cmd
+        else:
+            vx, wz = float(self.last_cmd.linear.x), float(self.last_cmd.angular.z)
+        vx, wz = self._actual_cmd(vx, wz)
+        self._applied_cmd = (vx, wz)
         yaw = math.radians(self.yaw_deg)
-        self.control_xy[0] += math.cos(yaw) * self.last_cmd.linear.x * dt
-        self.control_xy[1] += math.sin(yaw) * self.last_cmd.linear.x * dt
-        self.yaw_deg = (self.yaw_deg + math.degrees(self.last_cmd.angular.z * dt) + 180.0) % 360.0 - 180.0
+        self.control_xy[0] += math.cos(yaw) * vx * dt
+        self.control_xy[1] += math.sin(yaw) * vx * dt
+        self.yaw_deg = (self.yaw_deg + math.degrees(wz * dt) + 180.0) % 360.0 - 180.0
 
     def tick(self) -> None:
         with self.lock:
@@ -661,12 +697,14 @@ class SceneRequest(BaseModel):
     name: str
     camera: str | None = None
     freeze: bool | None = None
+    actuator: str | None = None
 
 
 @app.get("/api/scene-presets")
 def scene_presets() -> dict[str, Any]:
     return {"scenes": scene_catalog(), "camera": SIM_CAMERA_NAME,
-            "raycast_step": RAYCAST_STEP}
+            "raycast_step": RAYCAST_STEP, "actuator": SIM_ACTUATOR_NAME,
+            "actuators": sorted(ACTUATORS)}
 
 
 @app.post("/api/load-scene")
@@ -679,7 +717,8 @@ def load_scene(request: SceneRequest) -> dict[str, Any]:
     node = _require_sim()
     try:
         cfg = apply_scene(default_config(_active_robot_type()), request.name,
-                          request.camera or SIM_CAMERA_NAME)
+                          request.camera or SIM_CAMERA_NAME,
+                          request.actuator or SIM_ACTUATOR_NAME)
     except KeyError:
         raise HTTPException(status_code=404, detail=f"unknown scene: {request.name}")
     _stop_script("tinynav/platforms/cmd_vel_control.py")
