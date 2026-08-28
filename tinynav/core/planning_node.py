@@ -375,6 +375,9 @@ class PlanningNode(Node):
         # 5 把召回提到 68~72%，代价 4.3 -> 14.0 ms（250 ms 周期的 4%）。这是填洞的正路：
         # 用膨胀填洞每格要付 0.1 m/侧的过道净宽，而这里付的是 CPU。
         self.step = int(os.environ.get('TINYNAV_RAYCAST_STEP', '5'))
+        # 轨迹库的采样密度：omega 取 n 个、vx 取 max(3, n//2) 个，共 n*max(3,n//2) 条
+        # 前进弧 + 5 条倒车。打分是 O(条数 x 31 步 x 20 个车体取样点)，加密要线性付钱。
+        self.traj_samples = int(os.environ.get('TINYNAV_TRAJ_SAMPLES', '15'))
         # 梯度脱困：当前位姿本身已在碰撞里时用的兜底。速度压得很低，且累计位移有预算 ——
         # 后方没有任何传感，长时间盲退比楔住更危险。
         self.escape_speed = float(os.environ.get('TINYNAV_ESCAPE_SPEED', '0.08'))
@@ -598,6 +601,7 @@ class PlanningNode(Node):
                 init_p = np.zeros(3)
                 init_q = np.array([0.0, 0.0, 0.0, 1.0])
                 trajectories, params = generate_trajectory_library_3d(
+                    num_samples=self.traj_samples,
                     init_p=init_p, init_q=init_q, dt=self.dt, vx_max=self.robot.max_vx,
                     omega_max=self.robot.max_yaw
                 )
@@ -1599,6 +1603,7 @@ class PlanningNode(Node):
                 )
 
             trajectories, params = generate_trajectory_library_3d(
+                num_samples = self.traj_samples,
                 init_p = init_p,
                 init_q = init_q,
                 dt = self.dt,
