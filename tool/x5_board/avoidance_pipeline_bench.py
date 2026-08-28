@@ -75,7 +75,8 @@ def pipeline(depth, T, K, res, shape, step, label, n=7):
                                                   dt=0.1, vx_max=R.max_vx)
     trajs = normalize_pose_trajectories(trajs)
     fl, rl, hw = R.footprint_from_control()
-    t_sc, _ = tm(score_trajectories_by_ESDF, n, trajs, esdf, origin, res,
+    flat = np.full(esdf.shape, 1e3, dtype=np.float32)   # 没有路线时的两张平坦查表图
+    t_sc, _ = tm(score_trajectories_by_ESDF, n, trajs, esdf, flat, flat, origin, res,
                  R.hard_clearance, R.soft_clearance, fl, rl, hw, R.is_circle)
     tot = t_ray + t_obs + t_esdf + t_sc
     print(f'{label:<28s}{t_ray:9.1f}{t_obs:9.1f}{t_esdf:9.1f}{t_sc:9.1f}{tot:10.1f}   '

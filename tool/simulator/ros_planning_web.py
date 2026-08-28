@@ -251,6 +251,9 @@ class RosPlanningSimNode(Node):
         # VOLATILE 的发布者和 TRANSIENT_LOCAL 的订阅者在 DDS 里是**不兼容**的，
         # 根本不建连 —— 表现是 planning 一直打 "No target pose"，一点错都不报。
         self.target_pub = self.create_publisher(Odometry, "/control/target_pose", latched)
+        # 仿真里没有 map_node，全局路线由场景直接给。世界系，和 map_node 转过之后那条
+        # /mapping/global_plan_odom 是同一个口径。
+        self.route_pub = self.create_publisher(RosPath, "/mapping/global_plan_odom", latched)
         self.nav_active_pub = self.create_publisher(Bool, "/nav/active", latched)
         self.nav_paused_pub = self.create_publisher(Bool, "/nav/paused", latched)
 
@@ -329,6 +332,22 @@ class RosPlanningSimNode(Node):
         with self.lock:
             self.last_esdf_grid = grid_payload(msg, clearance)
 
+    def publish_route(self, stamp, config: dict[str, Any]) -> None:
+        route = config.get("route") or []
+        if len(route) < 2:
+            return
+        msg = RosPath()
+        msg.header.stamp = stamp
+        msg.header.frame_id = "world"
+        for x, y in route:
+            ps = PoseStamped()
+            ps.header = msg.header
+            ps.pose.position.x = float(x)
+            ps.pose.position.y = float(y)
+            ps.pose.orientation.w = 1.0
+            msg.poses.append(ps)
+        self.route_pub.publish(msg)
+
     def publish_camera_info(self, stamp, config: dict[str, Any]) -> None:
         cam = config["camera"]
         width, height = cam_size(cam)
@@ -393,6 +412,7 @@ class RosPlanningSimNode(Node):
         self.pose_pub.publish(pose_from_T(T_cam, stamp))
         self.publish_camera_info(stamp, config)
         self.publish_target(stamp, config)
+        self.publish_route(stamp, config)
         self.nav_active_pub.publish(Bool(data=True))
         self.nav_paused_pub.publish(Bool(data=False))
 

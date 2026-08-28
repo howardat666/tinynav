@@ -26,6 +26,7 @@ exec docker run --rm --net=host --name tinynav_sim \
   -e ROS_LOCALHOST_ONLY=1 -e ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-77}" \
   -e OPENBLAS_NUM_THREADS=2 -e OMP_NUM_THREADS=2 \
   -e TINYNAV_ALLOW_REVERSE="${TINYNAV_ALLOW_REVERSE:-0}" \
+  -e TINYNAV_ROUTE_COST="${TINYNAV_ROUTE_COST:-1}" \
   -e TINYNAV_SIM_SCENE="${TINYNAV_SIM_SCENE:-wall_ahead}" \
   -e TINYNAV_SIM_CAMERA="${TINYNAV_SIM_CAMERA:-match}" \
   --entrypoint bash "$IMAGE" -lc '

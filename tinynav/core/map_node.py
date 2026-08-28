@@ -521,6 +521,11 @@ class MapNode(Node):
 
         self.current_pose_pub = self.create_publisher(Odometry, "/mapping/current_pose", 10)
         self.global_plan_pub = self.create_publisher(Path, '/mapping/global_plan', 10)
+        # 同一条路线，但已经乘过 T_from_map_to_odom，直接就是规划器的 world 帧。
+        # 上游 PR #226 是靠 TF 查 map->world 的，而 looper 导航模式下没有任何节点广播
+        # 这个 TF（广播器只在 build_map_node 和 perception_node 里，两个都不跑）。
+        # 目标点 /control/target_pose 本来就是这样送出去的，路线跟着同一条路走。
+        self.global_plan_odom_pub = self.create_publisher(Path, '/mapping/global_plan_odom', 10)
         # Latched for the same reason as /mapping/cmd_pois above: this is state, not a
         # stream. It is published once when a POI becomes the active target, and
         # planning_node is restarted independently of this node (cmd_restart_nav_nodes),
@@ -1936,6 +1941,23 @@ class MapNode(Node):
             t_stage = mark_stage("global_path_msg_build", t_stage)
 
             self.global_plan_pub.publish(path_msg)
+
+            T_m2o = self.T_from_map_to_odom
+            if T_m2o is not None:
+                pts = np.asarray(paths_in_map, dtype=float)
+                pts_odom = pts @ T_m2o[:3, :3].T + T_m2o[:3, 3]
+                odom_msg_path = Path()
+                odom_msg_path.header.stamp = path_msg.header.stamp
+                odom_msg_path.header.frame_id = "world"
+                for x, y, z in pts_odom:
+                    pose = PoseStamped()
+                    pose.header = odom_msg_path.header
+                    pose.pose.position.x = float(x)
+                    pose.pose.position.y = float(y)
+                    pose.pose.position.z = float(z)
+                    pose.pose.orientation.w = 1.0
+                    odom_msg_path.poses.append(pose)
+                self.global_plan_odom_pub.publish(odom_msg_path)
             # 判"target 跳变"的分水岭:/control/target_pose 本来就是沿路径滚动的前视点，所以
             # 它动是正常的。只有这条路径自己变了，跳变才是缺陷。记首尾点和长度就够对上。
             head = paths_in_map[0] if len(paths_in_map) else None

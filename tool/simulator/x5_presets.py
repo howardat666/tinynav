@@ -83,15 +83,20 @@ def _box(name, center, size):
     return {"name": name, "kind": "box", "center": list(center), "size": list(size)}
 
 
+# `route` 是这个场景里 map_node 会给出的全局路线（世界系折线）。仿真里没有 map_node，
+# 所以按"在地图 SDF 走廊里搜出来的、绕开静态障碍的一条路"手写。规划器订的是
+# /mapping/global_plan_odom。
 SCENES: dict[str, dict[str, Any]] = {
     "open_run": dict(
         title="空地直行",
         note="3 m 空地。基线，任何改动都不许把它弄坏。",
+        route=[[0.0, 0.0], [3.0, 0.0]],
         start=[0.0, 0.0], yaw=0.0, target=[3.0, 0.0], objects=[],
         budget_s=45, need_reach=True, max_flips=6),
     "corridor": dict(
         title="0.8 m 走廊",
         note="净宽 0.8 m，直着穿过去。车宽 0.35，两边各 0.22 m 余量。",
+        route=[[0.0, 0.0], [3.0, 0.0]],
         start=[0.0, 0.0], yaw=0.0, target=[3.0, 0.0],
         objects=[_box("left", [1.5, 0.6, _WZ], [3.0, 0.2, _WH]),
                  _box("right", [1.5, -0.6, _WZ], [3.0, 0.2, _WH])],
@@ -99,6 +104,7 @@ SCENES: dict[str, dict[str, Any]] = {
     "narrow_gap": dict(
         title="0.9 m 门洞",
         note="一堵墙中间留 0.9 m。代码注释里旧直线探针在这里「转 102 次、超时」。",
+        route=[[0.0, 0.0], [1.5, 0.0], [3.0, 0.0]],
         start=[0.0, 0.0], yaw=0.0, target=[3.0, 0.0],
         objects=[_box("wall_left", [1.5, 1.15, _WZ], [0.2, 1.7, _WH]),
                  _box("wall_right", [1.5, -1.15, _WZ], [0.2, 1.7, _WH])],
@@ -107,12 +113,14 @@ SCENES: dict[str, dict[str, Any]] = {
         title="贴墙 + 目标在后（摆头那一幕）",
         note="正前方 0.2 m 一堵宽墙、两侧开阔、目标在右后方。2026-08-27 板上摆头的复刻，"
              "判据是变向次数不是到不到。",
+        route=[[0.0, 0.0], [0.0, -1.0], [-0.5, -1.8]],
         start=[0.0, 0.0], yaw=0.0, target=[-0.5, -1.8],
         objects=[_box("wall", [0.5, 0.0, _WZ], [0.2, 3.0, _WH])],
         budget_s=75, need_reach=True, max_flips=2),
     "dead_end": dict(
         title="死角（三面围住）",
         note="倒车默认关，所以正确行为是停住报无解 —— 既不许倒、也不许在里面摆头。",
+        route=[[0.0, 0.0], [3.0, 0.0]],
         start=[0.0, 0.0], yaw=0.0, target=[3.0, 0.0],
         objects=[_box("front", [0.55, 0.0, _WZ], [0.2, 1.4, _WH]),
                  _box("left", [0.0, 0.7, _WZ], [1.4, 0.2, _WH]),
@@ -122,6 +130,7 @@ SCENES: dict[str, dict[str, Any]] = {
         title="办公椅腿（矮障碍）",
         note="五条 5 cm 的腿，离地 0~0.35 m。专门压 low_obs 那条通路（0.05~0.25 m、"
              "1.5 m 内、>=2 点）—— z 跨度那条判不出来，靠离地高度判。",
+        route=[[0.0, 0.0], [0.8, 0.45], [1.6, 0.45], [2.5, 0.0]],
         start=[0.0, 0.0], yaw=0.0, target=[2.5, 0.0],
         objects=[_box("leg_c", [1.2, 0.0, 0.17], [0.05, 0.05, 0.35]),
                  _box("leg_a", [1.35, 0.22, 0.17], [0.05, 0.05, 0.35]),
@@ -132,6 +141,7 @@ SCENES: dict[str, dict[str, Any]] = {
     "doorway_turn": dict(
         title="过门后要右转",
         note="0.9 m 门洞，出去之后目标在右侧 —— 贪心的终点距离在门里就想往右切。",
+        route=[[0.0, 0.0], [1.2, 0.0], [2.2, -0.6], [2.2, -1.8]],
         start=[0.0, 0.0], yaw=0.0, target=[2.2, -1.8],
         objects=[_box("wall_left", [1.2, 1.15, _WZ], [0.2, 1.7, _WH]),
                  _box("wall_right", [1.2, -1.15, _WZ], [0.2, 1.7, _WH]),
@@ -162,4 +172,6 @@ def apply_scene(cfg: dict[str, Any], name: str,
     out["map_name"] = None
     out["map_path"] = None
     out["scene_name"] = name
+    # map_node 会给的那条"已经绕开静态障碍"的全局路线。仿真里没有 map_node，所以手写。
+    out["route"] = copy.deepcopy(sc.get("route") or [])
     return out

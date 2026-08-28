@@ -63,8 +63,9 @@ def main() -> int:
 
     timed("trajectory library", build)
     esdf = np.full(grid[:2], 10.0, dtype=np.float32)
+    flat = np.full(grid[:2], 1e3, dtype=np.float32)   # 没有路线时的两张平坦查表图
     timed("trajectory scoring", lambda: score_trajectories_by_ESDF(
-        trajs[0], esdf, origin, 0.1, robot.hard_clearance, robot.soft_clearance,
+        trajs[0], esdf, flat, flat, origin, 0.1, robot.hard_clearance, robot.soft_clearance,
         front, rear, half_w, robot.is_circle))
 
     try:

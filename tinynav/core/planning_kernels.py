@@ -208,7 +208,8 @@ def generate_trajectory_library_3d(
 
 
 @njit(cache=True)
-def score_trajectories_by_ESDF(trajectories, ESDF_map, origin, resolution,
+def score_trajectories_by_ESDF(trajectories, ESDF_map, path_dist_map, remaining_map,
+                                origin, resolution,
                                 hard_clearance=1e-3, soft_clearance=0.1,
                                 front_len=0.35, rear_len=0.35, half_w=0.15,
                                 is_circle=False):
@@ -220,6 +221,11 @@ def score_trajectories_by_ESDF(trajectories, ESDF_map, origin, resolution,
     """
     scores = []
     occ_points = []
+    # 全局路线的两个查表量，来自 build_route_fields，和 ESDF 共用形状/原点/分辨率。
+    # path_costs[t] = 整条轨迹**中心点**离路线最远的那一次（取最大而不是平均：短暂切角
+    # 会被其余贴着路线的部分稀释掉）。end_remainings[t] = 终点处路线还剩多长。
+    path_costs = []
+    end_remainings = []
     ESDF_rows, ESDF_cols = ESDF_map.shape
     # 方形底盘按"间距不超过一格"铺满车体，而不是只取中心加四角。0.28x0.35 的车体在 0.1 m
     # 栅格上，前缘两角相距 0.35 m 却中间不取样 —— 一个 0.1 m 的障碍能整个坐在空隙里，五个点
@@ -241,9 +247,25 @@ def score_trajectories_by_ESDF(trajectories, ESDF_map, origin, resolution,
         traj = trajectories[t]
         min_dist_for_traj = float('inf')
         closest_step_for_traj = -1
+        path_cost_max = 0.0
+        path_cost_n = 0
+        traveled_arc = 0.0
 
         for i in range(len(traj)):
             x_world, y_world = traj[i, 0], traj[i, 1]
+            if i > 0:
+                dxa = x_world - traj[i - 1, 0]
+                dya = y_world - traj[i - 1, 1]
+                traveled_arc += (dxa * dxa + dya * dya) ** 0.5
+            # 离路线的距离按**中心点**算，不按车体那 20 个取样点 —— 取样点是给碰撞用的，
+            # 拿它们算贴合度会把车宽也算进偏离量。
+            cx_img = int((x_world - origin[0]) / resolution)
+            cy_img = int((y_world - origin[1]) / resolution)
+            if 0 <= cx_img < ESDF_rows and 0 <= cy_img < ESDF_cols:
+                center_path_dist = float(path_dist_map[cx_img, cy_img])
+                if center_path_dist > path_cost_max:
+                    path_cost_max = center_path_dist
+                path_cost_n += 1
             qx, qy, qz, qw = traj[i, 3], traj[i, 4], traj[i, 5], traj[i, 6]
 
             # world XY forward from quaternion (body +Z forward)
@@ -280,6 +302,28 @@ def score_trajectories_by_ESDF(trajectories, ESDF_map, origin, resolution,
                             min_dist_for_traj = dist
                             closest_step_for_traj = i
 
+        if path_cost_n > 0:
+            path_costs.append(path_cost_max)
+        else:
+            path_costs.append(1e3)          # 整条轨迹都跑到栅格外面去了
+
+        end_x_img = int((traj[-1, 0] - origin[0]) / resolution)
+        end_y_img = int((traj[-1, 1] - origin[1]) / resolution)
+        if 0 <= end_x_img < ESDF_rows and 0 <= end_y_img < ESDF_cols:
+            end_remaining = float(remaining_map[end_x_img, end_y_img])
+        else:
+            end_remaining = 1e3
+        # 下限：一条轨迹再怎么走，剩余路程也不可能比"起点剩余 - 自己走过的弧长"更小。
+        # 少了这条，路线自己折回来时（掉头/发卡弯）横切过去能白捡一大截进展。
+        start_x_img = int((traj[0, 0] - origin[0]) / resolution)
+        start_y_img = int((traj[0, 1] - origin[1]) / resolution)
+        if 0 <= start_x_img < ESDF_rows and 0 <= start_y_img < ESDF_cols:
+            start_remaining = float(remaining_map[start_x_img, start_y_img])
+            if start_remaining < 1e3:
+                if end_remaining < start_remaining - traveled_arc:
+                    end_remaining = start_remaining - traveled_arc
+        end_remainings.append(end_remaining)
+
         if min_dist_for_traj < hard_clearance:  # collision
             scores.append(float('inf'))
         elif min_dist_for_traj != float('inf'):
@@ -295,4 +339,4 @@ def score_trajectories_by_ESDF(trajectories, ESDF_map, origin, resolution,
         else:
             scores.append(0.0)
         occ_points.append(closest_step_for_traj)
-    return scores, occ_points
+    return scores, occ_points, path_costs, end_remainings

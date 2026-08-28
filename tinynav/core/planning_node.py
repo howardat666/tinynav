@@ -222,6 +222,42 @@ def _roll_2d(grid, shift_voxels):
     return rolled
 
 
+def build_route_fields(route_xy, shape, origin, resolution):
+    """把全局路线栅格化成两张查表图，供 DWA 打分一次索引搞定。
+
+    路线本身已经是绕开静态障碍的（map_node 在地图的 SDF 走廊里搜出来的），这里只是让它
+    可查询。返回 (path_dist_map, remaining_map, has_route)：前者是每格到最近路线格的距离，
+    后者是该格"路线还剩多长"，不在路线上的格子继承最近路线格的剩余量。
+    """
+    path_dist_map = np.full(shape, 1e3, dtype=np.float32)
+    remaining_map = np.full(shape, 1e3, dtype=np.float32)
+    if route_xy is None or len(route_xy) < 2:
+        return path_dist_map, remaining_map, False
+
+    rows, cols = shape
+    route = np.asarray(route_xy, dtype=float)[:, :2]
+    node_arc = np.concatenate(([0.0], np.cumsum(np.linalg.norm(np.diff(route, axis=0), axis=1))))
+    arc = float(node_arc[-1])
+    if arc < 1e-9:
+        return path_dist_map, remaining_map, False
+
+    # 按半格重采样，否则栅格化出来的线有洞，距离变换会从洞里穿过去
+    sample_arc = np.linspace(0.0, arc, int(np.ceil(arc / (0.5 * resolution))) + 1)
+    r = ((np.interp(sample_arc, node_arc, route[:, 0]) - origin[0]) / resolution).astype(np.int64)
+    c = ((np.interp(sample_arc, node_arc, route[:, 1]) - origin[1]) / resolution).astype(np.int64)
+    inside = (r >= 0) & (r < rows) & (c >= 0) & (c < cols)
+    if not np.any(inside):
+        return path_dist_map, remaining_map, False
+
+    route_mask = np.zeros(shape, dtype=bool)
+    arc_map = np.zeros(shape, dtype=np.float32)
+    route_mask[r[inside], c[inside]] = True
+    arc_map[r[inside], c[inside]] = sample_arc[inside]   # 被经过两次的格子留后一次的弧长
+    dist_cells, (near_r, near_c) = distance_transform_edt(~route_mask, return_indices=True)
+    return ((dist_cells * resolution).astype(np.float32),
+            (arc - arc_map[near_r, near_c]).astype(np.float32), True)
+
+
 # === PlanningNode class ===
 class PlanningNode(Node):
     def __init__(self):
@@ -508,6 +544,19 @@ class PlanningNode(Node):
 
         self.poi_change_sub = self.create_subscription(Odometry, "/mapping/poi_change", self.poi_change_callback, 10)
 
+        # 全局路线。订的是 map_node 已经转到 world 帧的那条（/mapping/global_plan 是 map 帧，
+        # 而导航模式下没有任何节点广播 map->world 的 TF）。
+        self.create_subscription(Path, '/mapping/global_plan_odom', self._on_global_route, 1)
+        self._route_xy = None
+        self.route_cost_enabled = os.environ.get('TINYNAV_ROUTE_COST', '1') == '1'
+        # 障碍项的 1e5 压倒一切；剩下的里，progress 决定走多快，follow 拦住"横切到路线上
+        # 更近的一点"这种抄近道。
+        self.w_route_progress = float(os.environ.get('TINYNAV_W_ROUTE_PROGRESS', '100.0'))
+        self.w_path_follow = float(os.environ.get('TINYNAV_W_PATH_FOLLOW', '80.0'))
+        # remaining_map 在到达前就饱和到 0，最后一段要靠这项把车拉到精确目标上
+        self.w_goal_terminal = float(os.environ.get('TINYNAV_W_GOAL_TERMINAL', '100.0'))
+        self.route_terminal_band = float(os.environ.get('TINYNAV_ROUTE_TERMINAL_BAND', '0.5'))
+
 
         # Whether a browser is actually looking at the local view. The overlay layers and
         # the voxel cloud exist only to be drawn, and together they measured 25.9 ms of a
@@ -562,7 +611,7 @@ class PlanningNode(Node):
                     params = np.concatenate([params, vocab_params], axis=0)
                 # 2-D float32 clearance field, as built in sync_callback.
                 esdf = np.full(self.grid_shape[:2], 10.0, dtype=np.float32)
-                self._score_trajectories(trajectories, esdf)
+                self._score_trajectories(trajectories, esdf)   # 预热 numba
             except Exception as e:  # noqa: BLE001 - a warmup thread must never die silently
                 self.get_logger().error(f"trajectory warmup failed: {e}")
             finally:
@@ -575,6 +624,7 @@ class PlanningNode(Node):
         threading.Thread(target=_run, name="trajectory_warmup", daemon=True).start()
 
     def poi_change_callback(self, msg):
+        self._route_xy = None           # 缓存的路线是通往旧目标的
         # This silently discards the target, and it is a prime suspect for the
         # remaining stalls: in one run planning held a target for about 2 s out of a
         # 72 s window and then reported "No target pose" 563 times, with only one
@@ -610,6 +660,10 @@ class PlanningNode(Node):
         # When the target last arrived, which is what separates "standing on a rolling
         # waypoint" from "the run is over". See the arrival test in the planning loop.
         self._last_target_rx_ns = now_ns
+
+    def _on_global_route(self, msg: Path):
+        pts = [[p.pose.position.x, p.pose.position.y] for p in msg.poses]
+        self._route_xy = np.asarray(pts, dtype=float) if len(pts) >= 2 else None
 
     def _ui_active_callback(self, msg: Bool):
         if bool(msg.data) != self._ui_active:
@@ -690,7 +744,8 @@ class PlanningNode(Node):
     def _is_turn_in_place(param):
         return abs(param[0]) < 1e-6 and abs(param[1]) > 1e-6
 
-    def _score_trajectories(self, trajectories, esdf, params=None):
+    def _score_trajectories(self, trajectories, esdf, params=None,
+                            path_dist_map=None, remaining_map=None):
         """Collision scores, with in-place turns exempted on a round base.
 
         A circle rotating in place sweeps the area it already occupies, so the verdict is
@@ -698,8 +753,12 @@ class PlanningNode(Node):
         killed 12 of 14 turns, and the escape hatch then failed silently for 23 s.
         """
         front_len, rear_len, half_w = self.robot.footprint_from_control()
-        scores, occ_points = score_trajectories_by_ESDF(
-            trajectories, esdf, self.origin, self.resolution,
+        if path_dist_map is None:
+            path_dist_map = np.full(esdf.shape, 1e3, dtype=np.float32)
+            remaining_map = np.full(esdf.shape, 1e3, dtype=np.float32)
+        scores, occ_points, path_costs, end_remainings = score_trajectories_by_ESDF(
+            trajectories, esdf, path_dist_map, remaining_map,
+            self.origin, self.resolution,
             self.robot.hard_clearance, self.robot.soft_clearance,
             front_len, rear_len, half_w, self.robot.is_circle,
         )
@@ -707,7 +766,7 @@ class PlanningNode(Node):
             for i in range(len(params)):
                 if self._is_turn_in_place(params[i]):
                     scores[i] = 0.0
-        return scores, occ_points
+        return scores, occ_points, path_costs, end_remainings
 
     def _front_gate_m(self):
         """界面提示用的净空阈值。规划器已不用它，见 _prefix_clearance。"""
@@ -1554,7 +1613,11 @@ class PlanningNode(Node):
                 params = np.concatenate([params, vocab_params], axis=0)
 
         with Timer(name='traj score', text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=_TIMER_LOGGER):
-            scores, occ_points = self._score_trajectories(trajectories, ESDF_map, params)
+            route_xy = self._route_xy if self.route_cost_enabled else None
+            path_dist_map, remaining_map, has_route = build_route_fields(
+                route_xy, ESDF_map.shape, self.origin, self.resolution)
+            scores, occ_points, path_costs, end_remainings = self._score_trajectories(
+                trajectories, ESDF_map, params, path_dist_map, remaining_map)
 
         with Timer(name='pub', text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=_TIMER_LOGGER):
             # "前方堵住" = 连最慢的那档前进都过不了视距门限。轨迹库把速度采成
@@ -1572,17 +1635,32 @@ class PlanningNode(Node):
             def cost_function(traj, param, score, target_pose, idx):
                 gate_penalty = self._motion_gate_penalty(
                     param, idx, forward_ok, front_blocked)
+                smoothness = (40 * abs(self.last_param[0] - param[0])
+                              + 10 * abs(self.last_param[1] - param[1]))
 
-                # regular trajectory penalty
-                traj_end = np.array(traj[-1,:3])
-                target_end = target_pose if target_pose is not None else traj_end
-                # xy only. The target carries a camera height ~0.7 m above the
-                # trajectory plane, and sqrt(dxy^2 + 0.7^2) compresses the ranking to
-                # nothing near the goal: 0.1 m and 0.3 m of real error scored 0.707
-                # against 0.762, so continuity outweighed goal-seeking.
-                dist = np.linalg.norm(traj_end[:2] - target_end[:2])
+                if not has_route:
+                    # 没有路线就退回原来的贪心终点距离。
+                    # xy only. The target carries a camera height ~0.7 m above the
+                    # trajectory plane, and sqrt(dxy^2 + 0.7^2) compresses the ranking to
+                    # nothing near the goal: 0.1 m and 0.3 m of real error scored 0.707
+                    # against 0.762, so continuity outweighed goal-seeking.
+                    traj_end = np.array(traj[-1, :3])
+                    target_end = target_pose if target_pose is not None else traj_end
+                    dist = np.linalg.norm(traj_end[:2] - target_end[:2])
+                    return score * 100000 + 100 * dist + smoothness + gate_penalty
 
-                return score * 100000 + 100 * dist + 40 * abs(self.last_param[0] - param[0]) + 10 * abs(self.last_param[1] - param[1]) + gate_penalty
+                # 有路线：按"沿路线还剩多远"算进展，按"离路线最远多少"算贴合度。
+                # 直线距离在绕障时是个局部极小，这两项没有 —— 路线本身已经绕过去了。
+                terminal = 0.0
+                if end_remainings[idx] < self.route_terminal_band and target_pose is not None:
+                    terminal = self.w_goal_terminal * float(
+                        np.linalg.norm(traj[-1, :2] - target_pose[:2]))
+                return (score * 100000
+                        + self.w_route_progress * end_remainings[idx]
+                        + self.w_path_follow * path_costs[idx]
+                        + terminal
+                        + smoothness
+                        + gate_penalty)
 
             # path
             path = Path()
@@ -1692,9 +1770,22 @@ class PlanningNode(Node):
                 best_gain = float('nan')
                 self._reverse_mark(init_p)
             else:
-                ends_xy = np.array([trajectories[i][-1, :2] for i in admissible])
-                best_gain = stand_dist - float(np.min(np.linalg.norm(
-                    ends_xy - target_pose[None, :2], axis=1)))
+                if has_route:
+                    # 有路线时进展要沿路线算。直线距离在绕障时本来就会"越走越远"，
+                    # 用它判 no-progress 会在正确绕行的路上误触发脱困。
+                    here = np.asarray(init_p[:2], dtype=np.float64)
+                    hx = int((here[0] - self.origin[0]) / self.resolution)
+                    hy = int((here[1] - self.origin[1]) / self.resolution)
+                    if (0 <= hx < remaining_map.shape[0] and 0 <= hy < remaining_map.shape[1]
+                            and remaining_map[hx, hy] < 1e3):
+                        best_gain = float(remaining_map[hx, hy]) - float(
+                            min(end_remainings[i] for i in admissible))
+                    else:
+                        best_gain = 0.0
+                else:
+                    ends_xy = np.array([trajectories[i][-1, :2] for i in admissible])
+                    best_gain = stand_dist - float(np.min(np.linalg.norm(
+                        ends_xy - target_pose[None, :2], axis=1)))
                 escape_reason = self._escape_reason(
                     front_blocked, stand_dist,
                     abs(self._wrap(yaw_to_target - yaw_now)), best_gain)
