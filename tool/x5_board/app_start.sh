@@ -85,6 +85,17 @@ do_start() {
         echo "WARNING: insight_full is not running -- no camera topics will appear" >&2
     fi
 
+    # VIO is only needed while recording a bag; node_manager turns it on there and
+    # off again.  This is the boot-time default because the runtime switch does not
+    # survive a restart -- without it every power cycle silently burns 0.86 of a
+    # core (135% vs 34% of one core, measured).
+    INSIGHT_PARAM="${INSIGHT_PARAM:-/userdata/install/lib/insight_full/insight_param}"
+    if [[ -x "${INSIGHT_PARAM}" ]]; then
+        "${INSIGHT_PARAM}" vio_enabled false >/dev/null 2>&1 \
+            && echo "camera VIO paused (node_manager resumes it for bag recording)" \
+            || echo "NOTE: camera VIO switch unavailable -- is vio_enabled=true in user_params.json?" >&2
+    fi
+
     mkdir -p "${LOG_DIR}" "${DB_PATH}"
     load_env
 

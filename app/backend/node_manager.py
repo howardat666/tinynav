@@ -81,6 +81,10 @@ _ROBOT_TYPE = os.environ.get('TINYNAV_ROBOT_TYPE', 'go2')
 # numpy, so this does not pull the planning stack into the backend.
 _ROBOT = robot_config(_ROBOT_TYPE)
 _ACTUATOR = os.environ.get('TINYNAV_ACTUATOR', 'unitree')
+# 相机固件的 VIO 运行时开关。暂停时那两个重线程只空转睡眠，实测 135% -> 34% 一个核，
+# 且不用重启固件（vio_enabled=true 必须写在 user_params.json 里，否则参数不注册）。
+_INSIGHT_PARAM = os.environ.get(
+    'TINYNAV_INSIGHT_PARAM', '/userdata/install/lib/insight_full/insight_param')
 
 # 调度优先级（nice，越小越优先）。板上 8 核实测 CPU 619%/800% = 77% 但 load 11.3 ——
 # 还有两成空闲却有近一倍线程在排队，所以瓶颈是排队延迟而不是吞吐量，调优先级能直接
@@ -1863,6 +1867,27 @@ class BackendNode(Ros2NodeManager):
             f'{name} started (port={_WHEEL_PORT}, odom_source={_ODOM_SOURCE})'
         )
 
+    def _set_camera_vio(self, want: bool):
+        """开/关相机固件的 VIO。只有录 bag 需要它。
+
+        建图时必须关：cmd_map_build 是放 bag 重建，而 bag 里的 /camera/camera/vio_image
+        和实时相机是同名话题、同一个 domain，开着会让实时位姿挤掉回放的那些。
+        """
+        if not os.path.exists(_INSIGHT_PARAM):
+            return
+        try:
+            r = subprocess.run([_INSIGHT_PARAM, 'vio_enabled', 'true' if want else 'false'],
+                               capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.get_logger().warn(f'camera VIO {"on" if want else "off"} failed: {exc}')
+            return
+        if r.returncode != 0:
+            # vio_enabled=false 启动时这个参数根本没注册，此时失败是预期的
+            self.get_logger().warn(
+                f'camera VIO {"on" if want else "off"} rejected: {r.stdout.strip()}{r.stderr.strip()}')
+        else:
+            self.get_logger().info(f'camera VIO -> {"on" if want else "off"}')
+
     def _stop_sensor_procs(self):
         if not self._manage_processes:
             return
@@ -2160,6 +2185,9 @@ class BackendNode(Ros2NodeManager):
         if self._sensor_mode == 'looper':
             self._stop_sensor_procs()
         self._stop_all()
+        # 建图的偏航质量取决于 VIO（轮速的偏航尺度有 2.4% 且左右不对称），所以 bag 里
+        # 两种位姿都要有。开了之后头一两秒可能还没出位姿，200 s 的 bag 里无所谓。
+        self._set_camera_vio(True)
         self._start('realsense_bag_record')
 
     def cmd_bag_stop(self) -> bool:
@@ -2168,6 +2196,7 @@ class BackendNode(Ros2NodeManager):
 
         bag_path = self.bag_path
         stopped = self._terminate_bag_recorders()
+        self._set_camera_vio(False)
         self.processes.pop('bag_record', None)
         if self.state != 'idle':
             self.state = 'idle'
@@ -2352,6 +2381,7 @@ class BackendNode(Ros2NodeManager):
             raise RuntimeError('Map building is disabled in display backend role')
         self._stop_sensor_procs()
         self._stop_all()
+        self._set_camera_vio(False)
         self._start('rosbag_build_map')
 
     def _publish_cmd_pois(self, poi_id: int | None):
