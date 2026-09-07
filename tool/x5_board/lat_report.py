@@ -121,7 +121,160 @@ def fmt(v, unit="ms"):
 
 
 def chain(acc):
-    """返回 (表格行, 到 /cmd_vel 的累计, diffcar 等待)。"""
+    """算出链路各跳。返回 (表格行, 到 /cmd_vel 的累计, diffcar 里的等待)。"""
+    b_in, b_out = get(acc, "bridge", "d_in"), get(acc, "bridge", "d_out")
+    p_in, p_out = get(acc, "plan", "d_in"), get(acc, "plan", "d_out")
+    c_in, c_use = get(acc, "ctrl", "p_in"), get(acc, "ctrl", "used")
+
+    def sub(hi, lo):
+        return None if (hi is None or lo is None) else hi - lo
+
+    # 累计列是各节点直接量到的「距相机采集多久」；单跳列是相邻两个相减
+    return ([
+        ("相机双目计算 + DDS 到 bridge", b_in, b_in, "bridge d_in"),
+        ("bridge 转发", sub(b_out, b_in), b_out, "bridge d_out − d_in"),
+        ("DDS 到 planning + 同步器/排队", sub(p_in, b_out), p_in, "plan d_in − bridge d_out"),
+        ("planning 计算", sub(p_out, p_in), p_out, "plan d_out − d_in"),
+        ("DDS 到 cmd_vel_control", sub(c_in, p_out), c_in, "ctrl p_in − plan d_out"),
+        ("5Hz 限速 + 控制环等待", sub(c_use, c_in), c_use, "ctrl used − p_in"),
+    ], c_use, get(acc, "diffcar", "cmd_wait"))
+
+
+def phases(env):
+    """按 LATENV 的 prev=（在预览哪些图像话题）把一趟切成若干段。
+
+    分两趟比预览开销会把路线/光照/温度一起差进来；同一趟里切预览是唯一能控住
+    它们的做法。返回 [(prev 值, 起, 止)]。
+    """
+    seq = []
+    for t, txt in env:
+        if t is None:
+            continue
+        m = re.search(r"prev=(\S+)", txt)
+        if not m:
+            continue
+        v = m.group(1)
+        if not seq or seq[-1][0] != v:
+            seq.append((v, t, t))
+        else:
+            seq[-1] = (v, seq[-1][1], t)
+    return seq
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("paths", nargs="*", help="日志文件；留空则扫 --dir")
+    ap.add_argument("--dir", default=os.environ.get("TINYNAV_APP_LOG_DIR", "/userdata/x5/logs"))
+    ap.add_argument("--run", help='只看这一趟，如 2026_09_07_10_38_03；默认最新一趟')
+    ap.add_argument("--all-runs", action="store_true", help="把目录里所有趟混在一起（一般不要）")
+    ap.add_argument("--no-window", action="store_true",
+                    help="不取交集时间窗（会把空闲和导航混在一起，一般不要）")
+    ap.add_argument("--by-prev", action="store_true",
+                    help="按 LATENV 的 prev=（在预览什么）把一趟切成若干段分别出表")
+    ap.add_argument("--stale-h", type=float, default=2.0,
+                    help="比最新日志旧这么多小时的就跳过（默认 2）")
+    a = ap.parse_args()
+
+    paths = a.paths
+    if not paths and os.path.isdir(a.dir):
+        names = [f for f in os.listdir(a.dir) if f.endswith(".log") or f.endswith(".txt")]
+        # 🔴 不能按文件名前缀分组取"最新一趟"：常驻节点(app_start.sh)的时间戳是
+        # board-app 启动时刻，而 cmd_vel_control 是 enable nav 那一刻才建文件
+        # (node_manager._make_log)，两者必然不同 —— 那样筛只会剩 cmd_vel_control。
+        # 改成按节点各取最新一份。
+        if a.run:
+            names = [f for f in names if f.startswith(a.run)]
+        if not a.all_runs:
+            newest = {}
+            for f in names:
+                node = f[20:] if _RUN.match(f[:19]) else f
+                if node not in newest or f > newest[node]:
+                    newest[node] = f
+            names = sorted(newest.values())
+            # 旧节点的日志会一直留着（09-04 的 cmd_vel_control 就还在），只要它里面
+            # 恰好有 LAT 行就会混进中位数。按最新文件的 mtime 划一条线。
+            mt = {f: os.path.getmtime(os.path.join(a.dir, f)) for f in names}
+            cutoff = max(mt.values()) - a.stale_h * 3600
+            print("按节点各取最新一份（--all-runs 可看全部）：")
+            keep = []
+            for f in names:
+                if mt[f] < cutoff:
+                    print(f"  跳过 {f}（比最新的旧 {(max(mt.values()) - mt[f]) / 3600:.1f} 小时）")
+                else:
+                    print(f"  {f}")
+                    keep.append(f)
+            names = keep
+        paths = [os.path.join(a.dir, f) for f in sorted(names)]
+        # 后端的 LATENV 落在 logs/app.log（app_start.sh 把 uvicorn 的 stdout 重定向到
+        # 那里），不在 logs/nodes/ 里 —— 不带上它这一趟的工况就丢了。
+        app_log = os.path.join(os.path.dirname(a.dir.rstrip("/")), "app.log")
+        if os.path.exists(app_log):
+            paths.append(app_log)
+            print(f"  {os.path.basename(app_log)}（后端 LATENV）")
+    if not paths:
+        print(f"没有日志可读（--dir {a.dir}）", file=sys.stderr)
+        return 1
+
+    rows = collect(paths)
+    rows, win = window(rows) if not a.no_window else (rows, None)
+    if win:
+        lo, hi, span = win
+        print(f"交集时间窗 {hi - lo:.0f}s（各 tag 覆盖："
+              + " ".join(f"{t}={v[1] - v[0]:.0f}s" for t, v in sorted(span.items())) + "）")
+    elif not a.no_window:
+        print("⚠️ 各 tag 的时间范围没有交集，下面的相减【不可信】")
+    env = collect_env(paths)
+    if win:
+        lo, hi, _ = win
+        env = [e for e in env if e[0] is None or lo - 15 <= e[0] <= hi + 15]
+    if env:
+        print("这一趟的工况（LATENV，来自后端）：")
+        seen = set()
+        for _t, txt in env:
+            key = txt.split(" ui_age=")[0]      # 只在「开着什么」变化时打一行
+            if key in seen:
+                continue
+            seen.add(key)
+            print(f"  {txt}")
+        print("  ⚠️ ws/prev 不同的两趟【不可比】—— 观看本身就要花 CPU，直接吃延迟预算")
+        print()
+    if a.by_prev:
+        segs = phases(env)
+        if len(segs) < 2:
+            print("⚠️ 这一趟 prev= 从头到尾没变过，切不出段（要在跑的过程中切换预览）\n")
+        else:
+            t_all = [r[0] for r in rows if r[0] is not None]
+            hi_end = win[1] if win else (max(t_all) if t_all else 0)
+            print(f"按 prev= 切出 {len(segs)} 段：\n")
+            for i, (prev, t0, _t1) in enumerate(segs):
+                t_end = segs[i + 1][1] if i + 1 < len(segs) else hi_end
+                sub = fold([r for r in rows if r[0] is not None and t0 <= r[0] <= t_end])
+                n = len(next(iter(next(iter(sub.values())).values()))[0]) if sub else 0
+                print(f"── 第 {i + 1} 段  prev={prev}  {t_end - t0:.0f}s"
+                      f"  ({len(sub)} 个 tag, {n} 个窗口)")
+                if n < 3:
+                    print("   窗口太少，跳过 —— LAT 行按 TINYNAV_LAT_LOG_S 打，"
+                          "每段至少留 30 s\n")
+                    continue
+                tbl, c_use_s, d_wait_s = chain(sub)
+                for name, one, _cum, _src in tbl:
+                    print("   " + pad(name, 32) + fmt(one))
+                print("   " + pad("→ 到 /cmd_vel", 32) + fmt(c_use_s))
+                print("   " + pad("→ 到串口写（+diffcar）", 32)
+                      + fmt(None if c_use_s is None else c_use_s + (d_wait_s or 0)))
+                print()
+            print("各段只差 prev=，路线/光照/温度是同一趟，可以直接横向比。\n")
+
+    acc = fold(rows)
+    if not acc:
+        print("日志里没有 LAT 行 —— 是不是 TINYNAV_LAT_LOG_S=0，或者这趟没跑到导航？",
+              file=sys.stderr)
+        return 1
+
+    print(f"读了 {len(paths)} 个文件；各 tag 的窗口数："
+          + " ".join(f"{t}={len(next(iter(v.values()))[0])}" for t, v in acc.items()))
+    print()
+
     rows_tbl, c_use, d_wait = chain(acc)
     rt = get(acc, "diffcar", "serial_rt")
     rows = rows_tbl
