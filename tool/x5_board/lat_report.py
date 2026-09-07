@@ -325,8 +325,10 @@ def main():
             print("  " + pad(label, 34)
                   + f"{fmt(med(e[0]))}  (p90 {fmt(med(e[1]))} max {fmt(e[2])})")
 
-    missing = [n for n, v in (("bridge d_in", b_in), ("plan d_in", p_in),
-                              ("ctrl p_in", c_in), ("diffcar cmd_wait", d_wait))
+    missing = [n for n, v in (("bridge d_in", get(acc, "bridge", "d_in")),
+                              ("plan d_in", get(acc, "plan", "d_in")),
+                              ("ctrl p_in", get(acc, "ctrl", "p_in")),
+                              ("diffcar cmd_wait", d_wait))
                if v is None]
     if missing:
         print(f"\n⚠️ 缺 {', '.join(missing)}，对应的跳算不出来。"
