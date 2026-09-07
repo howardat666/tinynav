@@ -25,7 +25,7 @@ import base64
 import rclpy
 import rclpy.time
 import tf2_ros
-from rclpy.qos import DurabilityPolicy, QoSProfile
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from sensor_msgs.msg import CompressedImage, Image, PointCloud, PointCloud2
@@ -138,7 +138,10 @@ _POSE_TOPIC_WHEEL = '/wheel/camera_pose'
 _WHEEL_PORT = os.environ.get('TINYNAV_WHEEL_PORT', '/dev/ttyS3')
 _WHEEL_RADIUS = os.environ.get('TINYNAV_WHEEL_RADIUS', '0.050385')
 _WHEEL_BASE_RADIUS = os.environ.get('TINYNAV_BASE_RADIUS', '0.127083')
-_WHEEL_CAMERA_OFFSET = os.environ.get('TINYNAV_WHEEL_CAMERA_OFFSET', '0.06,0.05,0.18')
+_WHEEL_CAMERA_OFFSET = os.environ.get('TINYNAV_WHEEL_CAMERA_OFFSET', '0.067,0.05,0.126')
+# 相机光心高度。和 planning_node 的障碍地面基准是同一个物理量，共用同一个环境变量：
+# 各写一份的后果是改一处另一处静默偏 56 mm（0.18 是方车的旧值，圆盘实测 0.124）。
+_CAMERA_HEIGHT_M = float(os.environ.get('TINYNAV_CAMERA_HEIGHT_M', '0.124'))
 
 # ---------------------------------------------------------------------------- #
 # Offline map build resources
@@ -345,8 +348,25 @@ def _planning_argv() -> list[str]:
     ]
 
 
+# 跟踪器的逐条指令记录（w_ref / heading_err / target_yaw / path_len / query_t）。
+# 2026-09-01 实测到"规划器选 omega=-1.05，跟踪器实发 +1.05"，而 wz = w_ref + 1.47*heading_err
+# —— 少了这几个字段就只能在两三个候选机制之间猜。argparse 的参数必须在 --ros-args 之前。
+# TINYNAV_CMDVEL_DEBUG=0 关掉。约 25 Hz 一行 CSV，量很小。
+# /ws/planning 每 0.2s 一轮，所以 2s = 漏掉 10 拍才算走了
+_UI_ACTIVE_TIMEOUT_S = float(os.environ.get('TINYNAV_UI_ACTIVE_TIMEOUT_S', '2.0'))
+# 无条件重发的间隔。只在变化时发会让任何一次丢失/跳过变成永久状态。
+_UI_ACTIVE_REPUBLISH_S = 2.0
+# /ws/status 是 1 Hz，所以 5s = 漏掉 5 拍。比 UI 那条宽，因为退订位姿的代价更大
+# （nav 命令要用 _odom_pose 判就绪）。
+_CLIENT_IDLE_S = float(os.environ.get('TINYNAV_CLIENT_IDLE_S', '5.0'))
+_CMDVEL_DEBUG = os.environ.get('TINYNAV_CMDVEL_DEBUG', '1').strip() not in ('0', 'false', 'no')
+_CMDVEL_DEBUG_DIR = os.path.join(
+    os.environ.get('TINYNAV_APP_LOG_DIR', '/userdata/x5/logs'), 'cmd_vel_debug')
+
+
 def _cmd_vel_control_argv() -> list[str]:
-    return _node_argv('tinynav/platforms/cmd_vel_control.py') + [
+    dbg = (['--debug-record', '--debug-dir', _CMDVEL_DEBUG_DIR] if _CMDVEL_DEBUG else [])
+    return _node_argv('tinynav/platforms/cmd_vel_control.py') + dbg + [
         '--ros-args',
         '-p', f'robot_type:={_ROBOT_TYPE}',
         '-p', f'pose_topic:={_control_pose_topic()}',
@@ -407,7 +427,7 @@ def _diffcar_control_argv() -> list[str]:
         # agree already. The negation was harmless only while diffcar's camera_y was 0;
         # the trinocular's infra1 -- the image the whole stack runs on -- sits 50 mm
         # left of the middle lens, and a flipped sign puts every obstacle 100 mm off.
-        '-p', f'camera_offset_xyz:=[{cam_x},{_ROBOT.camera_y},0.18]',
+        '-p', f'camera_offset_xyz:=[{cam_x},{_ROBOT.camera_y},{_CAMERA_HEIGHT_M}]',
         # The actuator's clamp, not the planner's limit -- see RobotConfig.chassis_max_vx.
         # Passing max_vx here made hand-driving inherit the replan-period margin that only
         # navigation needs.
@@ -547,7 +567,11 @@ class BackendNode(Ros2NodeManager):
         self._tf_listener = None
         if self.telemetry_enabled:
             self.create_subscription(Float32, '/mapping/percent', self._on_mapping_percent, 10)
-            self.create_subscription(Odometry, '/slam/odometry_visual', self._on_slam_odom, 10)
+            # 🔴 20 Hz，是本节点最大的输入，实测独占约 48% 一个核（暂停 bridge 时
+            # uvicorn 从 62% 掉到 13.7%）。每条消息 23.6 ms：裸订阅者同话题只要 8.07 ms，
+            # 差的是 rclpy 每次派发都要重建含全部约 40 个实体的 wait set。
+            # 所以按客户端在不在场动态建/销，而不是全程挂着 —— 自主导航时没人看是常态。
+            self._odom_sub = None
             self.create_subscription(
                 Odometry, '/mapping/current_pose_in_map', self._on_pose_in_map, 10
             )
@@ -580,9 +604,13 @@ class BackendNode(Ros2NodeManager):
             # which is how the UI knows to stop showing "Navigating".
             self.create_subscription(Bool, '/mapping/nav_done', self._on_nav_done, 10)
             self.create_subscription(String, '/mapping/nav_progress', self._on_nav_progress, 10)
-            self.create_subscription(Image, '/planning/height_map', self._on_height_map, 1)
+            # 可视化一律 BEST_EFFORT，和 planning_node._viz_qos 对齐。用 RELIABLE 会把
+            # 【规划环】卡住（见那边的注释：实测规划周期 0.76 → 4.92 Hz）。
+            # ⚠️ 两端必须一致，不一致就是零投递且完全静默。
+            viz_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+            self.create_subscription(Image, '/planning/height_map', self._on_height_map, viz_qos)
             self.create_subscription(
-                OccupancyGrid, '/planning/obstacle_mask', self._on_obstacle_mask, 1
+                OccupancyGrid, '/planning/obstacle_mask', self._on_obstacle_mask, viz_qos
             )
             self.create_subscription(Path, '/planning/trajectory_path', self._on_trajectory_path, 1)
             self.create_subscription(Path, '/mapping/global_plan', self._on_global_plan, 1)
@@ -594,8 +622,9 @@ class BackendNode(Ros2NodeManager):
                 Odometry, '/control/target_pose', self._on_nav_target_pose,
                 QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
             )
-            self.create_subscription(PointCloud, '/planning/footprint', self._on_footprint, 1)
-            self.create_subscription(PointCloud2, '/planning/occupied_voxels', self._on_occupied_voxels, 1)
+            self.create_subscription(PointCloud, '/planning/footprint', self._on_footprint, viz_qos)
+            self.create_subscription(PointCloud2, '/planning/occupied_voxels',
+                                     self._on_occupied_voxels, viz_qos)
             self.create_subscription(String, '/planning/diagnostics', self._on_planning_diag, 1)
 
             self._tf_buffer = tf2_ros.Buffer()
@@ -630,7 +659,18 @@ class BackendNode(Ros2NodeManager):
         # reason as the pause flag: planning_node restarts more often than this node.
         self._ui_active_pub = self.create_publisher(Bool, '/planning/ui_active', _latched_qos)
         self._ui_clients = 0
+        # 心跳而不是 attach/detach 计数：连接被黑洞化时 /ws/planning 的 send_text 会挂住，
+        # finally 里的 detach 永远不执行，计数卡在高位。2026-09-07 实测零 TCP 连接时
+        # /planning/ui_active 仍是 true，planning 一直在为没人看的画面渲染（vis 11ms/周期
+        # + 一朵点云 + 250 KB/s 的 DDS，而后端还要为每条消息付反序列化）。心跳会自己过期。
+        self._ui_seen_at = 0.0
+        self._client_seen_at = 0.0   # 任何客户端在问机器人状态
+        # 每个 ws 端点各自的心跳。用心跳不用计数：连接被黑洞化时 finally 不执行，
+        # 计数会永久泄漏（2026-09-07 实测）。
+        self._ws_seen: dict[str, float] = {}
+        self._env_cpu_ref = (0.0, 0.0)
         self._ui_active_sent: bool | None = None
+        self._ui_active_sent_at = 0.0
         # Whether any watching client is in 3D mode. Decoding /planning/occupied_voxels is
         # a Python-level read_points loop and the points are 78% of the planning socket's
         # bytes, and the local view starts in 2D, where none of it is drawn.
@@ -673,6 +713,9 @@ class BackendNode(Ros2NodeManager):
         # 0.2 s: a browser opening a preview waits at most one tick for its first frame,
         # and the reconcile is a dict comparison over a handful of topics.
         self._preview_sub_timer = self.create_timer(0.2, self._apply_preview_subs)
+        self._ui_active_timer = self.create_timer(1.0, self._publish_ui_active)
+        self._lat_env_timer = self.create_timer(
+            float(os.environ.get('TINYNAV_LAT_LOG_S', '10') or 10), self._log_lat_env)
         self._last_frame: dict[str, bytes] = {}   # topic -> latest JPEG bytes
         self._last_frame_time: dict[str, float] = {}
         self._looper_bridge_proc: subprocess.Popen | None = None
@@ -1163,8 +1206,19 @@ class BackendNode(Ros2NodeManager):
             return False
         with self._lock:
             self.preview_callbacks[topic].append(cb)
-            self._preview_sub_wanted[topic] = True
+            # 时间戳而不是 True。/ws/preview 的循环只在【超时分支】检查 _connected，
+            # 帧一直来的话它永不超时，死连接上的 send_bytes 又可以无限缓冲 —— 于是
+            # finally 永不执行，订阅永久泄漏。2026-09-07 实测：零 TCP 连接而
+            # prev=infra1 仍活着，后端为它烧 42% 一个核，横跨整趟导航。
+            self._preview_sub_wanted[topic] = time.monotonic()
         return True
+
+    def preview_seen(self, topic: str):
+        """/ws/preview 的循环每轮调一次，续期这条预览的心跳。"""
+        with self._lock:
+            if self.preview_callbacks.get(topic):
+                self._preview_sub_wanted[topic] = time.monotonic()
+                self._ws_seen['preview'] = self._preview_sub_wanted[topic]
 
     def remove_preview_callback(self, topic: str, cb):
         """Unregister a frame callback; the subscription is dropped once none are left."""
@@ -1175,7 +1229,8 @@ class BackendNode(Ros2NodeManager):
                 self.preview_callbacks[topic].remove(cb)
             except ValueError:
                 pass
-            self._preview_sub_wanted[topic] = len(self.preview_callbacks[topic]) > 0
+            self._preview_sub_wanted[topic] = (
+                time.monotonic() if self.preview_callbacks[topic] else 0.0)
 
     def _apply_preview_subs(self):
         """Reconcile subscriptions with what the websocket handlers asked for.
@@ -1186,8 +1241,10 @@ class BackendNode(Ros2NodeManager):
         connect/disconnect pair that lands between two ticks cancels out instead of
         churning a subscription.
         """
+        now = time.monotonic()
         with self._lock:
-            wanted = dict(self._preview_sub_wanted)
+            wanted = {t: (v > 0.0 and now - v < _CLIENT_IDLE_S)
+                      for t, v in self._preview_sub_wanted.items()}
         for topic, want in wanted.items():
             have = topic in self._image_subs
             if want and not have:
@@ -1197,6 +1254,59 @@ class BackendNode(Ros2NodeManager):
                     self.get_logger().warn(f'preview subscribe {topic} failed: {e}')
             elif have and not want:
                 self._destroy_image_sub(topic)
+                self.get_logger().info(f'preview 退订 {topic}（没人看）')
+        self._reconcile_odom_sub()
+
+    def _log_lat_env(self):
+        """把「这一趟到底是什么工况」写进日志。
+
+        2026-09-07 的教训：两趟导航的延迟差 195 ms，而事后无法判断有多少来自
+        浏览器开着什么 —— uvicorn 的访问日志随重启轮掉了，浏览器状态无处可查。
+        没有这一行，任何 A/B 都可能被无形地污染。tool/x5_board/lat_report.py 会打印它。
+        """
+        now = time.monotonic()
+        with self._lock:
+            ws = {k: now - t for k, t in self._ws_seen.items() if now - t < 5.0}
+            ui_age = now - self._ui_seen_at if self._ui_seen_at else -1.0
+            cli_age = now - self._client_seen_at if self._client_seen_at else -1.0
+        prev = ','.join(sorted(self._image_subs)) or '-'
+        try:
+            st = open('/proc/self/stat').read().rsplit(') ', 1)[1].split()
+            ticks = (int(st[11]) + int(st[12])) / os.sysconf('SC_CLK_TCK')
+        except (OSError, IndexError, ValueError):
+            ticks = 0.0
+        t0, c0 = self._env_cpu_ref
+        cpu = 100.0 * (ticks - c0) / (now - t0) if t0 and now > t0 else float('nan')
+        self._env_cpu_ref = (now, ticks)
+        try:
+            load = open('/proc/loadavg').read().split()[0]
+        except OSError:
+            load = '?'
+        self.get_logger().info(
+            f"LATENV ws={','.join(sorted(ws)) or '-'} prev={prev} "
+            f"ui_age={ui_age:.1f} cli_age={cli_age:.1f} "
+            f"odom_sub={int(getattr(self, '_odom_sub', None) is not None)} "
+            f"ui_active={int(bool(self._ui_active_sent))} "
+            f"load={load} cpu={cpu:.0f}%")
+
+    def _reconcile_odom_sub(self):
+        """20 Hz 位姿只在有客户端时订。和上面同一个定时器，所以同样在 spin 线程上。"""
+        if not hasattr(self, '_odom_sub'):
+            return
+        with self._lock:
+            want = (self._client_seen_at > 0.0
+                    and time.monotonic() - self._client_seen_at < _CLIENT_IDLE_S)
+        if want and self._odom_sub is None:
+            self._odom_sub = self.create_subscription(
+                Odometry, '/slam/odometry_visual', self._on_slam_odom, 10)
+            self.get_logger().info('/slam/odometry_visual 订上了（有客户端）')
+        elif not want and self._odom_sub is not None:
+            try:
+                self.destroy_subscription(self._odom_sub)
+            except Exception as e:
+                self.get_logger().warn(f'destroy odom sub failed: {e}')
+            self._odom_sub = None
+            self.get_logger().info('/slam/odometry_visual 退订（没人看，省约 48% 一个核）')
 
     def _create_image_sub(self, topic: str):
         if topic in self._image_subs:
@@ -1208,10 +1318,14 @@ class BackendNode(Ros2NodeManager):
                 1,
             )
         else:
+            # height_color 是 planning_node 发的，和其它可视化一样是 BEST_EFFORT。
+            # 这里若用默认的 RELIABLE 就是零投递且完全静默 —— 已经踩过一次。
+            qos = (QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+                   if topic == _HEIGHT_COLOR_TOPIC else 1)
             self._image_subs[topic] = self.create_subscription(
                 Image, topic,
                 lambda msg, t=topic: self._on_image(msg, t),
-                1,
+                qos,
             )
 
     def _destroy_image_sub(self, topic: str):
@@ -1557,6 +1671,9 @@ class BackendNode(Ros2NodeManager):
         return True
 
     def get_status(self) -> dict:
+        # 🔴 这里【不能】续期客户端心跳：board_health.py 每几秒轮询一次
+        # http://127.0.0.1:8000/device/status，把它算成客户端会让位姿订阅 5 秒
+        # 一次反复建销。续期只放在真正的 UI 通道（三个 /ws/* 循环）里。
         self.recover_stale_error_state()
         with self._lock:
             raw = self.state
@@ -2333,19 +2450,52 @@ class BackendNode(Ros2NodeManager):
             pub.publish(Bool(data=paused))
 
     def _publish_ui_active(self):
-        """Republish /planning/ui_active only when the answer changed."""
-        active = self._ui_clients > 0
-        if active == self._ui_active_sent:
+        """定期重发 /planning/ui_active，不只在变化时发。
+
+        🔴 2026-09-07：只在变化时发让每一次失败都变成永久的 —— 实测浏览器离开后
+        零 TCP 连接而这个话题仍是 true，planning 一直为没人看的画面渲染，而且
+        「退订」日志一次都没出现。原来的写法还有一个洞：_ui_active_sent 在 publish
+        【之前】就被写掉，publish 被跳过（_destroyed / pub 为 None）时状态记成已发，
+        之后 active == _ui_active_sent 永远成立，再也不会重试。
+        一个 Bool 每 2 秒重发一次是免费的，而它把这整类 bug 都消掉。
+        """
+        with self._lock:
+            active = (self._ui_seen_at > 0.0
+                      and time.monotonic() - self._ui_seen_at < _UI_ACTIVE_TIMEOUT_S)
+            if not active:
+                # 心跳过期就把 3D 票也收回，否则一个走掉的客户端会永久留着它
+                self._want_voxels = False
+                self._voxel_points = []
+        now = time.monotonic()
+        due = now - getattr(self, '_ui_active_sent_at', 0.0) >= _UI_ACTIVE_REPUBLISH_S
+        if active == self._ui_active_sent and not due:
             return
-        self._ui_active_sent = active
         pub = getattr(self, '_ui_active_pub', None)
-        if pub is not None and not getattr(self, '_destroyed', False):
-            pub.publish(Bool(data=active))
+        if pub is None or getattr(self, '_destroyed', False):
+            return                      # 发不出去就【不要】记成已发，下一拍还会试
+        pub.publish(Bool(data=active))
+        self._ui_active_sent = active
+        self._ui_active_sent_at = now
+
+    def client_seen(self, kind: str = '?'):
+        """任何客户端活动都续期。局部视图那条门更严，见 ui_client_seen。"""
+        with self._lock:
+            self._client_seen_at = time.monotonic()
+            self._ws_seen[kind] = self._client_seen_at
+
+    def ui_client_seen(self):
+        """/ws/planning 的循环每轮调一次，续期心跳。"""
+        with self._lock:
+            self._ui_seen_at = time.monotonic()
+            self._client_seen_at = self._ui_seen_at
+            self._ws_seen['planning'] = self._ui_seen_at
+        self._publish_ui_active()
 
     def ui_client_attach(self):
         """A /ws/planning client connected."""
         with self._lock:
             self._ui_clients += 1
+            self._ui_seen_at = time.monotonic()
         self._publish_ui_active()
 
     def ui_client_detach(self):
@@ -2353,8 +2503,7 @@ class BackendNode(Ros2NodeManager):
         with self._lock:
             self._ui_clients = max(0, self._ui_clients - 1)
             if self._ui_clients == 0:
-                self._want_voxels = False
-                self._voxel_points = []
+                self._ui_seen_at = 0.0   # 干净断开就立刻停，不等心跳超时
         self._publish_ui_active()
 
     def set_want_voxels(self, want: bool):

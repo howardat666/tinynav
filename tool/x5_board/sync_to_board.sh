@@ -90,6 +90,8 @@ check=(
     tinynav/core/planning_node.py
     tinynav/platforms/omni3_kinematics.py
     tinynav/platforms/cmd_vel_control.py
+    tinynav/platforms/diffcar_control.py
+    tinynav/core/lat_stats.py
     tool/looper_bridge_node.py
     tool/x5_board/wheel_teleop.py
 )

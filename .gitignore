@@ -142,3 +142,6 @@ log/
 # Output result
 tinynav_db/
 tinynav_temp/
+
+# 离线复现用的深度场景抓帧（125 MB，重抓即可，见 docs/x5/nav_obstacle_tuning.md）
+/data/obstacle_scenes/

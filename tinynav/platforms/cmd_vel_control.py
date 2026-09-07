@@ -6,7 +6,12 @@ import logging
 import os
 import time
 from datetime import datetime
-from pathlib import Path
+# 别名不是风格问题：下面 `from nav_msgs.msg import Path` 会把 pathlib.Path 整个覆盖掉，
+# 于是 argparse 的 `type=Path` 变成"用一个字符串构造 ROS Path 消息"，--debug-dir 必然报
+# invalid Path value，--debug-record 走默认分支时 Path.home() 也一样炸。
+# 2026-09-01：这条把 cmd_vel_control 打成 rc=2，enable nav 后规划器照常出轨迹但没人执行，
+# 表现为"发了 POI、规划出了路径、车不走"。这个功能从写出来就没能用过。
+from pathlib import Path as FsPath
 
 import numpy as np
 import rclpy
@@ -15,14 +20,20 @@ from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Path
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from std_msgs.msg import Bool
+from tinynav.core.lat_stats import LatStats
 from tinynav.core.math_utils import pose_msg2np
 from tinynav.core.robot_config import robot_config
+
+
+# 轨迹接收的最小间隔。0 = 不限速。见 _traj_cb 里的说明：固定门对 ~6 Hz 的到达
+# 过程是反相关的，0.1 能收下几乎全部而仍然挡住真正的暴发。
+_TRAJ_MIN_INTERVAL_S = float(os.environ.get('TINYNAV_TRAJ_MIN_INTERVAL_S', '0.1'))
 
 
 class CmdVelDebugRecorder:
     def __init__(self, output_dir, cam_offset_3d):
         self.cam_offset_3d = np.asarray(cam_offset_3d, dtype=np.float64)
-        self.output_dir = Path(output_dir).expanduser()
+        self.output_dir = FsPath(output_dir).expanduser()
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.trajectory_dir = self.output_dir / "trajectories"
         self.trajectory_dir.mkdir(parents=True, exist_ok=True)
@@ -192,12 +203,20 @@ class CmdVelControlNode(Node):
         self._cam_offset_3d = np.asarray(self.robot.cam_offset_3d, dtype=np.float64)
         self.logger.info(f"Robot: {self.robot.describe()}")
 
-        self._debug_recorder = (
-            CmdVelDebugRecorder(debug_dir, self._cam_offset_3d) if debug_dir else None
-        )
+        # 调试设施绝不允许打死控制环。2026-09-01 就是一个 --debug-dir 的参数错误让
+        # cmd_vel_control 每次 enable nav 都 rc=2 退出，整趟导航报废。
+        self._debug_recorder = None
+        if debug_dir:
+            try:
+                self._debug_recorder = CmdVelDebugRecorder(debug_dir, self._cam_offset_3d)
+            except Exception as exc:
+                self.logger.error(f"debug recorder disabled: {exc}")
         if self._debug_recorder is not None:
             self.logger.info(f"cmd_vel debug recorder enabled: {self._debug_recorder.output_dir}")
 
+        self._lat = LatStats('ctrl', self.logger.info)
+        self._path_stamp_sec = None   # 被采纳的轨迹的戳 = 深度采集时刻，用来算全链累计
+        self._lat_loop_at = None
         self.position = np.zeros(3)
         self.rotation = np.eye(3)
         self._odom_pose_initialized = False
@@ -325,14 +344,26 @@ class CmdVelControlNode(Node):
 
     def _traj_cb(self, msg: Path):
         now = self._now_sec()
+        # path.header.stamp 是 planning 原样传下来的深度采集戳，所以这个数直接接得上
+        # bridge 和 planning 那两行
+        if self._lat.enabled:
+            self._lat.add('p_in', self._lat_now() - self._lat_stamp_sec(msg.header.stamp))
         # Rate limit first. _rebuild_path walks every pose twice in Python -- a
         # pose_msg2np quaternion-to-matrix per pose, then an np.unwrap and a second
-        # pass -- and paying that for a message we are about to discard is pure waste
-        # at the 5 Hz this drops to.
+        # pass -- and paying that for a message we are about to discard is pure waste.
+        #
+        # 🔴 2026-09-07：原值 0.2 s 是【反相关】的。planning 发 ~6 Hz（间隔 166 ms），
+        # 一个固定 0.2 s 的门对这种到达过程会退化成"丢一条收一条"，极限只剩 2.5 Hz ——
+        # 而且 planning 变得越规律，丢得越多。三趟实测：发布 6.0~6.3 Hz、采纳只有
+        # 3.9~4.7 Hz、丢弃 26~35%，每丢一条被跟踪的轨迹就多老 ~170 ms。
+        # 实测 C 趟 p_in 是三趟最好的(412ms)，却因为丢弃最多(35%)导致 used 反而变差。
+        # 用【真实时钟】而不是 _now_sec()：后者返回里程计戳，里程计一停这个门就永久关死。
+        rt_now = self._lat_now()
         if (
             self._last_traj_update_sec is not None
-            and now - self._last_traj_update_sec < 0.2  # Drop path updates faster than 5 Hz.
+            and rt_now - self._last_traj_update_sec < _TRAJ_MIN_INTERVAL_S
         ):
+            self._lat.add('drop', 1.0)   # n 就是窗口内被 5Hz 限速丢掉的轨迹条数
             if self._debug_recorder is not None:
                 self._debug_recorder.record_trajectory(
                     time.time_ns(),
@@ -343,7 +374,10 @@ class CmdVelControlNode(Node):
                 )
             return
 
+        _t_rb = self._lat_now()
         new_ref = self._rebuild_path(msg)
+        # 限速器就是为省这个开销而存在的 —— 把它量出来，好判断值不值得
+        self._lat.add('rebuild', self._lat_now() - _t_rb)
         if msg.poses and self._odom_stamp_sec is not None:
             path_start_sec = msg.poses[0].header.stamp.sec + msg.poses[0].header.stamp.nanosec * 1e-9
             path_lag_s = self._odom_stamp_sec - path_start_sec
@@ -363,6 +397,8 @@ class CmdVelControlNode(Node):
                     "planning_node may be taking too long."
                 )
 
+        self._path_stamp_sec = (
+            self._lat_stamp_sec(msg.header.stamp) if new_ref is not None else None)
         if new_ref is None:
             self._path_ref = None
             self._track_idx = 0
@@ -407,7 +443,7 @@ class CmdVelControlNode(Node):
                     path_ref=new_ref,
                     reason="accepted_concat",
                 )
-        self._last_traj_update_sec = now
+        self._last_traj_update_sec = rt_now
 
     def _log_traj_update(self, now, pose_count, duration_s, accepted):
         if self._last_traj_log_sec is not None and now - self._last_traj_log_sec < 1.0:
@@ -581,6 +617,7 @@ class CmdVelControlNode(Node):
         cmd.linear.x = v
         cmd.angular.z = wz
         self.cmd_pub.publish(cmd)
+        self._lat_cmd_out()
         if self._debug_recorder is not None:
             self._debug_recorder.record_cmd(
                 time.time_ns(),
@@ -661,6 +698,7 @@ class CmdVelControlNode(Node):
     def _publish_zero(self, reason, detail=None):
         cmd = Twist()
         self.cmd_pub.publish(cmd)
+        self._lat_cmd_out()
         if self._debug_recorder is not None:
             self._debug_recorder.record_cmd(
                 time.time_ns(),
@@ -680,6 +718,24 @@ class CmdVelControlNode(Node):
             if detail:
                 msg = f"{msg} {detail}"
             self.logger.info(msg)
+
+    def _lat_now(self):
+        return self.get_clock().now().nanoseconds * 1e-9
+
+    def _lat_stamp_sec(self, stamp):
+        return stamp.sec + stamp.nanosec * 1e-9
+
+    def _lat_cmd_out(self):
+        """在每个 /cmd_vel 发布点调用：累计到这里就是相机采集 → 速度指令出门。"""
+        if not self._lat.enabled:
+            return
+        now = self._lat_now()
+        if self._path_stamp_sec is not None:
+            self._lat.add('used', now - self._path_stamp_sec)
+        if self._lat_loop_at is not None:
+            self._lat.add('loop', now - self._lat_loop_at)
+        self._lat_loop_at = now
+        self._lat.tick()
 
     def _now_sec(self):
         if self._odom_stamp_sec is not None:
@@ -703,7 +759,7 @@ def parse_args(args=None):
     )
     parser.add_argument(
         "--debug-dir",
-        type=Path,
+        type=FsPath,
         default=None,
         help="Output directory for --debug-record. Defaults to ~/.local/share/tinynav/cmd_vel_debug/<timestamp>.",
     )
@@ -725,7 +781,7 @@ def main(args=None):
         debug_dir = cli_args.debug_dir
         if debug_dir is None:
             stamp = datetime.now().strftime("cmd_vel_debug_%Y%m%d_%H%M%S")
-            debug_dir = Path.home() / ".local" / "share" / "tinynav" / "cmd_vel_debug" / stamp
+            debug_dir = FsPath.home() / ".local" / "share" / "tinynav" / "cmd_vel_debug" / stamp
 
     node = CmdVelControlNode(debug_dir=debug_dir)
     try:

@@ -34,6 +34,7 @@ from rclpy.node import Node
 
 # Not omni-specific despite the module name: a generic planar-base -> camera-optical
 # conversion. Duplicating it is how the two frames drift apart.
+from tinynav.core.lat_stats import LatStats
 from tinynav.platforms.omni3_kinematics import base_pose_to_camera_pose
 
 TICK_HZ = 20.0
@@ -41,6 +42,9 @@ _POSE_RE = re.compile(r"x=(-?[\d.]+)\s+y=(-?[\d.]+)\s+theta=(-?[\d.]+)")
 # 电压只有 ESP32 知道，而串口只有本节点持有 —— 不采就没有任何电压时间序列，
 # 而"电池带载塌下去"正是 2026-08-21 掉线唯一的可疑线索却又无法证实的东西。
 _BATT_RE = re.compile(r"当前=([\d.]+)V 最低=([\d.]+)V")
+# 每轮编码器实测速度，带符号，固件挂在位姿同一行的尾部。以前 odom.twist 直接抄指令
+# ——「速度表接在油门上」——于是打滑、堵转、死区在数据里和正常走完全同形。
+_WHEELV_RE = re.compile(r"vl=(-?[\d.]+)\s+vr=(-?[\d.]+)")
 
 
 class DiffCarLink:
@@ -58,6 +62,7 @@ class DiffCarLink:
         termios.tcsetattr(self.fd, termios.TCSANOW, a)
         self._buf = b""
         self._lines: list[str] = []
+        self.last_rx_at = None   # 最近一行到达时刻，量串口往返用
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._t = threading.Thread(target=self._reader, daemon=True)
@@ -78,6 +83,7 @@ class DiffCarLink:
                     ln, self._buf = self._buf.split(b"\n", 1)
                     self._lines.append(ln.decode("utf-8", "replace").strip())
                     del self._lines[:-64]        # bound it; only the newest pose matters
+                    self.last_rx_at = time.monotonic()
 
     def send(self, cmd: str) -> None:
         os.write(self.fd, (cmd + "\n").encode())
@@ -104,7 +110,9 @@ class DiffCarControlNode(Node):
         # 170 mm when the axle was at the back. Height 0.18 is the measured optical
         # centre. node_manager overrides all three from DIFFCAR_CONFIG; this default
         # only applies to a hand-launched node.
-        p("camera_offset_xyz", [0.05, 0.05, 0.18])
+        # 默认值只在没传参时用。板上由 node_manager 按 DIFFCAR_CONFIG 推导后传入，
+        # 这里跟着写成同一组数，免得手起节点时静默用上旧车的几何。
+        p("camera_offset_xyz", [0.087, 0.05, 0.124])
         p("cmd_vel_topic", "/cmd_vel")
         # 遥控的专用话题。空字符串＝关掉优先，回到"两股都发 /cmd_vel、取最后一条"的老行为。
         p("teleop_cmd_vel_topic", "/teleop/cmd_vel")
@@ -121,6 +129,8 @@ class DiffCarControlNode(Node):
         p("link_probe_host", "192.168.19.51")
         p("link_probe_period_s", 3.0)
         p("battery_period_s", 2.0)
+        # 必须与固件的 constexpr WHEEL_BASE 一致：只用来把每轮实测速度还原成整车 w。
+        p("wheel_base", 0.2035)
         # 固件的低压闭锁是 9.60 V；这里早一点叫，好在日志里留下"塌之前"的样子
         p("battery_warn_v", 10.0)
 
@@ -153,6 +163,14 @@ class DiffCarControlNode(Node):
         self._teleop_stamp = 0.0
         self._teleop_held = False
         self._pose = None
+        self.wheel_base = float(g("wheel_base").value)
+        self._wheel_v = None          # (vl, vr) m/s，None ＝ 固件还没报过
+        self._wheel_v_warned = False
+        self._lat = LatStats('diffcar', self.get_logger().info)
+        self._lat_p_sent = None   # 最近一次发 `p` 的时刻
+        self._lat_p_prev = None   # 上一拍的，量串口往返用
+        self._lat_tick_at = None
+        self._lat_cmd_seen = None   # 已记过等待时长的那条指令的戳
         self.create_timer(1.0 / TICK_HZ, self._tick)
 
         # The ESP32 has no network, so it cannot tell whether the PC is reachable -- it
@@ -270,10 +288,26 @@ class DiffCarControlNode(Node):
             self.get_logger().info(
                 f"teleop {'takes over' if teleop_fresh else 'released, navigation resumes'}")
         v, w = self._teleop if teleop_fresh else self._cmd
+        if self._lat.enabled:
+            _mono = time.monotonic()
+            # /cmd_vel 是 Twist，没有 header —— 戳链在这一跳断掉，只能量它在本节点
+            # 躺了多久。全链累计要拿 ctrl 那行的 used 加上这个数。
+            # 只在指令【变化】时记一次：_cmd_stamp 只在收到 Twist 时更新，而本拍 20 Hz
+            # 照跑，不加这个判据量到的是"距上次收指令多久"，空闲时会无界增长（实测 49 s）。
+            if (self._cmd_stamp > 0.0 and not teleop_fresh
+                    and self._cmd_stamp != self._lat_cmd_seen):
+                self._lat_cmd_seen = self._cmd_stamp
+                self._lat.add('cmd_wait', _mono - self._cmd_stamp)
+            if self._lat_tick_at is not None:
+                self._lat.add('tick', _mono - self._lat_tick_at)
+            self._lat_tick_at = _mono
         self.link.send(f"u {v:.3f} {w:.3f}")
         # Poll rather than wait for a reply: the firmware's `y` telemetry carries wheel
         # speeds but not the pose, and a blocking read would stall this timer.
         self.link.send("p")
+        # 上一拍的发送时刻要留着：`p` 的回复本拍 drain 不到（send 之后立刻 drain，
+        # 串口还没往返完），解析到的那行答的是【上一拍】的 p。
+        self._lat_p_prev, self._lat_p_sent = self._lat_p_sent, time.monotonic()
         self._send_link_state()
         now = time.monotonic()
         if now - self._batt_at > self._batt_period:
@@ -284,13 +318,23 @@ class DiffCarControlNode(Node):
             m = _POSE_RE.search(line)
             if m:
                 x, y, theta_deg = (float(s) for s in m.groups())
+                rx_at = self.link.last_rx_at
+                if self._lat.enabled and self._lat_p_prev is not None and rx_at is not None:
+                    # 位姿是发布时打 now 的戳，但内容是 rt + rx_wait 之前的编码器读数。
+                    # 下游看到的「很新的位姿」实际上老了这么多。
+                    self._lat.add('serial_rt', max(0.0, rx_at - self._lat_p_prev))
+                    self._lat.add('rx_wait', max(0.0, time.monotonic() - rx_at))
                 self._pose = (x, y, np.deg2rad(theta_deg))
+                wv = _WHEELV_RE.search(line)
+                if wv:
+                    self._wheel_v = (float(wv.group(1)), float(wv.group(2)))
                 continue
             b = _BATT_RE.search(line)
             if b:
                 self._on_battery(float(b.group(1)), float(b.group(2)))
                 continue
             self._on_firmware_line(line)
+        self._lat.tick()
         if self._pose is None:
             return
         self._publish(*self._pose)
@@ -346,6 +390,21 @@ class DiffCarControlNode(Node):
             )
         self._pc_sent, self._pc_sent_at = self._pc_ok, now
 
+    def _measured_twist(self) -> tuple[float, float]:
+        """编码器实测的整车速度。固件不报 vl/vr（旧固件）时才退回指令，并且要说出来 ——
+        静默退回等于把这个字段变成指令回声，而那正是它以前的样子。"""
+        if self._wheel_v is None:
+            if not self._wheel_v_warned:
+                self._wheel_v_warned = True
+                self.get_logger().warning(
+                    "firmware reports no vl/vr -- odom twist falls back to the command, "
+                    "so slip and stall are invisible; flash the firmware that appends "
+                    "vl=/vr= to the `p` reply"
+                )
+            return self._cmd
+        vl, vr = self._wheel_v
+        return (vl + vr) / 2.0, (vr - vl) / self.wheel_base
+
     def _publish(self, x: float, y: float, theta: float) -> None:
         stamp = self.get_clock().now().to_msg()
         odom = Odometry()
@@ -356,8 +415,9 @@ class DiffCarControlNode(Node):
         odom.pose.pose.position.y = y
         odom.pose.pose.orientation.z = float(np.sin(theta / 2.0))
         odom.pose.pose.orientation.w = float(np.cos(theta / 2.0))
-        odom.twist.twist.linear.x = self._cmd[0]
-        odom.twist.twist.angular.z = self._cmd[1]
+        v_meas, w_meas = self._measured_twist()
+        odom.twist.twist.linear.x = v_meas
+        odom.twist.twist.angular.z = w_meas
         self.odom_pub.publish(odom)
 
         if self.pose_pub is None:

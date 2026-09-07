@@ -101,6 +101,7 @@ async def ws_status(ws: WebSocket):
             else:
                 node = runner.node
                 if node is not None:
+                    node.client_seen('status')   # 真正的 UI 通道；HTTP 的 /device/status 不算
                     payload = json.dumps({'online': True, **node.get_status()})
                 else:
                     payload = json.dumps({'online': False})
@@ -133,6 +134,9 @@ async def ws_pose(ws: WebSocket):
     node.pose_callbacks.append(_on_pose)
     try:
         while True:
+            # 位姿订阅按客户端在场动态建销，所以这里必须续期 —— 否则一个只开
+            # /ws/pose 的客户端会把自己的数据源饿死
+            node.client_seen('pose')
             try:
                 pose = await asyncio.wait_for(queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
@@ -257,6 +261,11 @@ async def ws_planning(ws: WebSocket):
     reader = asyncio.create_task(_planning_view_mode_reader(ws, node))
     try:
         while True:
+            # 每轮查连接 + 续期心跳。光靠 finally 里的 detach 不够：连接被黑洞化时
+            # send_text 会挂住，detach 永远不执行，planning 就一直为没人看的画面渲染。
+            if not _connected(ws):
+                break
+            node.ui_client_seen()
             snapshot = _clear_stopped_nav_snapshot(node.get_planning_snapshot())
             payload = json.dumps(snapshot)
             await ws.send_text(payload)
@@ -303,11 +312,15 @@ async def ws_preview(ws: WebSocket, topic: str = Query(...)):
         return
     try:
         while True:
+            # 每轮都查连接、每轮都续期心跳。原来只在【超时分支】查 _connected，
+            # 而帧一直来时 queue.get() 永不超时，死连接上的 send_bytes 又能无限缓冲，
+            # 于是这个循环永不退出、finally 永不执行、订阅永久泄漏。
+            if not _connected(ws):
+                break
+            node.preview_seen(topic)
             try:
                 frame = await asyncio.wait_for(queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
-                if not _connected(ws):
-                    break
                 continue
             # Binary, not base64 text: base64 costs a flat 33% on a link that is
             # already the bottleneck. The frontend's decodeFrame has always accepted

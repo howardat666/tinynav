@@ -348,3 +348,90 @@ free -m; nproc
 | `x5/wheel-nav` | ⭐ 工作分支，基于 `pr136` |
 | `pr136` / `pr150` / `pr172` / `pr194` | 已 fetch 的上游 PR，见 § 5.2 |
 | `main` | `origin/main` 快照（`25e705e`）|
+
+- [`grid_resolution.md`](grid_resolution.md) — 局部栅格分辨率 0.1→0.05 的完整账（内存实测、矮障碍反而更差、OctoMap 为什么不对症）
+- [`odometry_vio_calibration.md`](odometry_vio_calibration.md) — 轮速里程计标定：⚠️ 那份「±0.6%」是 VIO 时代的，VIO 关掉后 `diffcar_calib_vio.py` 已经跑不了；**图像闭合实测偏航高报 2.4%、左右不对称 2.3%**（2026-09-02 增补）
+- [`vio_to_wheel_odom.md`](vio_to_wheel_odom.md) — 用轮速里程计换掉 VIO 的 CPU 账、唯一阻碍（姿态）、迁移步骤
+- [`command_vs_actual.md`](command_vs_actual.md) — 指令/编码器/VIO 三路速度的实测：滞后 0.2 s、`C/A`=1.000、原地小角速度以前完全不转及其修法（§9~§11）；**§13 逐跳延迟：相机双目 120 ms、排队 230 ms、planning 计算 200 ms**
+- [latency_chain.md](latency_chain.md) — **全链延迟**：图像采集→轮速指令的逐跳测量方法与空闲基线；四个节点的 `LAT` 行 + `lat_report.py`；⚠️ 纠正了 `in_age` 其实是**位姿**龄（不含任何传感器延迟）这个长期误读，以及位姿内容那 50 ms 的隐形延迟
+- [planning_cost.md](planning_cost.md) — 「明明能过去就是不走」的三层原因：承诺段门限把半径算两遍、障碍势垒在 soft 边界是断崖、代价函数缺静止代价
+- [vio_reset_investigation.md](vio_reset_investigation.md) — 固件 VIO 重启的九格消去实验：CPU/内存/BPU/DDS/优先级全不是；含调度优先级 A/B 与 insight_full 线程拆解
+- [map_odom_and_reloc.md](map_odom_and_reloc.md) — 「跑偏」与「要手动重开」的机制：map->odom yaw 日志 bug（tilt 越小越野）、拟合等权 150 秒历史（recent5 残差 p90 123°）、重锁三道前置、高度门 0.30 m
+
+---
+
+## 9. 板上当前生效配置（2026-09-02 19:00 基准）
+
+改参数之前先看这里，改完**回来更新**。真值在板上：
+`tr '\0' '\n' < /proc/$(pgrep -f "[u]vicorn")/environ | grep TINYNAV`
+
+### 9.1 写在 `/userdata/x5/env.sh` 里的（备份 `env.sh.bak-0902b`）
+
+全部 7 条，`grep -E "^export TINYNAV_" /userdata/x5/env.sh` 逐字核对过：
+
+| 变量 | 值 | 为什么 |
+|---|---|---|
+| `TINYNAV_ACTUATOR` | `diffcar` | 平台 |
+| `TINYNAV_CAMERA_HEIGHT_M` | `0.124` | 实测；估错会把整片地板标成障碍 |
+| `TINYNAV_RAYCAST_STEP` | `3` | 墙面召回（step=10 在 1~3 m 只召回 42~56%） |
+| `TINYNAV_LOW_OBS` | `0` | 矮障碍层在硬件上贡献 76% 的格子且全是噪声 |
+| `TINYNAV_LOW_OBS_MIN_PTS` | `2` | 关掉之后无效，留着是为了 `LOW_OBS=1` 时 A/B |
+| `TINYNAV_MAX_VX` | `0.25` | 0.35 试过，两次撞击的直接原因（一拍从 fc=1.17 到 0.03） |
+| `TINYNAV_ALLOW_REVERSE` | `1` | 楔住后 110 条轨迹被拒 96 条，关着倒车就一个动作都没有 |
+
+⚠️ **`/userdata/x5/env.sh` 在 `app_start.sh` 之前 source，而且不在 git 里** ——
+仓库里那份是 `tool/x5_board/env.sh`，两份内容不同。改错那份白改一轮。
+
+### 9.2 走代码默认、没写进 `env.sh` 的
+
+| 变量 | 默认 | 含义 |
+|---|---|---|
+| `TINYNAV_MAP_ODOM_HALF_LIFE_S` | `20` | map→odom 约束的时间半衰期（0=关，回到等权 150 秒历史） |
+| `TINYNAV_RELOC_MAX_Z_DEV_M` | `0.30` | 解的相机高度必须贴住参考关键帧 |
+| `TINYNAV_RELOC_RELOCK_MIN_ODOM_M` | `1.0` | 重锁前置：streak 内里程计位移 |
+| `TINYNAV_RELOC_RELOCK_MAX_CLEAN_FRAC` | `0.30` | 重锁前置：当前坐标系还有多少干净约束 |
+| `TINYNAV_RELOC_RELOCK_MAX_SPREAD_M` | `1.5` | 重锁前置：触发解的候选散布 |
+| `TINYNAV_PLAN_LATEST_ONLY` | **`0`** | 0=旧的 FIFO 取用；1=回调只存、20 Hz 定时器取最新。**待真车 A/B** |
+| `TINYNAV_MAX_INPUT_AGE_S` | `0.5` | 超过这么老的同步集直接丢 |
+| `TINYNAV_NOPROGRESS_ESCAPE_S` | `5.0` | no-progress 脱困的时间预算 |
+| `TINYNAV_ROBOT_Z_BOTTOM` | `-0.11` | 障碍波段下界（离地 +0.014 m） |
+| `TINYNAV_MIN_WALL_SPAN_M` | `0.05` | 障碍 z 跨度门限 |
+
+### 9.3 启动日志里该长什么样
+
+```
+Robot: diffcar (circle r=0.1175m hull=0.122m, cam=(0.067,0.05), ctrl=(0.0,0.0),
+                safety_r=0.05m, hard/soft=0.17/0.27m, z_band=[-0.11,+0.40],
+                vx<=0.25/rev0.2 yaw<=0.6 (clamp 0.8/1.2), reverse=True)
+planning pose source: /wheel/camera_pose
+planning pose sync: approximate slop=0.06s, FIFO intake
+obstacle: raycast step=3 span>=0.05 zbot=-0.11(离地+0.014m) dilation=0 low_obs=off
+reverse: ENABLED (TINYNAV_ALLOW_REVERSE, 一次脱困上限 0.30m) —— 楔住时会倒车脱困
+```
+
+🔑 **这四行是唯一可靠的"跑的是什么配置"凭据** —— 别拿 `env.sh` 的内容当结论
+（`app_start.sh` 里的 `${VAR:-默认}` 会覆盖，而它还有一份陈旧的孪生文件）。
+
+### 9.4 决策行里的新字段
+
+```
+... cycle=0.20s stamp_lag=0.31s in_age=0.19s
+```
+
+- `in_age` = 进规划回调时数据已经多老 = **相机 + bridge + 排队**
+- `stamp_lag − in_age` = **本节点的计算耗时**
+- `in_age − 0.163` = **排队掉的时间**（0.163 s 是 `/slam/depth` 到手时的常态数据龄）
+
+⚠️ 排队是**随负载出现**的：车基本没动时 `in_age` p50 只有 0.19 s，负载上来才到 0.33~0.50 s。
+
+### 2026-09-03 新增的环境变量（都在 planning_node）
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `TINYNAV_DECISION_LOG_HZ` | **0 = 逐拍** | `decision:`/`candidates:`/`best forward:` 的节流。原来写死 1 Hz，而规划周期 0.25 s —— 5 拍只看得到 1 拍，把"障碍首次出现在多远"量偏了 |
+| `TINYNAV_ROUTE_PROBE_M` | 2.0 | 沿全局路线往前探多远，出 `route_block` / `route_clear` |
+| `TINYNAV_ROUTE_UNPIN_ON_BLOCK` | **1 = 开** | `route_clear < hard_clearance` 时本拍 `w_path_follow=0`，日志打 `ROUTE-UNPINNED` |
+| `TINYNAV_BARRIER_INCLUDE_START` | **0 = 不含** | 障碍势垒的最小净空是否算轨迹起点。含起点时它对所有候选恒等，退化成常数 |
+
+判据速查：`route_clear` 比 `front_clearance` 早报警（前向探针对侧面障碍是瞎的）；
+`decision:` 行里 `route_block=inf` 表示路线畅通。详见 `planning_cost.md`。

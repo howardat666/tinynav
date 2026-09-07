@@ -1,6 +1,7 @@
 import argparse
 import collections
 import copy
+import math
 import os
 import time
 
@@ -23,6 +24,7 @@ from rclpy.qos import (
 from sensor_msgs.msg import CameraInfo, Image
 from tf2_msgs.msg import TFMessage
 
+from tinynav.core.lat_stats import LatStats
 from tinynav.core.math_utils import np2msg, pose_msg2np
 
 # Same switch and same default as planning_node's, so one environment variable turns on
@@ -37,6 +39,7 @@ class LooperBridgeNode(Node):
         super().__init__("looper_bridge_node")
         self.args = args
         self.bridge = CvBridge()
+        self._lat = LatStats('bridge', self.get_logger().info)
 
         self.cached_camera_info = None
         self.last_keyframe_pose = None
@@ -105,10 +108,13 @@ class LooperBridgeNode(Node):
         self._exact_pose_prefixes = ("/camera/camera/vio",)
         # VIO 原点重置会毒化 map->odom：约束跨了两个坐标系，解出来的 yaw 会阶跃几十度。
         # 判据用 z 不用速度 —— 触发场景是原地快转，线速度本来就小。
-        self._vio_prev = None
+        self._vio_prev = None            # (时间戳ns, z, x, y)
         self._vio_resets = 0
         self._vio_gaps = 0
         self._vio_dz_m = float(os.environ.get("TINYNAV_VIO_RESET_DZ_M", "0.15"))
+        # 判"位移超出物理可能"的速度上限。取平台 max_vx 的 3 倍留足余量 —— 只要跳变
+        # 比这还大就一定不是真实运动。原来的判据靠"相邻两帧"，见 _check_vio_continuity。
+        self._vio_max_speed = float(os.environ.get("TINYNAV_VIO_MAX_SPEED", "1.0"))
 
         self.camera_info_sub = self.create_subscription(
             CameraInfo, "/camera/camera/infra1/camera_info", self.camera_info_callback,
@@ -336,33 +342,44 @@ class LooperBridgeNode(Node):
         """检测在这里做，因为本回调已经收到每一帧 —— 单开一个 Python 订阅者在这块板上
         实测要 15% 一个核（rclpy 没有零拷贝）。"""
         t_ns = stamp.sec * 10**9 + stamp.nanosec
-        z = float(T[2, 3])
+        z, x, y = float(T[2, 3]), float(T[0, 3]), float(T[1, 3])
         if self._vio_prev is not None:
-            pt, pz = self._vio_prev
+            pt, pz, px, py = self._vio_prev
             dt = (t_ns - pt) / 1e9
             # z 恰好归零是实测到的重置签名，但固件开着 use_zupt（零速更新），有可能
             # 自己把 z 吸到 0 —— 所以它只报 WARNING，够门限的真跳变才报 ERROR。
-            # 只有相邻两帧（没丢帧）才能判跳变。本节点的位姿 QoS 是 depth=1 而执行器只有
-            # 2 线程，实测会丢到 150~400 ms 的洞 —— 跨洞采样平滑运动也像跳变。
-            contiguous = dt < 0.12
-            big = contiguous and abs(z - pz) > self._vio_dz_m
-            snapped = contiguous and abs(z) < 1e-9 and abs(pz) > 0.05
+            #
+            # 🔴 判据不能要求"相邻两帧"。原来写的是 contiguous = dt < 0.12，理由是
+            # "跨过丢帧的洞时，平滑运动看起来也像跳变"。理由成立，但这个节点的位姿
+            # 订阅是 depth=1，实测回调间隔中位数就是 450 ms（话题本身是稳定 20 Hz），
+            # 于是 dt < 0.12 几乎永不成立 —— 2026-09-01 实测 6 次真实重置报了 0 次，
+            # 检测器等于关着。改成按【物理极限】判：位移比车可能走的还远就是跳变，
+            # 这个判据跨多大的洞都成立。
+            plausible = max(self._vio_max_speed * max(dt, 0.0), self._vio_dz_m)
+            jumped = math.hypot(x - px, y - py) > plausible
+            big = jumped or abs(z - pz) > max(self._vio_dz_m, plausible)
+            snapped = abs(z) < 1e-9 and abs(pz) > 0.05
             if big or snapped:
                 self._vio_resets += 1
-                where = (f"z={pz:+.3f}->{z:+.3f} pos=[{T[0, 3]:+.2f},{T[1, 3]:+.2f},{z:+.2f}] "
+                where = (f"z={pz:+.3f}->{z:+.3f} "
+                         f"xy=[{px:+.2f},{py:+.2f}]->[{x:+.2f},{y:+.2f}] "
+                         f"({math.hypot(x - px, y - py):.2f}m in {dt:.2f}s, "
+                         f"上限 {plausible:.2f}m) "
                          f"yaw={np.degrees(np.arctan2(T[1, 0], T[0, 0])):+.1f}deg dt={dt:.3f}s")
                 if big:
                     self.get_logger().error(f"vio origin reset #{self._vio_resets}: {where}")
                 else:
                     self.get_logger().warning(
                         f"vio z snapped to zero #{self._vio_resets}: {where}")
-            # 固件的 rotation_prior_max_interval=0.15：超过它就丢 IMU 旋转先验，
-            # 而快速转头最依赖那个先验
+            # 这是【本节点收到】的间隔，不是固件的发布节奏 —— 位姿话题实测稳定 20 Hz、
+            # 0% 超过 0.15 s，而这里的中位数是 450 ms，差的那部分是本节点 depth=1 的
+            # 队列 + 执行器排队丢掉的。原来的文案说"固件丢了 IMU 旋转先验"，是错的。
             if dt > 0.15:
                 self._vio_gaps += 1
                 self.get_logger().warning(
-                    f"vio frame gap {dt * 1000:.0f}ms (#{self._vio_gaps})")
-        self._vio_prev = (t_ns, z)
+                    f"本节点漏收位姿 {dt * 1000:.0f}ms (#{self._vio_gaps}) "
+                    f"—— 话题本身是 20Hz，这是我们自己的队列/调度丢的")
+        self._vio_prev = (t_ns, z, x, y)
 
     def depth_callback(self, depth_msg: Image):
         # Forwarded in the camera's own mono16 millimetres, not converted to 32FC1
@@ -380,11 +397,21 @@ class LooperBridgeNode(Node):
         # Consumers handle both encodings: planning_node and planning_bag_viser
         # branch on msg.encoding, and perception_node still publishes 32FC1 here in
         # RealSense mode, so this topic was never single-encoding to begin with.
+        # 入口龄 = 相机算完 + DDS 到 bridge；出口龄减它 = bridge 自己花的时间
+        _t_in = self._lat_age(depth_msg.header.stamp) if self._lat.enabled else 0.0
         self.depth_pub.publish(self.relabel_depth(depth_msg))
+        if self._lat.enabled:
+            self._lat.add('d_in', _t_in)
+            self._lat.add('d_out', self._lat_age(depth_msg.header.stamp))
+            self._lat.tick()
         key = depth_msg.header.stamp.sec * 1_000_000_000 + depth_msg.header.stamp.nanosec
         self._depth_by_stamp[key] = depth_msg
         while len(self._depth_by_stamp) > self._depth_cache_max:
             self._depth_by_stamp.popitem(last=False)
+
+    def _lat_age(self, stamp) -> float:
+        now = self.get_clock().now().nanoseconds
+        return (now - (stamp.sec * 1_000_000_000 + stamp.nanosec)) / 1e9
 
     def relabel_depth(self, depth_msg: Image) -> Image:
         """Re-header the camera depth for /slam/depth, sharing the payload.
