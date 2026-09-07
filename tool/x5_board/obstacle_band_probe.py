@@ -31,7 +31,8 @@ LAYER_Z_REL = [-0.45 + k * RES for k in range(10)]
 class Probe(Node):
     def __init__(self):
         super().__init__('obstacle_band_probe')
-        qos = QoSProfile(depth=5, reliability=ReliabilityPolicy.RELIABLE)
+        # planning 的可视化话题是 BEST_EFFORT；这里用 RELIABLE 就是零投递且完全静默。
+        qos = QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.robot_z = None
         self.frames = []
         self.mask_counts = []

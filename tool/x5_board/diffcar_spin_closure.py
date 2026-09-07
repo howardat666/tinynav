@@ -114,7 +114,7 @@ def one_revolution(node, w):
     for _ in range(25):
         rclpy.spin_once(node, timeout_sec=0.02)
     p0 = profile(node.img)
-    q_v0 = node.vio_q
+    q_v0 = node.vio_q          # None = 固件 VIO 关着，旁证这一列留空
     prev = 2.0 * np.arctan2(node.odom_q[2], node.odom_q[3])
     acc = 0.0
     seen = node.img_seq
@@ -135,7 +135,9 @@ def one_revolution(node, w):
         if node.img_seq != seen:
             seen = node.img_seq
             if abs(np.degrees(acc)) > EVAL_FROM_DEG:
-                rec.append((acc, rotvec_z(q_v0, node.vio_q), profile(node.img)))
+                v_ang = (rotvec_z(q_v0, node.vio_q)
+                         if (q_v0 is not None and node.vio_q is not None) else float('nan'))
+                rec.append((acc, v_ang, profile(node.img)))
     m = Twist()
     t1 = time.time()
     while time.time() - t1 < 1.5:
@@ -143,7 +145,10 @@ def one_revolution(node, w):
         rclpy.spin_once(node, timeout_sec=0.01)
 
     print("  转完: 里程计累计 %+.2f 度, VIO %+.2f 度, 闭合区记录 %d 帧, 最低电压 %.2f V"
-          % (np.degrees(acc), np.degrees(rotvec_z(q_v0, node.vio_q)), len(rec), vmin))
+          % (np.degrees(acc),
+             np.degrees(rotvec_z(q_v0, node.vio_q))
+             if (q_v0 is not None and node.vio_q is not None) else float('nan'),
+             len(rec), vmin))
     if len(rec) < 6:
         print("  !! 闭合区帧数不够，没法定闭合点")
         return None
@@ -178,7 +183,9 @@ def main():
     t0 = time.time()
     while time.time() - t0 < 15:
         rclpy.spin_once(node, timeout_sec=0.1)
-        if node.odom_q and node.vio_q and node.img is not None and node.batt:
+        # VIO 不再是前提：固件里已经关掉（/camera/camera/vio_100hz 不存在了）。
+        # 真正的基准是图像闭合，VIO 只是个旁证，没有就不打。
+        if node.odom_q and node.img is not None and node.batt:
             break
     if node.img is None or not node.odom_q:
         sys.exit("数据不全")
