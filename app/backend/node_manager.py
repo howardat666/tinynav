@@ -1870,8 +1870,8 @@ class BackendNode(Ros2NodeManager):
     def _set_camera_vio(self, want: bool):
         """开/关相机固件的 VIO。只有录 bag 需要它。
 
-        建图时必须关：cmd_map_build 是放 bag 重建，而 bag 里的 /camera/camera/vio_image
-        和实时相机是同名话题、同一个 domain，开着会让实时位姿挤掉回放的那些。
+        建图和导航都不需要：建图的位姿来自 bag（而且跑在独立 domain 231 上），导航用
+        轮速。开着就是白烧 0.86 核。
         """
         if not os.path.exists(_INSIGHT_PARAM):
             return
@@ -2381,6 +2381,7 @@ class BackendNode(Ros2NodeManager):
             raise RuntimeError('Map building is disabled in display backend role')
         self._stop_sensor_procs()
         self._stop_all()
+        # 建图的位姿由 bag 提供，所以这里只是防止录制那一步把 VIO 留在开着
         self._set_camera_vio(False)
         self._start('rosbag_build_map')
 

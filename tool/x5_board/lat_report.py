@@ -140,25 +140,32 @@ def chain(acc):
     ], c_use, get(acc, "diffcar", "cmd_wait"))
 
 
-def phases(env):
-    """按 LATENV 的 prev=（在预览哪些图像话题）把一趟切成若干段。
+def phases(env, hi_end):
+    """按 LATENV 的 prev=（在预览哪些图像话题）把一趟按取值池化。
 
-    分两趟比预览开销会把路线/光照/温度一起差进来；同一趟里切预览是唯一能控住
-    它们的做法。返回 [(prev 值, 起, 止)]。
+    分两趟比预览开销会把路线/光照/温度一起差进来；同一趟里切预览是唯一能控住它们
+    的做法。按【取值】而不是按连续段汇总，所以来回开关多少次、每次多久都不影响 ——
+    同一种状态的样本自动并到一起。
+
+    返回 [(prev 值, [(起, 止), ...], 总时长)]，按总时长降序。
     """
-    seq = []
-    for t, txt in env:
-        if t is None:
+    marks = [(t, re.search(r"prev=(\S+)", txt)) for t, txt in env if t is not None]
+    marks = [(t, m.group(1)) for t, m in marks if m]
+    if not marks:
+        return []
+    # LATENV 是周期打的，所以一个采样点代表「从它到下一个采样点」这段时间
+    spans = {}
+    for i, (t, v) in enumerate(marks):
+        t_end = marks[i + 1][0] if i + 1 < len(marks) else hi_end
+        if t_end <= t:
             continue
-        m = re.search(r"prev=(\S+)", txt)
-        if not m:
-            continue
-        v = m.group(1)
-        if not seq or seq[-1][0] != v:
-            seq.append((v, t, t))
+        cur = spans.setdefault(v, [])
+        if cur and abs(cur[-1][1] - t) < 1e-6:
+            cur[-1] = (cur[-1][0], t_end)      # 相邻同值的段直接接起来
         else:
-            seq[-1] = (v, seq[-1][1], t)
-    return seq
+            cur.append((t, t_end))
+    out = [(v, iv, sum(b - a for a, b in iv)) for v, iv in spans.items()]
+    return sorted(out, key=lambda x: -x[2])
 
 
 def main():
@@ -239,22 +246,25 @@ def main():
         print("  ⚠️ ws/prev 不同的两趟【不可比】—— 观看本身就要花 CPU，直接吃延迟预算")
         print()
     if a.by_prev:
-        segs = phases(env)
+        t_all = [r[0] for r in rows if r[0] is not None]
+        hi_end = win[1] if win else (max(t_all) if t_all else 0)
+        segs = phases(env, hi_end)
         if len(segs) < 2:
-            print("⚠️ 这一趟 prev= 从头到尾没变过，切不出段（要在跑的过程中切换预览）\n")
+            v = segs[0][0] if segs else "?"
+            print(f"⚠️ 这一趟 prev= 从头到尾都是 {v}，切不出对照"
+                  "（要在跑的过程中切换预览）\n")
         else:
-            t_all = [r[0] for r in rows if r[0] is not None]
-            hi_end = win[1] if win else (max(t_all) if t_all else 0)
-            print(f"按 prev= 切出 {len(segs)} 段：\n")
-            for i, (prev, t0, _t1) in enumerate(segs):
-                t_end = segs[i + 1][1] if i + 1 < len(segs) else hi_end
-                sub = fold([r for r in rows if r[0] is not None and t0 <= r[0] <= t_end])
+            print(f"按 prev= 池化出 {len(segs)} 种工况"
+                  "（同一取值的所有时间段合并，所以开关几次、每次多久都不影响）：\n")
+            for prev, iv, dur in segs:
+                sub = fold([r for r in rows if r[0] is not None
+                            and any(a0 <= r[0] <= b0 for a0, b0 in iv)])
                 n = len(next(iter(next(iter(sub.values())).values()))[0]) if sub else 0
-                print(f"── 第 {i + 1} 段  prev={prev}  {t_end - t0:.0f}s"
-                      f"  ({len(sub)} 个 tag, {n} 个窗口)")
-                if n < 3:
-                    print("   窗口太少，跳过 —— LAT 行按 TINYNAV_LAT_LOG_S 打，"
-                          "每段至少留 30 s\n")
+                note = "  ⚠️ 窗口太少，只能当参考" if n < 5 else ""
+                print(f"── prev={prev}   共 {dur:.0f}s / {len(iv)} 段 / "
+                      f"{len(sub)} 个 tag / {n} 个窗口{note}")
+                if not sub:
+                    print("   这段里没有 LAT 行\n")
                     continue
                 tbl, c_use_s, d_wait_s = chain(sub)
                 for name, one, _cum, _src in tbl:
@@ -263,7 +273,7 @@ def main():
                 print("   " + pad("→ 到串口写（+diffcar）", 32)
                       + fmt(None if c_use_s is None else c_use_s + (d_wait_s or 0)))
                 print()
-            print("各段只差 prev=，路线/光照/温度是同一趟，可以直接横向比。\n")
+            print("各行只差 prev=，路线/光照/温度是同一趟，可以直接横向比。\n")
 
     acc = fold(rows)
     if not acc:
