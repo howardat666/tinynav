@@ -29,6 +29,10 @@ exec docker run --rm --net=host --name tinynav_sim \
   -e TINYNAV_ROUTE_COST="${TINYNAV_ROUTE_COST:-1}" \
   -e TINYNAV_TRAJ_SAMPLES="${TINYNAV_TRAJ_SAMPLES:-15}" \
   -e TINYNAV_SIM_SCENE="${TINYNAV_SIM_SCENE:-wall_ahead}" \
+  -e TINYNAV_SIM_PORT="${TINYNAV_SIM_PORT:-8766}" \
+  -e TINYNAV_GRID_OFFSET_Z="${TINYNAV_GRID_OFFSET_Z:-0.15}" \
+  -e TINYNAV_W_IDLE="${TINYNAV_W_IDLE:-40.0}" \
+  -e TINYNAV_IDLE_VX_EPS="${TINYNAV_IDLE_VX_EPS:-1e-6}" \
   -e TINYNAV_SIM_CAMERA="${TINYNAV_SIM_CAMERA:-match}" \
   --entrypoint bash "$IMAGE" -lc '
 set +u; source /opt/ros/humble/setup.bash; set -u

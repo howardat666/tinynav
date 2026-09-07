@@ -1788,3 +1788,67 @@ tool/x5_board/reloc_forensics.py map_node.log --jump-m 1.0
 
 离原点远 → 看起来像「位置乱跳」；就在原点附近 → 看起来像「角度乱跳」。**同一个病。**
 
+
+---
+
+## 2026-09-03 11:22 那趟（`vx<=0.4`、z 波段 −0.16/0.10、倒车开、滞回 release=5）
+
+**日志改动**：`decision:` 的 1 Hz 节流去掉（`TINYNAV_DECISION_LOG_HZ`，默认 0=逐拍），
+新增 `route_block` / `route_clear`。代价零：820 条决策 / 3.65 Hz，`cycle` p50 仍是 0.25 s，
+`in_age` p50 从 0.390 降到 0.350，**`trajectory expired = 0`**。
+
+⚠️ 之前所有"障碍首次出现在多远"的数字**都被那个节流污染过**（偏低最多 v×1.15 s，
+0.4 m/s 时 0.46 m），不能再引用。
+
+### 整体（未暂停 710 拍；暂停窗口 198.5~203.0 和 205.4~224.8）
+
+```
+cycle    p50 0.25   p90 0.30   max 0.71
+in_age   p50 0.35   p90 0.47   max 0.50
+esdf_at_robot  p50 0.40  p90 0.78  min 0.14
+obstacle_cells p50 149   p90 219   max 364
+escape: off 672 / no-progress 88 / blocked 33 / retreat 14 / heading 13
+vx: 0.4 占 351 拍(43%)，0 占 207，倒车 14，原地转 134
+```
+
+### 三次真碰撞（`esdf_at_robot < hard 0.172`）
+
+```
+t+172.3  esdf=0.16  vx=+0.400  fc=0.21  fwd=3/90    route_clear=0.10
+t+172.5  esdf=0.16  vx=+0.267  fc=1.20  fwd=16/90   route_clear=0.10
+t+197.0  esdf=0.16  vx=+0.000  fc=0.02  fwd=0/90  blocked  route_clear=0.05
+```
+
+t+197.0 那次的逐拍（**1.1 秒从"90/90 可行、前方 1.20 m 全空、全速"到压进障碍**）：
+
+```
+195.7  +0.400  fc=1.20  esdf=0.81  fwd=90/90  route_block=inf   route_clear=0.32
+195.9  +0.400  fc=1.20  esdf=0.81  fwd=90/90  route_block=1.72  route_clear=0.15  ← 路线先报警
+196.1  +0.067  fc=1.20  esdf=0.36  fwd=39/90  route_block=0.20  route_clear=0.00  ← 一拍掉 0.45 m
+196.8  +0.067  fc=0.04  esdf=0.21  fwd= 4/90
+197.0  +0.000  fc=0.02  esdf=0.16  fwd= 0/90  blocked
+197.2  −0.060                                 retreat            ← 倒车自己启动
+```
+
+🔑 两条：**① `route_clear` 比 `front_clearance` 早两拍报警**（障碍在侧面，前向探针天生
+看不见）；**② `esdf_at_robot` 一拍掉 0.45 m 而车只走了 0.08 m** —— 不是靠近，是障碍
+突然出现在栅格里。
+
+### 主因定案：全局路线
+
+见 `planning_cost.md` 的表。**`route_clear < 0.172` 占 46%；3 次碰撞 + 17 次全速贴着走
+全部落在那一档；路线安全的 382 拍里车跑 0.4 m/s、离障碍中位 0.56 m、85/90 条可行，
+一次没出事。**
+
+### 读日志的两个坑（我都踩了）
+
+- 🔴 **"所有数值冻结"先查 `nav paused`**，别当活锁。这一趟 206~224 秒整段冻结是暂停。第三次踩。
+- 🔴 **末尾 122 秒的 `No target pose` 是 `Received POIs from planner: {}`**（POI 被清空），不是故障。
+
+### BPU 不是瓶颈
+
+```
+BPU 连续 10 秒：38 36 40 34 35 36 45 46 47 45   平均 ~40%
+CPU load 10.25 / 8 核（超订 28%）      温度 86.5 °C（95 降频，余量 8.5）
+bridge 87.6% / map_node 78.6% / insight_full 74.9% / planning 71.0% / uvicorn 51.1%
+```

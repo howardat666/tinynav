@@ -39,7 +39,9 @@ PID_DIR="${PID_DIR:-${X5_ROOT}/run}"
 WHEEL_PORT="${WHEEL_PORT:-/dev/ttyS3}"
 WHEEL_RADIUS="${WHEEL_RADIUS:-0.050385}"
 BASE_RADIUS="${BASE_RADIUS:-0.127083}"
-CAMERA_OFFSET="${CAMERA_OFFSET:-0.06,0.05,0.18}"
+# [前,左,上]，base_link(=驱动轴) -> 相机。0.087 = camera_x 0.067 + 轴后移 0.020，
+# 和 DIFFCAR_CONFIG 的 camera_x - control_x 必须一致（那边是推导的，这里是写死的）。
+CAMERA_OFFSET="${CAMERA_OFFSET:-0.087,0.05,0.126}"
 
 # Minimum free space to start a recording. The Looper set is about 12 MB/s
 # (infra1 mono8 at 20 Hz is 7, depth mono16 at 5 Hz is 3.5, compressed colour the

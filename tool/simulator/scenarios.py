@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import math
 import sys
 import time
@@ -22,8 +23,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tool.simulator import x5_presets  # noqa: E402
 
-BASE = "http://127.0.0.1:8766"
+# 端口跟着 TINYNAV_SIM_PORT 走：上游那份仿真也占 8766，两边同时开时我们的会挪到 8767，
+# 写死会静默打到上游那份上去（它没有 /api/load-scene，报 404）。
+BASE = os.environ.get("TINYNAV_SIM_BASE",
+                      f'http://127.0.0.1:{os.environ.get("TINYNAV_SIM_PORT", "8766")}')
 ACTUATOR = "perfect"
+# (物理外壳半径, 圆心在控制点前多少米)。启动时从 /api/robot-presets 取，
+# 取不到就退回发布出来的 footprint（旧行为）。
+BODY = None
 
 
 def api(path, payload=None, timeout=20):
@@ -78,6 +85,21 @@ def clearance_to_objects(corners, objects):
     return worst
 
 
+def body_circle_xy(frame, body):
+    """按物理外壳画一圈点。body = (半径, 圆心在控制点前多少米)；None 表示没配，退回 footprint。"""
+    if body is None:
+        return None
+    r, off = body
+    x, y = frame.get("robot_xy") or (None, None)
+    if x is None:
+        return None
+    yaw = math.radians(float(frame.get("robot_yaw_deg", 0.0)))
+    cx, cy = x + math.cos(yaw) * off, y + math.sin(yaw) * off
+    n = 24
+    return [[cx + r * math.cos(2 * math.pi * i / n),
+             cy + r * math.sin(2 * math.pi * i / n)] for i in range(n)]
+
+
 def run(name, sc, poll_hz=5.0):
     # 场景由服务端按 x5_presets 那一份定义生成，且 load-scene 会把 planning 和 control
     # 都换新的。少了这个隔离，planning 带着上一个场景的障碍图、control 带着累积的路径
@@ -117,7 +139,11 @@ def run(name, sc, poll_hz=5.0):
         x, y = f["robot_xy"]
         vx, wz = f["selected_param"]
         d = math.hypot(tgt[0] - x, tgt[1] - y)
-        clr = clearance_to_objects(f.get("robot_footprint_xy") or [], cfg.get("objects") or [])
+        # 🔴 不用发布出来的 footprint —— 那画的是【扫掠圆】（半径 collision_radius、
+        # 圆心在控制点）。驱动轴不过圆心时它比车身大，拿它判碰撞除正前方外处处高报。
+        body = body_circle_xy(f, BODY)
+        clr = clearance_to_objects(body or f.get("robot_footprint_xy") or [],
+                                   cfg.get("objects") or [])
         samples.append((time.monotonic() - t0, x, y, f["robot_yaw_deg"], vx, wz, d, clr))
         if d < 0.4 and reached_at is None:
             reached_at = time.monotonic() - t0
@@ -139,8 +165,10 @@ def run(name, sc, poll_hz=5.0):
     ok = (reached_at is not None) if sc["need_reach"] else True
     # 变向次数是摆头的判据，每个场景给的上限不同（见 x5_presets.SCENES）。
     ok = ok and flips <= int(sc.get("max_flips", 6))
-    # 倒车默认关，所以任何真正的倒车指令都是问题（-0.06 以内是跟踪律的反馈余量，不算）
-    ok = ok and len(revs) == 0
+    # 倒车开着时它是脱困手段而不是缺陷，判据换成「有没有压进障碍」（下一行）。
+    # 关着时任何真正的倒车指令都是问题（-0.06 以内是跟踪律的反馈余量，不算）。
+    if os.environ.get("TINYNAV_ALLOW_REVERSE", "0") != "1":
+        ok = ok and len(revs) == 0
     ok = ok and hits == 0            # 压进障碍就是失败，不管到没到
     return dict(name=name, ok=ok, reached_at=reached_at, flips=flips,
                 stalled_frac=stalled / len(samples), n=len(samples),
@@ -159,11 +187,22 @@ def main():
     a = ap.parse_args()
     BASE = a.base
     ACTUATOR = a.actuator
+    global BODY
+    try:
+        pres = api("/api/robot-presets")["presets"]
+        r = next(p["robot"] for p in pres if p["name"] == "diffcar")
+        if r.get("body_radius"):
+            BODY = (float(r["body_radius"]), float(r.get("body_offset_x", 0.0)))
+    except Exception as exc:
+        print(f"⚠️ 取不到物理外壳，碰撞判据退回发布的 footprint（会按扫掠圆高报）: {exc}")
     all_sc = SCENES
     todo = a.only or list(all_sc)
     bad = 0
     print(f"执行误差模型: {ACTUATOR}")
-    print(f"{'场景':<12} {'到达':>7} {'变向':>4} {'最小净空':>8} {'压进障碍':>8} {'路程':>6} {'末距':>6}  结果")
+    print(f"碰撞判据: {'物理外壳 r=%.3f 圆心在控制点前 %.3f m' % BODY if BODY else '发布的 footprint(扫掠圆)'}")
+    print(f"倒车: {'开' if os.environ.get('TINYNAV_ALLOW_REVERSE','0')=='1' else '关'}"
+          f"（判据随之变：开着时倒车不算缺陷，只看有没有压进障碍）")
+    print(f"{'场景':<12} {'到达':>7} {'变向':>4} {'倒车':>4} {'最小净空':>8} {'压进障碍':>8} {'路程':>6} {'末距':>6}  结果")
     for name in todo:
         if name not in all_sc:
             print(f"  未知场景 {name}（有：{', '.join(all_sc)}）")
@@ -177,7 +216,7 @@ def main():
             continue
         bad += not r["ok"]
         reach = f"{r['reached_at']:.1f}s" if r["reached_at"] is not None else "未到"
-        print(f"{name:<12} {reach:>7} {r['flips']:>4} {r['min_clear']:>7.3f}m "
+        print(f"{name:<12} {reach:>7} {r['flips']:>4} {r['reverse_cmds']:>4} {r['min_clear']:>7.3f}m "
               f"{r['hits']:>8} {r['path_len']:>5.2f}m {r['final_d']:>5.2f}m  "
               f"{'OK' if r['ok'] else '**FAIL**'}", flush=True)
     print("全部通过" if not bad else f"{bad} 个场景不通过", flush=True)

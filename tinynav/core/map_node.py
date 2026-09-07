@@ -38,6 +38,7 @@ import logging
 import asyncio
 import threading
 import time
+import traceback
 from tf2_ros import TransformBroadcaster
 from tinynav.core.build_map_node import DEFAULT_VLAD_CENTRES, LOOP_CLOSURE_DEFAULTS, load_vlad_centres, TinyNavDB
 from tinynav.core.build_map_node import solve_pose_graph
@@ -312,6 +313,18 @@ class MapNode(Node):
         self.keyframe_image_sub = Subscriber(self, Image, '/slam/keyframe_image')
         self.keyframe_odom_sub = Subscriber(self, Odometry, '/slam/keyframe_odom')
         self.continuous_odom_sub = self.create_subscription(Odometry, '/slam/odometry', self.continuous_odom_callback, 100)
+        # 🔴 nav 定时器的位姿源【不能】用 /slam/odometry —— looper 模式下它的
+        # Publisher count = 0（VIO 关掉之后就没人发了），实测 `ros2 topic hz` 报
+        # "does not appear to be published yet"。2026-09-03 我把 #178 的定时器接在它上面，
+        # latest_odom_pose 永远是 None → try_publish_nav_path 一次都没跑 →
+        # 【箭头不出现、POI 不动】，而且一条错误日志都没有。
+        # 活的那个是 /slam/odometry_visual（20.03 Hz），由 bridge 用同一个
+        # make_odom_msg(T_world_camera) 从 /wheel/camera_pose 造出来 —— 和
+        # /slam/keyframe_odom 同源同帧，所以可以直接换。
+        self.nav_odom_topic = os.environ.get('TINYNAV_NAV_ODOM_TOPIC', '/slam/odometry_visual')
+        self.nav_odom_sub = self.create_subscription(
+            Odometry, self.nav_odom_topic, self.nav_odom_callback, 10)
+        self.get_logger().info(f"nav target pose source: {self.nav_odom_topic}")
         # TRANSIENT_LOCAL to match the publisher. The nav target is state, published
         # once per user click, and this node is always the late joiner: it is started
         # by the same request that then sends the POI, and needs ~15 s to get here --
@@ -356,7 +369,77 @@ class MapNode(Node):
         # 门限量出来的：397 个静止样本里正常的全 <=1.8 m、翻转的全 >=2.22 m，1.2 m 误拒 0.5%、
         # 抓住 100%。⚠️ 我原本按推理提的 0.3 m 会误拒 37.7%。
         self.reloc_gate_m = float(os.environ.get('TINYNAV_RELOC_GATE_M', '1.2'))
+        # map->odom 的引导门限，见 compute_transform_from_map_to_odom。
         self.reloc_gate_streak_n = int(os.environ.get('TINYNAV_RELOC_GATE_STREAK', '5'))
+        # 重锁的三道前置条件。09-02 实测：车停着(整条 streak 里程计只动 0.52 m)、当前坐标系
+        # 有 45/91 条干净约束的情况下，5 个内点率 0.31~0.35、候选散布 2.9~3.2 m 的解彼此
+        # 一致，就把 92 条约束全丢了，地图帧被搬走 3.9 m / 145 度。重锁是恢复通道，但
+        # 「锁错了」的前提是有新证据 —— 车不动就没有新证据，只是检索换了个候选。
+        self.relock_min_odom_m = float(os.environ.get('TINYNAV_RELOC_RELOCK_MIN_ODOM_M', '1.0'))
+        # 🔴 引导解（第一个解）的唯一质量门。它天然绕过里程计一致性门（没有上一个解可比），
+        # 而整个 map 帧建在它上面。2026-09-03 15:12 实测：首解 cand_spread=2.48m ratio=0.27
+        # 错了 3.5 m，之后 80 秒里每一个【正确】的解（spread 0.17~0.62、ratio 0.47~0.62）
+        # 都因为跟它不一致而被拒；重启后首解正是那些被拒的位置，证明首解才是错的。
+        # 散布做【稳态】门限是坏的（>2.0m 误伤 36% 好解），但只用在引导这一次上：
+        # 这一趟它会把错的挡掉，13.7 秒后锁到对的。
+        self.reloc_bootstrap_max_spread_m = float(
+            os.environ.get('TINYNAV_RELOC_BOOTSTRAP_MAX_SPREAD_M', '1.0'))
+        # 已采信的解的个数。1 = 只有引导解、还没被任何第二个解印证过。
+        self._reloc_accepted_n = 0
+
+        # 🔴 #178（上游）：全局路线原来挂在 keyframe_callback 上，而关键帧实测只有
+        # 0.64 Hz（270 帧 / 419 s），也就是【每 1.5 秒才更新一次目标】—— 这正是记过的
+        # 「target 跳变 = 关键帧饿死」。改成独立定时器 + 最新里程计。
+        self.latest_odom_pose = None
+        self.latest_odom_ns = 0
+        self.nav_target_period_s = float(os.environ.get('TINYNAV_NAV_TARGET_PERIOD_S', '0.5'))
+        # 全局路线（SDF 走廊搜索）缓存。只在没有缓存 / POI 变了 / 偏离缓存路线超过门限时重搜。
+        # 不缓存的话 try_publish_nav_path 实测 73~94 ms，2 Hz 就是 16% 的核，而板上 CPU 已超订。
+        self.cached_nav_path_in_map = None
+        self.cached_nav_path_poi_index = -1
+        self.nav_replan_deviation_m = float(os.environ.get('TINYNAV_NAV_REPLAN_DEVIATION_M', '1.0'))
+        # 🔴 #225（上游）：只按"偏离缓存路线"重规划，永远拦不住「车停在路线【上】、
+        # 前面是建图后才出现的障碍」这一类 —— 偏差是 0，所以永不触发，上游原话是
+        # "a deadlock that used to require manual intervention"。我们那趟 route_clear
+        # < 0.172 占 47%，正是这一类。
+        # ⚠️ 默认 0 = 关。先单独验 #178 的定时器，再把这个打开，别混在一起。
+        self.nav_stall_timeout_s = float(os.environ.get('TINYNAV_NAV_STALL_TIMEOUT_S', '0'))
+        self.nav_stall_progress_eps_m = float(
+            os.environ.get('TINYNAV_NAV_STALL_EPS_M', '0.05'))
+        self._nav_stall_best_remaining = None
+        self._nav_stall_since = None
+        # 前视点的单调游标。sig 用缓存路径对象的 id：重搜会换对象，游标随之归零。
+        self._pursuit_index = 0
+        self._pursuit_path_sig = None
+        self.relock_max_clean_frac = float(
+            os.environ.get('TINYNAV_RELOC_RELOCK_MAX_CLEAN_FRAC', '0.30'))
+        self.relock_max_spread_m = float(os.environ.get('TINYNAV_RELOC_RELOCK_MAX_SPREAD_M', '1.5'))
+        self._last_clean_frac = 0.0
+        # 解出来的相机高度必须贴着它参考的那个关键帧 —— 都在同一层地板上。实测 209 个
+        # 接受解 |dz| p50=0.04 p90=0.07 p99=0.22 m，0.3 m 只拒掉 2 个(1.0%)，而那两个
+        # 一个是 z=+1.10 m（相机离地 0.124 m，物理上不可能）、且正好是「到达」判定前的
+        # 最后一条约束，把拟合朝向拉偏了 11.5 度。
+        self.reloc_max_z_dev_m = float(os.environ.get('TINYNAV_RELOC_MAX_Z_DEV_M', '0.30'))
+        # 约束的时间半衰期。原来最近 100 条等权，在 0.65 关键帧/s 下就是 150 s 的历史 ——
+        # 车开到地图另一头时，150 s 前那一片蕴含的 map->odom 和现在这一片的权重一样大，
+        # 于是解永远落在两者之间、并随车缓慢转动。09-02 实测那一段 `|拟合 - 最近5条中心|`
+        # p90 = 123 度，手动重开 map_node 就是在清这个缓冲（重开后 p90 降到 16 度）。
+        # 回测（判据 = 解离最近 5 条约束的圆心有多远 / 代价 = 解自己的相邻抖动）：
+        #   不衰减 p90=138 度 | 60s p90=105 | 30s p90=30 | **20s p90=10** | 10s p90=4 但抖动 max 57 度
+        # 20 s 把长尾按下去而相邻抖动中位仍是 0.6 度。0 = 关掉衰减，回到旧行为。
+        self.map_odom_half_life_s = float(
+            os.environ.get('TINYNAV_MAP_ODOM_HALF_LIFE_S', '20.0'))
+        # 倾角门。map 和 odom 都是地面坐标系，它们之间的变换**几何上不可能有大倾角**，
+        # 所以 tilt 是个免费的坏解判据 —— 而且是唯一一个在引导阶段就有效的。
+        # 实测 592 次拟合：p50 1.00° / p90 1.70° / **p99 2.90°** / max 29.4°，
+        # 而 tilt>3° 的 5 次全部出现在约束数 2~6 条时，`|d_yaw|` 最大 134.5°。按约束数分箱：
+        #   cons 1~5 : tilt p50 24.4°  |d_yaw| p90 134.5°   🔴
+        #   cons 6~20: tilt p50  0.9°  |d_yaw| p90   1.9°
+        #   cons 21+ : tilt p50 ≤1.5°  |d_yaw| p90 ≤1.0°
+        # 拒了就保留上一个 T（不是置 None），所以代价只是箭头晚 1.5 s 一拍 ——
+        # 比之前那个约束数门限便宜得多（那个买来 27~67 秒的空窗，见文件末注释）。
+        self.map_odom_max_tilt_deg = float(
+            os.environ.get('TINYNAV_MAP_ODOM_MAX_TILT_DEG', '3.0'))
         self._last_accepted_reloc = None
         self._reloc_gate_streak = []
         self._reloc_rejects = 0
@@ -541,6 +624,8 @@ class MapNode(Node):
         self.tf_broadcaster = TransformBroadcaster(self)
 
         self._save_completed = False
+        self.nav_target_timer = self.create_timer(
+            self.nav_target_period_s, self.nav_target_timer_callback)
 
     def _start_nav_path_search_warmup(self):
         """Kick off the path-search JIT warmup without blocking the constructor.
@@ -631,6 +716,10 @@ class MapNode(Node):
 
             if not self.pois:
                 self.poi_index = -1
+                self.cached_nav_path_in_map = None
+                self.cached_nav_path_poi_index = -1
+                self._nav_stall_best_remaining = None
+                self._nav_stall_since = None
                 # Signal planning_node to clear target_pose so it stops publishing paths
                 dummy_pose = np.eye(4)
                 self.poi_change_pub.publish(np2msg(dummy_pose, self.get_clock().now().to_msg(), "world", "map"))
@@ -642,6 +731,10 @@ class MapNode(Node):
             self._leg_initial_length = None
             self._leg_start_time = None
             self._speed_estimate = None
+            self.cached_nav_path_in_map = None
+            self.cached_nav_path_poi_index = -1
+            self._nav_stall_best_remaining = None
+            self._nav_stall_since = None
             self.get_logger().info(
                 f"Parsed POIs (visit order = as received): keys={order} -> {self.pois}")
         except json.JSONDecodeError as e:
@@ -659,6 +752,12 @@ class MapNode(Node):
 
     def continuous_odom_callback(self, odom_msg: Odometry):
         self.continuous_odom_recorder.record_odometry_msg(odom_msg)
+
+    def nav_odom_callback(self, odom_msg: Odometry):
+        """nav 定时器的位姿源。只存最新，不做别的。"""
+        self.latest_odom_pose, _ = msg2np(odom_msg)
+        self.latest_odom_ns = (int(odom_msg.header.stamp.sec) * 1_000_000_000
+                               + int(odom_msg.header.stamp.nanosec))
 
     def localization_stop_callback(self, msg: Bool):
         if msg.data:
@@ -810,8 +909,6 @@ class MapNode(Node):
             self.compute_transform_from_map_to_odom()
         t_stage = mark_stage("tf_update", t_stage)
 
-        with Timer(name = "nav path", text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=self.timer_logger):
-            self.try_publish_nav_path(keyframe_image_timestamp_ns)
             # timer or queue for publish the nav path
             # and record the map pose
             # compute the coordinate transform from the map pose to the keyframe pose
@@ -851,15 +948,52 @@ class MapNode(Node):
             f"obs[{st.get('spread_detail', '?')}] map[{st.get('pose_detail', '?')}]"
         )
 
+    def _ref_keyframe_z(self):
+        """最佳候选关键帧在地图里的高度。None = 这次没有可比的参考。"""
+        st = self.last_relocalization_stats or {}
+        cand_ts = st.get("cand_ts") or []
+        matches = st.get("cand_matches") or []
+        if not cand_ts or not matches:
+            return None
+        i = int(np.argmax(matches))
+        ref = self.map_poses.get(cand_ts[i]) if i < len(cand_ts) else None
+        return None if ref is None else float(np.asarray(ref)[2, 3])
+
     def _reloc_agrees_with_odom(self, ts, odom):
         """里程计说不可能的地图跳变就丢掉，不让它进约束集。判据见 __init__ 里的注释。"""
         pose = self.relocalization_poses.get(ts)
         if pose is None:
             return True
+        # 高度门：地面车的相机高度是常数，解不该比它参考的关键帧高出/低下这么多。
+        z_ref = self._ref_keyframe_z()
+        if z_ref is not None:
+            dz = abs(float(np.asarray(pose)[2, 3]) - z_ref)
+            if dz > self.reloc_max_z_dev_m:
+                self.get_logger().warning(
+                    f"reloc rejected on height: solved z is {dz:.2f}m off its reference "
+                    f"keyframe (limit {self.reloc_max_z_dev_m:.2f}m) | "
+                    f"{self._reloc_gate_margins()}")
+                self.relocalization_poses.pop(ts, None)
+                self.relocalization_pose_weights.pop(ts, None)
+                self.relocalization_pose_quality.pop(ts, None)
+                return False
         cur = (np.asarray(pose)[:3, 3].copy(), odom[:3, 3].copy())
         prev = self._last_accepted_reloc
         if prev is None:
+            spread_m = (self.relocalization_pose_quality.get(ts) or (0.0, 0.0))[0]
+            if (self.reloc_bootstrap_max_spread_m > 0.0
+                    and spread_m > self.reloc_bootstrap_max_spread_m):
+                self.get_logger().warning(
+                    f"reloc bootstrap rejected: candidates are {spread_m:.2f}m apart "
+                    f"(need <={self.reloc_bootstrap_max_spread_m:.2f}m) -- the whole map "
+                    f"frame gets built on this one solution, so it gets the only gate | "
+                    f"{self._reloc_gate_margins()}")
+                self.relocalization_poses.pop(ts, None)
+                self.relocalization_pose_weights.pop(ts, None)
+                self.relocalization_pose_quality.pop(ts, None)
+                return False
             self._last_accepted_reloc = cur
+            self._reloc_accepted_n = 1
             return True
         d_map = float(np.linalg.norm(cur[0] - prev[0]))
         d_odom = float(np.linalg.norm(cur[1] - prev[1]))
@@ -873,6 +1007,7 @@ class MapNode(Node):
                     f"{self._reloc_gate_margins()}")
             self._reloc_gate_streak = []
             self._last_accepted_reloc = cur
+            self._reloc_accepted_n += 1
             return True
 
         # 必须有恢复通道：连续多次被拒的解如果彼此一致，说明是我们锁错了地方而不是它在跳。
@@ -883,13 +1018,44 @@ class MapNode(Node):
             self._reloc_gate_streak = [cur]
         self._reloc_rejects += 1
         if len(self._reloc_gate_streak) >= self.reloc_gate_streak_n:
+            # streak 内里程计走过的路。首尾直线距离会低估绕行，但作为「有没有新证据」的
+            # 下限够用，而且不需要额外缓存。
+            odom_travel = float(np.linalg.norm(
+                self._reloc_gate_streak[-1][1] - self._reloc_gate_streak[0][1]))
+            spread_m = (self.relocalization_pose_quality.get(ts) or (0.0, 0.0))[0]
+            veto = None
+            # 🔴 只有【已被第二个解印证过】的锁才值得要求「新证据」。若当前锁还是那个孤立的
+            # 引导解，要求里程计先走 1 m 就是死锁：地图帧错了 → 车拿不到目标 → 不动 →
+            # 里程计永远 0.00 m → 一致的正确解永远换不上来。2026-09-03 15:12 实测就是
+            # 这一幕：3 次「odom only moved 0.18/0.00/0.15m」，80 秒后只能人去重启 nav。
+            corroborated = self._reloc_accepted_n >= 2
+            if corroborated and odom_travel < self.relock_min_odom_m:
+                veto = (f"odom only moved {odom_travel:.2f}m "
+                        f"(need {self.relock_min_odom_m:.2f}m)")
+            elif self._last_clean_frac > self.relock_max_clean_frac:
+                veto = (f"current frame still has {self._last_clean_frac:.0%} clean "
+                        f"constraints (need <={self.relock_max_clean_frac:.0%})")
+            elif spread_m > self.relock_max_spread_m:
+                veto = (f"candidates are {spread_m:.2f}m apart "
+                        f"(need <={self.relock_max_spread_m:.2f}m)")
+            if veto is not None:
+                self.get_logger().warning(
+                    f"reloc gate: {len(self._reloc_gate_streak)} rejects agree on "
+                    f"[{cur[0][0]:+.2f},{cur[0][1]:+.2f}] but NOT re-locking -- {veto}")
+                self._reloc_gate_streak = []
+                self.relocalization_poses.pop(ts, None)
+                self.relocalization_pose_weights.pop(ts, None)
+                self.relocalization_pose_quality.pop(ts, None)
+                return False
             keep = (self.relocalization_poses[ts],
                     self.relocalization_pose_weights.get(ts),
                     self.relocalization_pose_quality.get(ts))
             self.get_logger().warning(
                 f"reloc gate: {len(self._reloc_gate_streak)} consecutive rejects agree on "
                 f"[{cur[0][0]:+.2f},{cur[0][1]:+.2f}] -- re-locking there and dropping "
-                f"{len(self.relocalization_poses)} constraints")
+                f"{len(self.relocalization_poses)} constraints "
+                f"(odom moved {odom_travel:.2f}m, clean {self._last_clean_frac:.0%}, "
+                f"cand_spread {spread_m:.2f}m)")
             self.relocalization_poses.clear()
             self.relocalization_pose_weights.clear()
             self.relocalization_pose_quality.clear()
@@ -902,6 +1068,7 @@ class MapNode(Node):
                 self.relocalization_pose_quality[ts] = keep[2]
             self._reloc_gate_streak = []
             self._last_accepted_reloc = cur
+            self._reloc_accepted_n = 2   # 重锁已被 streak 印证
             return True
 
         self.get_logger().warning(
@@ -1150,6 +1317,15 @@ class MapNode(Node):
     # fired. There is no z condition: this robot drives on one floor, and a second
     # condition that always passes is a trap waiting for the day it does not.
     POI_ARRIVAL_RADIUS_XY_M = 0.4
+    # 到达判定的跳变守卫。地图位姿 = map->odom x 里程计，任何一端出问题都会让它瞬移，
+    # 而瞬移落进 0.4 m 半径里就等于「导航结束」—— 单帧一个坏位姿就能终结一条腿。
+    # 2026-09-01 实测：固件 VIO 跟丢后内部重启（进程不重启，我们这边毫无察觉），原点
+    # 归零，地图位姿 3.08 s 挪了 2.85 m = 0.92 m/s（是 max_vx 0.25 的 3.7 倍），
+    # 正好落到离 POI 0.341 m，立刻宣布到达，而车其实还在 2.75 m 外。
+    # 门限 = max_vx x dt + 重定位本身允许的跳幅。后者取 1.2 m 不是拍的：那是量出来的
+    # 重定位解间距上限，压到 0.3 m 会误拒 37.7% 的正常解。
+    ARRIVAL_MAX_VX_MPS = 0.25
+    ARRIVAL_RELOC_SLACK_M = 1.2
 
     def _publish_poi_status(self, pose_in_map_position: np.ndarray, advanced: int) -> None:
         total = len(self.pois)
@@ -1635,6 +1811,14 @@ class MapNode(Node):
         fwd = np.asarray(T)[:3, :3] @ np.array([0.0, 0.0, 1.0])
         return math.degrees(math.atan2(float(fwd[1]), float(fwd[0])))
 
+    @staticmethod
+    def _transform_yaw_deg(T):
+        """绕世界 z 的旋转角。⚠️ 不能拿 _ground_yaw_deg 量【变换矩阵】—— 它读的是第三列，
+        对近似纯偏航的变换那一列就是 [0,0,1]，atan2 出来是倾角轴的方位角即纯噪声。
+        实测因此把 map->odom 的朝向报成 ±180 度乱跳，而真实值稳定在 -15 度附近。"""
+        R = np.asarray(T)[:3, :3]
+        return math.degrees(math.atan2(float(R[1, 0]), float(R[0, 0])))
+
     def compute_transform_from_map_to_odom(self):
         """
         Solve the optmization problem.
@@ -1646,6 +1830,7 @@ class MapNode(Node):
         }
         constant_pose_index_dict = { 1: True }
         used_timestamps = []
+        newest_ns = max(self.relocalization_poses) if self.relocalization_poses else 0
         for timestamp, pose in self.relocalization_poses.items():
             if timestamp in self.pose_graph_used_pose:
                 used_timestamps.append(timestamp)
@@ -1653,11 +1838,23 @@ class MapNode(Node):
                 camera_in_odom_world = self.pose_graph_used_pose[timestamp]
                 observation_T_from_map_to_odom =  camera_in_odom_world @ se3_inv(camera_in_map_world)
                 weight = self.relocalization_pose_weights[timestamp]
+                if self.map_odom_half_life_s > 0.0:
+                    age_s = (newest_ns - timestamp) / 1e9
+                    weight *= 0.5 ** (age_s / self.map_odom_half_life_s)
 
                 relative_pose_constraint.append((0, 1, observation_T_from_map_to_odom, weight * np.array([10.0, 10.0, 10.0]), weight * np.array([10.0, 10.0, 10.0])))
         relative_pose_constraint = relative_pose_constraint[-100:]
         optimized_parameters = pose_graph_solve(optimized_parameters, relative_pose_constraint, constant_pose_index_dict, max_iteration_num = 1000)
-        self.T_from_map_to_odom = optimized_parameters[0]
+        T_new = optimized_parameters[0]
+        tilt_deg = math.degrees(math.acos(max(-1.0, min(1.0, float(T_new[2, 2])))))
+        if (self.map_odom_max_tilt_deg > 0.0 and tilt_deg > self.map_odom_max_tilt_deg
+                and self.T_from_map_to_odom is not None):
+            self.get_logger().warning(
+                f"map->odom fit rejected on tilt: {tilt_deg:.1f}deg > "
+                f"{self.map_odom_max_tilt_deg:.1f}deg with {len(relative_pose_constraint)} "
+                f"constraints -- keeping the previous transform")
+            return
+        self.T_from_map_to_odom = T_new
 
         # 这条是位姿跳变的直接证据：跳的是 T，不是位姿，而 T 只在这里变。附上约束成分是
         # 因为解由成分决定 —— 只按时间取最近 100 条、又没有鲁棒核，陈旧低质约束占多数时
@@ -1692,32 +1889,110 @@ class MapNode(Node):
             te_s, re_s = _resid(T)
             te_c, re_c = _resid(T_cf)
             gap = float(np.linalg.norm(T[:3, 3] - T_cf[:3, 3]))
+            # 🔑 判「解有没有跟上现在这一片」只能看【最近几条】的残差：全体中位被 150 s 的
+            # 历史稀释掉。09-02 那段要手动重开的运行，全体 p50 只有 5.8 度而最近 5 条是 123 度。
+            k = min(5, len(te_s))
             self.get_logger().info(
                 f"map->odom fit: solver resid t_p50={np.median(te_s):.2f}m "
-                f"r_p50={np.median(re_s):.1f}deg | closed-form resid t_p50={np.median(te_c):.2f}m "
+                f"r_p50={np.median(re_s):.1f}deg | recent{k} resid "
+                f"t={np.median(te_s[-k:]):.2f}m r={np.median(re_s[-k:]):.1f}deg | "
+                f"closed-form resid t_p50={np.median(te_c):.2f}m "
                 f"r_p50={np.median(re_c):.1f}deg | gap={gap:.2f}m "
-                f"cf_yaw={self._ground_yaw_deg(T_cf):+.1f}deg"
+                f"cf_yaw={self._transform_yaw_deg(T_cf):+.1f}deg"
             )
         prev = self._last_T_map_to_odom_logged
         d_t = float(np.linalg.norm(T[:3, 3] - prev[:3, 3])) if prev is not None else 0.0
-        d_yaw = (self._ground_yaw_deg(T) - self._ground_yaw_deg(prev)) if prev is not None else 0.0
+        d_yaw = (self._transform_yaw_deg(T) - self._transform_yaw_deg(prev)) if prev is not None else 0.0
         d_yaw = (d_yaw + 180.0) % 360.0 - 180.0
         self._last_T_map_to_odom_logged = T.copy()
         used = [self.relocalization_pose_quality.get(ts) for ts in used_timestamps[-100:]]
         used = [q for q in used if q is not None]
         clean = sum(1 for sp, r in used if sp <= 0.5 and r >= 0.70)   # sp 现在是米
+        self._last_clean_frac = (clean / len(used)) if used else 0.0
         spans = sorted(sp for sp, _ in used) or [0.0]
         ratios = sorted(r for _, r in used) or [0.0]
         self.get_logger().info(
             f"map->odom: t=[{T[0,3]:+.2f},{T[1,3]:+.2f},{T[2,3]:+.2f}] "
-            f"yaw={self._ground_yaw_deg(T):+.1f}deg "
+            f"yaw={self._transform_yaw_deg(T):+.1f}deg "
             f"tilt={math.degrees(math.acos(max(-1.0, min(1.0, float(T[2,2]))))):.1f}deg "
             f"d_t={d_t:.3f}m d_yaw={d_yaw:+.1f}deg "
             f"constraints={len(relative_pose_constraint)} clean={clean}/{len(used)} "
             f"spread_p50={spans[len(spans)//2]:.2f}m ratio_p50={ratios[len(ratios)//2]:.2f}"
         )
 
-    def try_publish_nav_path(self, timestamp: int):
+    def _nav_replan_reason(self, pose_in_map_position):
+        """要不要重搜全局路线。None = 用缓存。
+
+        三个触发条件来自上游 #178：没有缓存 / POI 换了 / 偏离缓存路线超过门限。
+        搜索本身只要 10 ms，贵的是它上下游那 70 ms 的发布和日志 —— 但缓存住搜索之后
+        每一拍仍然会重选前视点、重判到达，这才是 2 Hz 要买的东西。"""
+        if self.cached_nav_path_in_map is None or len(self.cached_nav_path_in_map) < 2:
+            return "no cached path"
+        if self.cached_nav_path_poi_index != self.poi_index:
+            return f"poi changed {self.cached_nav_path_poi_index} -> {self.poi_index}"
+        pts = np.asarray(self.cached_nav_path_in_map, dtype=float)[:, :2]
+        dev = float(np.min(np.linalg.norm(pts - np.asarray(pose_in_map_position)[:2], axis=1)))
+        if dev > self.nav_replan_deviation_m:
+            return f"deviated {dev:.2f}m from cached path (limit {self.nav_replan_deviation_m:.2f}m)"
+        if self.nav_stall_timeout_s > 0.0:
+            stalled = self._nav_stall_reason(pose_in_map_position, pts)
+            if stalled is not None:
+                return stalled
+        return None
+
+    def _nav_stall_reason(self, pose_in_map_position, path_xy):
+        """沿缓存路线的剩余长度在 nav_stall_timeout_s 内没缩短超过 eps 就算卡住。
+
+        用「剩余弧长」而不是「走了多远」：车在障碍前左右摆头时位移不小，但沿路线的进展是 0。
+        monotonic 不用 time.time()：板上没有 RTC，对时会让墙钟跳约 344 天。"""
+        i = int(np.argmin(np.linalg.norm(path_xy - np.asarray(pose_in_map_position)[:2], axis=1)))
+        seg = path_xy[i:]
+        remaining = (float(np.sum(np.linalg.norm(np.diff(seg, axis=0), axis=1)))
+                     if len(seg) > 1 else 0.0)
+        now = time.monotonic()
+        if (self._nav_stall_best_remaining is None
+                or remaining < self._nav_stall_best_remaining - self.nav_stall_progress_eps_m):
+            self._nav_stall_best_remaining = remaining
+            self._nav_stall_since = now
+            return None
+        if self._nav_stall_since is None:
+            self._nav_stall_since = now
+            return None
+        held = now - self._nav_stall_since
+        if held < self.nav_stall_timeout_s:
+            return None
+        self._nav_stall_best_remaining = None
+        self._nav_stall_since = None
+        return (f"no progress for {held:.1f}s: {remaining:.2f}m still remaining along the "
+                f"cached route while only {self.nav_replan_deviation_m:.2f}m off it")
+
+    def nav_target_timer_callback(self):
+        """按固定周期用【最新】里程计更新目标，而不是等下一个关键帧。
+
+        ⚠️ 位姿源订错话题会让这里静默地什么都不做（箭头不出现、POI 不动，零日志）。
+        所以：拿不到最新位姿就退回关键帧那份（等于改动前的行为），并且把原因喊出来。"""
+        pose, ts = self.latest_odom_pose, self.latest_odom_ns
+        if pose is None:
+            if self.pose_graph_used_pose:
+                ts = max(self.pose_graph_used_pose)
+                pose = self.pose_graph_used_pose[ts]
+                self.get_logger().warning(
+                    f"nav target: no pose on {self.nav_odom_topic} yet -- falling back to "
+                    f"the newest keyframe pose. Check `ros2 topic info {self.nav_odom_topic}` "
+                    f"for Publisher count = 0.", throttle_duration_sec=5.0)
+            else:
+                return
+        try:
+            self.try_publish_nav_path(ts, odom_pose=pose)
+        except Exception:
+            # 🔴 rclpy 的定时器回调抛异常会把整个节点带走。上面那个 KeyError 就是这么
+            # 让导航静默停摆的 —— UI 上只看到"箭头没了"，真正的原因躺在日志最后 6 行。
+            # 周期性回调宁可漏一拍也不能死；异常必须喊出来但要节流，否则 2 Hz 刷屏。
+            self.get_logger().error(
+                "nav target tick failed: " + traceback.format_exc(),
+                throttle_duration_sec=5.0)
+
+    def try_publish_nav_path(self, timestamp: int, odom_pose=None):
         t_start = time.perf_counter()
         stage_timings = {}
 
@@ -1740,34 +2015,54 @@ class MapNode(Node):
                 self.get_logger().info(msg)
 
         t_stage = t_start
-        self.get_logger().info(f"try_publish_nav_path, timestamp: {timestamp}")
+        self.get_logger().debug(f"try_publish_nav_path, timestamp: {timestamp}")
         t_stage = mark_stage("start_log", t_stage)
         if self.T_from_map_to_odom is None:
-            self.get_logger().info("Relocalization not successful yet, skip publishing nav path")
+            self.get_logger().info("Relocalization not successful yet, skip publishing nav path", throttle_duration_sec=2.0)
             log_nav_timing("skip_no_relocalization")
             return
 
-        pose_in_map = se3_inv(self.T_from_map_to_odom) @ self.pose_graph_used_pose[timestamp]
+        # 定时器传最新里程计；不传就退回关键帧那份（预热和离线工具还走这条）。
+        pose_in_odom = (odom_pose if odom_pose is not None
+                        else self.pose_graph_used_pose.get(timestamp))
+        if pose_in_odom is None:
+            log_nav_timing("skip_no_odom_pose")
+            return
+        pose_in_map = se3_inv(self.T_from_map_to_odom) @ pose_in_odom
         self.current_pose_in_map_pub.publish(np2msg(pose_in_map, self.get_clock().now().to_msg(), "world", "map"))
         pose_in_map_position = pose_in_map[:3, 3]
         t_stage = mark_stage("pose_in_map_publish", t_stage)
 
         if self.poi_index == -1:
-            self.get_logger().info("No POI found, skip publishing nav path")
+            self.get_logger().info("No POI found, skip publishing nav path", throttle_duration_sec=2.0)
             log_nav_timing("skip_no_poi")
             return
 
         if self.poi_index >= len(self.pois):
-            self.get_logger().info("All POIs have been visited, skip publishing nav path")
+            self.get_logger().info("All POIs have been visited, skip publishing nav path", throttle_duration_sec=2.0)
             log_nav_timing("skip_all_pois_visited")
             return
 
         poi = self.pois[self.poi_index]
-        print(f"poi: {poi}")
         poi_pose = np.eye(4)
         poi_pose[:3, 3] = poi
         self.poi_pub.publish(np2msg(poi_pose, self.get_clock().now().to_msg(), "world", "map"))
         t_stage = mark_stage("poi_publish", t_stage)
+
+        # 这一帧的地图位姿是不是瞬移过来的（见 ARRIVAL_MAX_VX_MPS）。只用来否决"到达"，
+        # 不影响路径规划 —— 位姿本身可能只是被重定位修正了，那是正常的。
+        teleported = False
+        prev = getattr(self, '_arrival_prev', None)
+        if prev is not None:
+            dt = max((timestamp - prev[0]) / 1e9, 1e-3)
+            moved = float(np.linalg.norm(pose_in_map_position[:2] - prev[1][:2]))
+            budget = self.ARRIVAL_MAX_VX_MPS * dt + self.ARRIVAL_RELOC_SLACK_M
+            if moved > budget:
+                teleported = True
+                self.get_logger().warning(
+                    f"地图位姿瞬移 {moved:.2f}m/{dt:.2f}s ({moved/dt:.2f} m/s，上限 "
+                    f"{budget:.2f}m) —— 本帧不判到达。位姿源可能刚重置")
+        self._arrival_prev = (timestamp, np.array(pose_in_map_position, dtype=float))
 
         advanced_poi_count = 0
         while self.poi_index < len(self.pois):
@@ -1784,7 +2079,7 @@ class MapNode(Node):
                 f"poi_map=[{poi[0]:.2f},{poi[1]:.2f}]",
                 throttle_duration_sec=1.0,
             )
-            if diff_position_norm_xy < self.POI_ARRIVAL_RADIUS_XY_M:
+            if diff_position_norm_xy < self.POI_ARRIVAL_RADIUS_XY_M and not teleported:
                 # Emit the 100% frame *before* advancing the index, otherwise the UI's
                 # last observed progress for this POI is whatever partial value the
                 # previous keyframe happened to publish, and the bar never fills.
@@ -1821,14 +2116,24 @@ class MapNode(Node):
             if not self._nav_completed:
                 self._nav_completed = True
                 self.nav_done_pub.publish(Bool(data=True))
-            self.get_logger().info("All POIs have been visited, skip publishing nav path")
+            self.get_logger().info("All POIs have been visited, skip publishing nav path", throttle_duration_sec=2.0)
             log_nav_timing(f"skip_all_pois_visited_after_advance:{advanced_poi_count}")
             return
 
         target_poi = self.pois[self.poi_index]
-        with Timer(name = "generate nav path in map", text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=self.timer_logger):
-            paths_in_map = self.generate_nav_path_in_map(pose_in_map = pose_in_map, target_poi = target_poi)
-        t_stage = mark_stage("generate_path", t_stage)
+        replan_reason = self._nav_replan_reason(pose_in_map_position)
+        if replan_reason is None:
+            paths_in_map = self.cached_nav_path_in_map
+            t_stage = mark_stage("generate_path_cached", t_stage)
+        else:
+            with Timer(name = "generate nav path in map", text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=self.timer_logger):
+                paths_in_map = self.generate_nav_path_in_map(pose_in_map = pose_in_map, target_poi = target_poi)
+            self.cached_nav_path_in_map = paths_in_map
+            self.cached_nav_path_poi_index = self.poi_index
+            self._nav_stall_best_remaining = None
+            self._nav_stall_since = None
+            self.get_logger().info(f"nav replan: {replan_reason}")
+            t_stage = mark_stage("generate_path", t_stage)
 
         if paths_in_map is not None:
             # xy only: the map's path points span 0.4 m in z, which inflated both the
@@ -1877,19 +2182,39 @@ class MapNode(Node):
                 path_arr_xy = np.asarray(paths_in_map, dtype=float)[:, :2]
                 robot_xy = np.asarray(pose_in_map_position[:2], dtype=float)
                 radial = np.linalg.norm(path_arr_xy - robot_xy, axis=1)
-                beyond = np.flatnonzero(radial >= lookahead_m)
-                # Earliest qualifying point, not the nearest one: order along the path is
-                # what makes this follow the route rather than cut to whatever end is
-                # closest. Nothing qualifies only when the whole path is inside the
-                # radius, and then the far end is the best available aim point.
-                chosen_index = int(beyond[0]) if len(beyond) else len(paths_in_map) - 1
+                # 🔴 从【离车最近的那个点】往后扫，不是从路径头扫。
+                # 原来是 `beyond = flatnonzero(radial >= lookahead)` 取 beyond[0]，即整条
+                # 路径上【最早】的合格点。这在"每拍都重新搜路径"时无害（路径头就在车脚下、
+                # 永远不合格），但 2026-09-03 我为了让 2 Hz 扛得住而加了路径缓存之后就致命了：
+                # 车沿缓存路径走过 lookahead(2.0 m) 之后，【路径自己的起点】就满足
+                # radial >= 2.0，于是 beyond[0] = 0，目标瞬间跳回 45 秒前的出发点、
+                # 落在车【后方】2.2~3.0 m。实测车因此在原地蹭了 40 秒直到人取消
+                # （t=45.2 塌陷，与"车离路径头 2.24 m"这一刻精确吻合）。
+                # 保留原注释的意图：合格点仍按【路径顺序】取最早的一个，所以折叠段还是会
+                # 被走过而不是被抄近道 —— 只是起点从 0 换成了最近点。
+                start_i = int(np.argmin(radial))
+                # 单调推进：同一条缓存路径内，目标不许沿路径往回退。
+                if self._pursuit_path_sig == id(paths_in_map):
+                    start_i = max(start_i, self._pursuit_index)
+                else:
+                    self._pursuit_path_sig = id(paths_in_map)
+                self._pursuit_index = start_i
+                beyond = np.flatnonzero(radial[start_i:] >= lookahead_m)
+                chosen_index = (int(start_i + beyond[0]) if len(beyond)
+                                else len(paths_in_map) - 1)
                 target_position = paths_in_map[chosen_index]
                 accumulated_distance = float(np.sum(np.linalg.norm(
                     np.diff(path_arr_xy[:chosen_index + 1], axis=0), axis=1
                 ))) if chosen_index > 0 else 0.0
                 target_position_in_map = np.array([target_position[0], target_position[1], target_position[2]])
-                pose_in_origin_odom = self.odom[timestamp]
-                T = pose_in_origin_odom @ se3_inv(pose_in_map)
+                # 🔴 原来是 self.odom[timestamp]，而 self.odom 只有【关键帧】的键 ——
+                # nav 定时器传的是里程计消息的时间戳，于是 KeyError 把整个节点打死
+                # （2026-09-03 16:13 实测：第一次 nav target 发出去 0.1 s 后节点就没了，
+                # 箭头闪一下就停、POI 不走，而 planning 抱着过期目标又跑了 64 秒）。
+                # 用产出 pose_in_map 的那个位姿本身，天然自洽。写入点 891/892、1104/1105、
+                # 1111/1112 三处都是把【同一个】 odom 同时写进 self.odom 和
+                # pose_graph_used_pose，所以关键帧那条路上这两种写法逐位相同。
+                T = pose_in_odom @ se3_inv(pose_in_map)
                 target_position_in_odom = T[:3, :3] @ target_position_in_map + T[:3, 3]
                 dummy_pose = np.eye(4)
                 dummy_pose[:3, 3] = target_position_in_odom

@@ -163,18 +163,24 @@ do_start() {
     export TINYNAV_PUBLISH_PLANNING_OVERLAYS="${TINYNAV_PUBLISH_PLANNING_OVERLAYS:-1}"
     export TINYNAV_VERBOSE_TIMER="${TINYNAV_VERBOSE_TIMER:-0}"
     # 障碍感知。step 5 而不是 10：前方 1~3 m 的占据格单帧召回 42~56% -> 68~72%
-    # (2026-08-26 板上实测)，代价 4.3 -> 14.0 ms。膨胀 0：膨胀每格要付 0.1 m/侧的过道
-    # 净宽，而窄过道正好最缺这 0.2 m，填洞交给 step。span 留 0.2：0.1 在实测的一帧里
-    # 多出的格子分不清是地面还是椅子腿，矮障碍这件事交给下面按离地高度判的那一路。
+    # (2026-08-26 板上实测)，代价 4.3 -> 14.0 ms。
     export TINYNAV_RAYCAST_STEP="${TINYNAV_RAYCAST_STEP:-5}"
-    export TINYNAV_MIN_WALL_SPAN_M="${TINYNAV_MIN_WALL_SPAN_M:-0.2}"
-    export TINYNAV_DILATION_CELLS="${TINYNAV_DILATION_CELLS:-0}"
-    # 矮障碍：办公椅星形底盘那类 4~8 cm 的东西在 0.1 m 体素里和地面同层，z 跨度恒为 0，
-    # 所以走一条按离地高度判的独立通路。量程 1.5 m 是量出来的（2 m 外拟合地面自己抬 4.5 cm）。
-    export TINYNAV_LOW_OBS="${TINYNAV_LOW_OBS:-1}"
-    export TINYNAV_LOW_OBS_H_LO="${TINYNAV_LOW_OBS_H_LO:-0.05}"
-    export TINYNAV_LOW_OBS_RANGE_M="${TINYNAV_LOW_OBS_RANGE_M:-1.5}"
-    export TINYNAV_LOW_OBS_MIN_PTS="${TINYNAV_LOW_OBS_MIN_PTS:-2}"
+    # 🔴 span 和 dilation 这里【不给默认值】，交给 robot_config 的平台配置。
+    # 它们的物理含义是"多少层"而不是"多少米"：build_obstacle_map 里
+    # z_span = (occ_high - occ_low) * resolution，所以栅格分辨率一改，米数就必须跟着改。
+    # 这里原来写死 0.2（0.1 m 栅格时代的值），分辨率降到 0.05 后它把"要 3 层"悄悄变成
+    # "要 5 层"，实测扔掉 52% 的墙格子（69 -> 33），车因此对障碍不敏感、8 次压进车体
+    # 半径以内（2026-09-01）。留成纯 A/B 开关：外面设了才导出。
+    [ -n "${TINYNAV_MIN_WALL_SPAN_M:-}" ] && export TINYNAV_MIN_WALL_SPAN_M
+    [ -n "${TINYNAV_DILATION_CELLS:-}" ] && export TINYNAV_DILATION_CELLS
+    # 矮障碍层已默认关（2026-09-02）：0.05 m 栅格下 z 跨度单独就够，而它在板上贡献
+    # 185/243 个障碍格全是噪声。⚠️ 这里**不能**写 `${TINYNAV_LOW_OBS:-0}` —— 那个写法
+    # 会把环境里残留的 1 原样留下（这次就这么翻的：重启前 uvicorn 的环境里已经有 1），
+    # 于是代码里的默认值永远轮不到。和上面两个耦合参数一样：外面设了才导出。
+    [ -n "${TINYNAV_LOW_OBS:-}" ] && export TINYNAV_LOW_OBS
+    [ -n "${TINYNAV_LOW_OBS_H_LO:-}" ] && export TINYNAV_LOW_OBS_H_LO
+    [ -n "${TINYNAV_LOW_OBS_RANGE_M:-}" ] && export TINYNAV_LOW_OBS_RANGE_M
+    [ -n "${TINYNAV_LOW_OBS_MIN_PTS:-}" ] && export TINYNAV_LOW_OBS_MIN_PTS
     export TINYNAV_CAMERA_HEIGHT_M="${TINYNAV_CAMERA_HEIGHT_M:-0.18}"
 
     # 检索方案。vlad = VLAD over BPU SuperPoint（默认），bow = DBoW3 over ORB。
@@ -210,7 +216,7 @@ do_start() {
         echo "⚠️ 地图必须用同一个 retrieval 建，换了就得重建"
         echo "map build     : rate=${TINYNAV_MAP_PLAY_RATE} queue=${TINYNAV_MAP_SYNC_QUEUE} vis=${TINYNAV_MAP_VISUALIZATION} videos=${TINYNAV_MAP_SAVE_VIDEOS} db_sync=${TINYNAV_DB_SYNC_EVERY}"
         echo "diagnostics   : planning_overlays=${TINYNAV_PUBLISH_PLANNING_OVERLAYS} verbose_timer=${TINYNAV_VERBOSE_TIMER}"
-        echo "obstacle      : step=${TINYNAV_RAYCAST_STEP} span=${TINYNAV_MIN_WALL_SPAN_M} dilation=${TINYNAV_DILATION_CELLS} low_obs=${TINYNAV_LOW_OBS} (h>=${TINYNAV_LOW_OBS_H_LO}m <${TINYNAV_LOW_OBS_RANGE_M}m)"
+        echo "obstacle      : step=${TINYNAV_RAYCAST_STEP} span=${TINYNAV_MIN_WALL_SPAN_M:-<平台配置>} dilation=${TINYNAV_DILATION_CELLS:-<平台配置>} low_obs=${TINYNAV_LOW_OBS:-<代码默认 0>} (h>=${TINYNAV_LOW_OBS_H_LO:-0.05}m <${TINYNAV_LOW_OBS_RANGE_M:-1.5}m)"
         echo "=============================================================="
     } >> "${LOGFILE}"
 

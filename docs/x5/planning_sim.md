@@ -103,3 +103,127 @@ python3 tool/simulator/scenarios.py wall_ahead   # 只跑一个
 场景之间的用时和路程就不可比了。`load-scene` 带 `freeze: true`，等它发出第一条非退化
 轨迹之后再 `POST /api/freeze {"frozen": false}` 放行。加上冻结之后 `doorway_turn`
 从「通过」变成「141 次变向、到不了」—— 之前是预热期间蒙过去的。
+
+---
+
+# 2026-09-02 更新：两个自己的坑 + 判别力的上限
+
+## 1. 🔴 三个可视化订阅是 RELIABLE，和发布端不兼容
+
+`planning_node` 的可视化话题在 2026-09-02 全改成 `_viz_qos` = **BEST_EFFORT**
+（为了不让跟不上的 web 后端把规划环阻塞住）。而 `ros_planning_web.py` 里
+
+```python
+self.create_subscription(PointCloud,   "/planning/footprint",      ..., 10)   # 默认 RELIABLE
+self.create_subscription(OccupancyGrid,"/planning/obstacle_mask",  ..., 10)
+self.create_subscription(OccupancyGrid,"/planning/occupancy_grid", ..., 10)
+```
+
+**BEST_EFFORT 发布 + RELIABLE 订阅 = QoS 不兼容、零投递、完全静默。**
+判据：`ros2 topic info -v <话题>` 直接打印两端的 Reliability。已全部改成 BEST_EFFORT。
+
+⚠️ **收回一个过度归因**：我一开始说"这把碰撞判据弄瞎了"（footprint 空 →
+`clearance_to_objects` 返回 inf → 最小净空打成 `nan`、压进障碍恒 0）。那次探测是在
+`freeze: True` **没解冻**的仿真上做的，冻着本来就没有新深度、planning 也不发 footprint。
+修之前那套场景其实是给出了有限净空的。**QoS 该改，但别拿它解释别的现象。**
+
+🔑 顺带：改 QoS 的影响面**不止 UI**。`tool/` 和 `tests/` 里订阅同样话题的离线工具会静默
+失效，而它们不像界面那样"一看就知道黑了"。同一天在 `tool/x5_board/obstacle_band_probe.py`
+也查出一个显式写死 `ReliabilityPolicy.RELIABLE` 的（收不到任何东西），已修。
+**改 QoS 之后要 `grep -rn create_subscription` 整个仓库。**
+
+## 2. 判据写死了「倒车关」
+
+```python
+# 旧：倒车默认关，所以任何真正的倒车指令都是问题
+ok = ok and len(revs) == 0
+```
+
+`TINYNAV_ALLOW_REVERSE=1` 之后，任何用到倒车的场景都会**按判据自己的定义**失败 ——
+`doorway_turn` 就是这么"挂"的（到达 69.9 s、净空 1.038 m、压进 0，唯一的失败原因是
+发过倒车指令）。已改成按环境变量分流：
+
+```python
+if os.environ.get("TINYNAV_ALLOW_REVERSE", "0") != "1":
+    ok = ok and len(revs) == 0        # 关着时任何倒车都是问题
+# 开着时倒车是脱困手段，判据只看有没有压进障碍
+```
+
+汇总行也多打一列**倒车次数** —— 原来 `reverse_cmds` 算了但没打，所以「这个场景到底用了
+几次倒车」看不见。
+
+## 3. 🔴 判别力的上限：`dead_end` 在抛硬币
+
+同一个场景、同一份代码，五次运行：
+
+| 配置 | 变向 | 倒车 | 结果 |
+|---|---|---|---|
+| FIFO + 倒车关 | 19 | 0 | FAIL |
+| FIFO + 倒车开 | **4** | **1** | OK |
+| 取最新 + 倒车开 第1遍 | 6 | 0 | FAIL |
+| 取最新 + 倒车开 第2遍 | 18 | 0 | FAIL |
+| 取最新 + 倒车开 单跑 | 19 | 1 | FAIL |
+
+原因：`_should_retreat` 要 `front_blocked AND (escape_clear < 门限 OR escape_age > 门限)`，
+而 `dead_end` 里车离前墙 0.55 m、两侧墙 ±0.7 m，**还转得开**，第二个条件成不成立全看
+障碍图那一刻的状态。
+
+🔑 **所以在这个场景上仿真的判别力就是 ±1 —— 拿它判任何改动都会得到噪声。**
+真车楔住是 `fwd_ok=0/90` 连续 16 秒（几何完全不同、条件硬得多），
+所以这个抛硬币**不能**推断真车行为；真车那次已单独验过倒车会触发。
+
+## 4. 由此得到的使用纪律
+
+- **单次运行不能定罪。** 有一次「取最新」跑出 `open_run 42.2 s`（基线 10.7 s）、
+  `corridor 只走 0.21 m`，第二遍和单跑全部正常 —— **不可复现**。
+- **要 A/B 就跑两遍，而且比 8 个稳定场景，不比 `dead_end`。**
+  「取最新」两遍下来那 8 个和基线逐位相同（10.8/10.8/10.8/9.5/9.6/未到/12.5/8.9 s）。
+- **不要同时开两个仿真服务** —— 会撞 8766 端口，两边结果都废。
+- 起服务后**等到日志出现 `traj published` 再跑场景**，否则第一个场景在预热期里跑。
+
+---
+
+## 2026-09-03：新增三个「全局路线自己穿过障碍」的场景
+
+旧的 9 个场景的 `route` **全部是正确的**（已经绕开障碍），所以它们一个都覆盖不到板上
+占 46% 的那一类失效。新增的三个把路线故意画穿障碍，起点也刻意给偏 + 给转角
+（正对着能一条直线开过去的起点测不出转向期间的判据）：
+
+| 场景 | 起点 / 偏航 | 考什么 |
+|---|---|---|
+| `route_thru_wall` | (−0.4,−0.5) / +40° | 路中间后来放了一堵墙，路线直穿它 |
+| `route_grazes_leg` | (−0.5,+0.7) / −50° | 路线擦着椅腿（`route_clear`≈0.10），让 5~10 cm 就能过 —— 板上占比最大的一档 |
+| `route_thru_blocked_door` | (−0.3,−0.2) / +25° | ⚠️ 预期难，是解钉的**上限探针**：进展项仍指着被堵死的那扇门 |
+
+顺带修了 `scene_catalog()` 对没写 `title` 的场景会 `KeyError`（`corridor` 就没写，
+web 下拉框一直是坏的）。
+
+⚠️ **仿真和板上不是同一套速度**：仿真 `vx<=0.25 yaw<=0.6`，板上 `vx<=0.40`。
+轨迹长度差 1.6 倍，直接影响代价项之间的相对权重，**跨平台比数字之前先核这一行启动日志**。
+
+### main 上的仿真更新（`#240`，2026-09-03 合入）
+
+main 走的是另一条路线：`tool/simulator/offline_planning_web/`（浏览器里选场景）+
+重写过的 `ros_planning_web.py`，并且**删掉了 `scenarios.py` 和 `x5_presets.py`**
+（那两个是 x5 独有的无头跑法）。两套架构不同，**没有直接可拉的东西** ——
+要么保留无头这套（回归判据能进 CI），要么整体换成 web 那套。暂不动。
+
+## 🔴 仿真的深度没有噪声 —— 有一类参数它结构上调不了（2026-09-04）
+
+`tool/simulator/planning_scene.py` / `map_volume.py` 里搜 `noise|random|jitter|sigma`
+**零命中**：渲染出来的深度是几何精确的。
+
+于是**任何"取决于噪声落在量化边界哪一侧"的参数，在仿真里都没有区分力，而且会给出相反的
+结论**。已经踩到的一次：
+
+| `TINYNAV_GRID_OFFSET_Z` | 启动日志的门限 | 仿真 `chair_leg_low_head_on`（65 mm 腿） | 真实数据 `scene_chair.npz` 5~10 cm 格 |
+|---|---|---|---|
+| 0.15 | 50 mm | 绕开（净空 +35 mm） | 8 格 @ 0.68 m |
+| 0.1625 | 63 mm | **压上去**（−20 mm） | **27 格 @ 0.53 m** |
+
+两边**方向完全相反**。真实数据那组才算数 —— 板上地面单帧在 5×5 cm 格内的高度跨度实测
+max 89 mm，而仿真是 0。
+
+**判据：凡是和"地面噪声 vs 体素层边界"有关的参数（z 波段下界、跨度门限、grid_offset_z），
+一律用 `tool/x5_board/replay_obstacle_map.py` + `data/obstacle_scenes/*.npz` 扫，不要用仿真。**
+仿真管的是规划行为（绕不绕、摆不摆头、到不到）。

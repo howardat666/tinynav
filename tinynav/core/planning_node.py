@@ -17,7 +17,7 @@ import numpy as np
 from scipy.ndimage import distance_transform_edt, binary_dilation
 from dataclasses import dataclass
 import message_filters
-from rclpy.qos import DurabilityPolicy, QoSProfile
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
 from rclpy.duration import Duration
 from sensor_msgs.msg import PointCloud2, PointCloud
@@ -26,7 +26,9 @@ import sensor_msgs_py.point_cloud2 as pc2
 from std_msgs.msg import Bool, Header, String
 from codetiming import Timer
 import cv2
+from tinynav.core.lat_stats import LatStats
 from tinynav.core.math_utils import quat_to_matrix, matrix_to_quat, pose_msg2np, rotvec_to_matrix
+from tinynav.core.raycast_split import run_raycasting_split
 from tinynav.core.planning_kernels import (
     generate_trajectory_library_3d,
     low_obstacle_hits,
@@ -82,6 +84,7 @@ _FOOTPRINT_OUTLINE = os.environ.get('TINYNAV_FOOTPRINT_OUTLINE', '0') == '1'
 # This env var is the ceiling, not the switch: /planning/ui_active gates it at runtime,
 # so an unattended robot skips the work without anyone having to set anything.
 _PUBLISH_PLANNING_OVERLAYS = os.environ.get('TINYNAV_PUBLISH_PLANNING_OVERLAYS', '1') == '1'
+_PUBLISH_VOXEL_CLOUD = os.environ.get('TINYNAV_PUBLISH_VOXELS', '1') == '1'
 
 # Pose topics whose stamps are byte-identical to the image stamps, so exact-stamp
 # synchronisation against /slam/depth works. Kept in the same shape as
@@ -104,6 +107,27 @@ _HEIGHT_LUT = np.array([          # BGR，给 bgr8
     [215, 205, 200],              # >60cm
     [22, 18, 16],                 # 无效
 ], dtype=np.uint8)
+
+# z 跨度判据的逐像素判决配色。回答的是「图里哪块被判成障碍、哪块没有、以及为什么没有」——
+# 离地高度那套配色答不了「为什么没识别」，因为它不看格子的跨度，只看单点的高度。
+_VERDICT_LUT = np.array([         # BGR，给 bgr8
+    [25, 20, 18],                 # 0 无效深度
+    [90, 90, 90],                 # 1 栅格外（超出 4m 框）
+    [50, 50, 240],                # 2 🔴 该格【是障碍】
+    [60, 220, 250],               # 3 🟡 该格波段内有占据，但 z 跨度不够 —— 关键调试项
+    [90, 190, 90],                # 4 🟢 该格波段内没有占据（真空）
+    [200, 140, 70],               # 5 🔵 本像素的 z 在波段外（地面 / 太高），本来就不参与
+    [230, 60, 230],               # 6 🟣 跨度不够，但该格最高占据层【明显离地】= 有个矮东西被否了
+    [70, 70, 40],                 # 7 ⬛ 同上，但那个体素的累加值是【负的】= 栅格主动认定它是空的
+], dtype=np.uint8)
+# 3 和 6 必须分开：一个格子"有占据但跨度不够"最常见的原因就是【它只有地面】。
+# 板上实测 223 个"跨度不够"的格子，混在一起这个数没有意义 —— 真正要找的是 6。
+_VERDICT_NAMES = ('无效', '栅格外', '障碍', '只有地面', '栅格不认', '波段外', '矮物被否', '被刻空')
+# 逐类薄涂强度。平涂（全 1.0）实测读不出来：判决色是大块纯色、没有任何实物轮廓，
+# 对不上现实里哪个东西被判成了什么。要看的两类（障碍 / 矮物被否）涂重，其余压到 0.16~0.35
+# 让底图的纹理透出来。
+_VERDICT_ALPHA = np.array([0.90, 0.35, 0.72, 0.16, 0.30, 0.16, 0.92, 0.34],
+                          dtype=np.float32)
 
 
 def build_obstacle_map(occupancy_grid, origin, resolution, robot_z, config=None):
@@ -129,6 +153,117 @@ def build_obstacle_map(occupancy_grid, origin, resolution, robot_z, config=None)
     if config.dilation_cells > 0 and np.any(obstacle):
         obstacle = binary_dilation(obstacle, iterations=config.dilation_cells)
     return obstacle
+
+
+def min_visible_height_m(origin_z, robot_z, grid_nz, resolution, camera_height_m, config):
+    """离地多高的物体才够 min_wall_span_m 的 z 跨度（地面自己占的层算在内）。
+
+    🔴 必须传【运行时真实的】origin[2]，不能从 grid_offset 反推：初值 origin 里不含
+    位姿（= -shape*res/2 + grid_offset），而 roll_occupancy_grid 返回的是
+    old_origin + 整数格，所以 origin 永远停在那个初始格上 —— 实机是 -0.100 而不是
+    反推出来的 -0.076。差 24 mm，正好差一整档检出高度，我按反推算错过一次。
+
+    模块级函数，和 classify_verdict 一样给 tool/verdict_tuner.py 共用。
+    """
+    zc = origin_z + (np.arange(grid_nz) + 0.5) * resolution
+    h = zc[((zc - robot_z) >= config.robot_z_bottom)
+           & ((zc - robot_z) <= config.robot_z_top)] - (robot_z - camera_height_m)
+    lo, hi = h - resolution / 2, h + resolution / 2
+    for H in np.arange(0.0, 1.0, 0.001):
+        occ = np.flatnonzero((lo < H + 1e-9) & (hi > -1e-9))   # 地面(0) 到 H
+        if occ.size and (occ[-1] - occ[0]) * resolution >= config.min_wall_span_m - 1e-9:
+            return float(H)
+    return float('inf')
+
+
+def classify_verdict(occupancy_grid, origin, resolution, robot_z, camera_height_m,
+                     obstacle_mask, d, pw_x, pw_y, pw_z, low_h, config):
+    """逐像素判决：这块地方被 z 跨度判据判成了什么、没判成障碍的话卡在哪一步。
+
+    模块级函数，planning_node 和 tool/verdict_tuner.py 共用 —— 两边各写一份的话会
+    静默漂移，这一条我已经踩过两次（离线复现和板上给出不同的类别分布）。
+
+    判决按格子(i,j)优先，因为"这块地方是不是障碍"本来就是按格子决定的。
+    返回 (verdict uint8 HxW, stats dict)。
+    """
+    nx, ny, nz = occupancy_grid.shape
+    res = resolution
+    # 和 build_obstacle_map 同一套算法，重算一遍（80x80x14 的布尔运算，亚毫秒），
+    # 免得为了拿中间量去改 build_obstacle_map 的签名。
+    zc = origin[2] + (np.arange(nz) + 0.5) * res
+    zm = ((zc - robot_z) >= config.robot_z_bottom) & ((zc - robot_z) <= config.robot_z_top)
+    band = occupancy_grid[:, :, zm] > config.occ_threshold
+    has_occ = band.any(axis=2)
+    n = band.shape[2]
+    zi = np.arange(n, dtype=np.float32)
+    hi = np.where(band, zi[None, None, :], -1).max(axis=2)
+    lo = np.where(band, zi[None, None, :], n).min(axis=2)
+    span_ok = has_occ & (((hi - lo) * res) >= config.min_wall_span_m)
+
+    i = np.floor((pw_x - origin[0]) / res).astype(np.int32)
+    j = np.floor((pw_y - origin[1]) / res).astype(np.int32)
+    inside = (d > 0) & (i >= 0) & (i < nx) & (j >= 0) & (j < ny)
+    ic = np.clip(i, 0, nx - 1); jc = np.clip(j, 0, ny - 1)
+
+    zrel = pw_z - robot_z
+    px_in_band = (zrel >= config.robot_z_bottom) & (zrel <= config.robot_z_top)
+
+    verdict = np.full(d.shape, 1, dtype=np.uint8)          # 1 栅格外
+    verdict[d <= 0] = 0                                     # 0 无效
+    # 🔴 波段外要先整片涂掉，而且下面每一条按格子的赋值都必须带 judged。以前"波段外"
+    # 只在格子没占据时才可能出现，于是桌面/椅背（离地 >0.52 m，本来不参与判断）继承了
+    # 它那一列的颜色 —— 板上真数据实测 69% 的波段外像素被涂错，桌子一片黄就是这个。
+    judged = inside & px_in_band
+    verdict[inside & ~px_in_band] = 5                        # 波段外
+    cell_occ = has_occ[ic, jc]
+    # 🔴 这一档原来叫"空（真空）"，名字是错的：有像素就说明这一帧真有回波，judged 又
+    # 保证回波落在波段内 —— 所以"该列没占据"只能意味着【栅格不认本帧的观测】。图里根本
+    # 不存在"确认是空"这一类，因为没东西反光就不会有像素。
+    # 再按本像素自己那个体素的累加值分两档：负 = 栅格主动刻空了它（掠射线把地面自己的
+    # 回波抹掉；板上真数据实测 1.5~2 m 的地面像素 87% 落这一档）；0~门限 = 只是还没攒够
+    # 两帧。前者是系统性的，后者等一帧就好。
+    kz = np.clip(np.floor((pw_z - origin[2]) / res).astype(np.int32), 0, nz - 1)
+    own = occupancy_grid[ic, jc, kz]
+    verdict[judged & ~cell_occ] = 4                           # 栅格不认（还在攒）
+    verdict[judged & ~cell_occ & (own < 0.0)] = 7             # 栅格不认（被刻空）
+    # 该格最高占据层的离地高度，用来把"只有地面"和"有个矮东西被否了"分开。
+    # zc[zm] 是波段内各层的中心（世界 z），hi 是波段内的层【序号】。
+    zc_band = zc[zm]
+    top_h = np.where(has_occ, np.take(zc_band, np.clip(hi.astype(np.int32), 0,
+                                                       len(zc_band) - 1)),
+                     -1e3) - (robot_z - camera_height_m)
+    low_obj = has_occ & (top_h > low_h)
+    verdict[judged & cell_occ] = 3                            # 只有地面
+    verdict[judged & low_obj[ic, jc]] = 6                     # 矮物被否
+    verdict[judged & obstacle_mask[ic, jc]] = 2               # 障碍（最高优先）
+
+    stats = {
+        'obstacle_cells': int(obstacle_mask.sum()),
+        'low_rejected_cells': int((low_obj & ~span_ok).sum()),
+        'ground_only_cells': int((has_occ & ~span_ok & ~low_obj).sum()),
+        'empty_cols': int((~has_occ).sum()),
+        'band_layers': int(n),
+        'band_z_lo': float(zc[zm][0]) if n else float('nan'),
+        'band_z_hi': float(zc[zm][-1]) if n else float('nan'),
+    }
+    return verdict, stats
+
+
+def tint_verdict(base_bgr, verdict):
+    """判决色薄涂在底图上 + 底部色标条。
+
+    平涂（全 1.0）实测读不出来：判决色是大块纯色、没有任何实物轮廓，对不上现实里
+    哪个东西被判成了什么。要看的两类涂重，其余压轻让底图纹理透出来。
+    """
+    a = _VERDICT_ALPHA[verdict][..., None]
+    img = np.clip(base_bgr.astype(np.float32) * (1.0 - a)
+                  + _VERDICT_LUT[verdict].astype(np.float32) * a, 0, 255).astype(np.uint8)
+    k = len(_VERDICT_LUT)
+    w = img.shape[1]
+    bar = np.zeros((12, w, 3), dtype=np.uint8)
+    for t in range(k):
+        bar[:, t * w // k:(t + 1) * w // k] = _VERDICT_LUT[t]
+    return np.vstack([img, bar])
 
 
 def generate_predefined_trajectory_vocabularies(
@@ -269,18 +404,43 @@ class PlanningNode(Node):
         self.path_pub = self.create_publisher(Path, '/planning/trajectory_path', 10)
         # Throttled JSON for the app's diagnostics panel; see _publish_diagnostics.
         self.diag_pub = self.create_publisher(String, '/planning/diagnostics', 1)
-        self.height_map_pub = self.create_publisher(Image, "/planning/height_map", 10)
+        # 🔴 可视化话题一律 BEST_EFFORT + depth 1。默认 QoS 是 RELIABLE：订阅方是 web
+        # 后端（uvicorn 45~62% CPU）跟不上时，publish() 会把【规划环】卡住。
+        # 2026-09-02 实测 A/B：可视化开 → 规划周期 0.76 Hz（p90 2.37s）；关 → 4.92 Hz
+        # （p90 0.22s），快 6.5 倍。判据是关掉后 planning 的 CPU 反而从 35.6% 升到
+        # 52.8% —— 它之前是【被阻塞】而不是算不过来。
+        # ⚠️ 两端必须一起改：BEST_EFFORT 发布 + RELIABLE 订阅是 QoS 不兼容，零投递且完全静默。
+        # trajectory_path 不在此列 —— 那是控制指令，必须可靠。
+        self._viz_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+        self.height_map_pub = self.create_publisher(Image, "/planning/height_map", self._viz_qos)
         # 相机视角的离地高度着色图，给前端和 infra1 并排对比用。只在有人订阅时才算。
-        self.height_color_pub = self.create_publisher(Image, "/planning/height_color", 1)
+        self.height_color_pub = self.create_publisher(Image, "/planning/height_color", self._viz_qos)
         self._height_color_uv = None
         self._height_color_last_ns = 0
         self.height_color_hz = float(os.environ.get('TINYNAV_HEIGHT_COLOR_HZ', '2.0'))
         self.height_color_stride = int(os.environ.get('TINYNAV_HEIGHT_COLOR_STRIDE', '2'))
-        self.obstacle_mask_pub = self.create_publisher(OccupancyGrid, '/planning/obstacle_mask', 10)
-        self.footprint_pub = self.create_publisher(PointCloud, '/planning/footprint', 10)
-        self.occupancy_cloud_pub = self.create_publisher(PointCloud2, '/planning/occupied_voxels', 10)
-        self.occupancy_cloud_esdf_pub = self.create_publisher(PointCloud2, '/planning/occupied_voxels_with_esdf', 10)
-        self.occupancy_grid_pub = self.create_publisher(OccupancyGrid, '/planning/occupancy_grid', 10)
+        # obstacle = 逐像素打「这块被 z 跨度判成障碍了吗、没有的话卡在哪一步」；
+        # height  = 旧的离地高度配色（它答不了「为什么没识别」）。
+        self.height_color_mode = os.environ.get('TINYNAV_HEIGHT_COLOR_MODE', 'obstacle')
+        # 判决图里区分「只有地面」和「有个矮东西被否了」的离地高度界。
+        self.verdict_low_h = float(os.environ.get('TINYNAV_VERDICT_LOW_H', '0.03'))
+        # 判决图的底图。infra = 红外图（能看清实物纹理，对得上现实），depth = 深度当亮度
+        # （只有轮廓没纹理，但【免费】—— 深度图本来就在手里）。
+        # ⚠️ infra 要多订阅一个 20 Hz 的 640x544 话题，板上实测一个什么都不做的裸订阅者
+        # 就要【13.9% 一个核】，而判决图只用其中 1 Hz 一帧。这笔钱是刻意付的：depth 当
+        # 底图只有轮廓没纹理，对不上现实里到底哪个东西被判成了什么，而这张图的全部用处
+        # 就是让人做那个判断。CPU 再紧就退 depth。
+        # 没有更便宜的红外源：keyframe_image 只有 0.66 Hz，运动时底图会比判决图旧 1.5 s。
+        self.verdict_base = os.environ.get('TINYNAV_VERDICT_BASE', 'infra')
+        self.infra_topic = os.environ.get(
+            'TINYNAV_VERDICT_BASE_TOPIC', '/camera/camera/infra1/image_rect_raw')
+        self._infra_sub = None
+        self._infra_msg = None
+        self.obstacle_mask_pub = self.create_publisher(OccupancyGrid, '/planning/obstacle_mask', self._viz_qos)
+        self.footprint_pub = self.create_publisher(PointCloud, '/planning/footprint', self._viz_qos)
+        self.occupancy_cloud_pub = self.create_publisher(PointCloud2, '/planning/occupied_voxels', self._viz_qos)
+        self.occupancy_cloud_esdf_pub = self.create_publisher(PointCloud2, '/planning/occupied_voxels_with_esdf', self._viz_qos)
+        self.occupancy_grid_pub = self.create_publisher(OccupancyGrid, '/planning/occupancy_grid', self._viz_qos)
         self.depth_sub = message_filters.Subscriber(self, Image, '/slam/depth')
         # Where this node takes the robot pose from. A parameter rather than a
         # literal for two reasons: /insight/vio_20hz does not exist on current
@@ -350,14 +510,27 @@ class PlanningNode(Node):
                 [self.depth_sub, self.pose_sub], queue_size=30, slop=pose_sync_slop
             )
         self.ts.registerCallback(self.sync_callback)
+        # 取用策略：直接在回调里干活(FIFO，永远处理最旧的未过期集合)，还是回调只存、
+        # 定时器取最新。默认沿用旧行为 —— 09-02 的仿真套件在这个改动下从 9/9 变 7/9，
+        # 但那两个失败场景【单跑都过】，套件本身不可复现，所以既不能定罪也不能放行。
+        # 要 A/B 就 TINYNAV_PLAN_LATEST_ONLY=1，判据见 in_age= 那一列。
+        self._plan_latest_only = os.environ.get('TINYNAV_PLAN_LATEST_ONLY', '0') == '1'
+        self._pending_set = None
+        if self._plan_latest_only:
+            # 20 Hz：必须快过深度帧(4.8 Hz)，否则 pending 会白等一拍。单线程执行器 +
+            # 默认互斥回调组，所以它和 sync_callback 不会重入。
+            self.create_timer(0.05, self._plan_tick)
         self.get_logger().info(
             "planning pose sync: "
             + ("exact" if use_exact_pose_sync else f"approximate slop={pose_sync_slop}s")
+            + (", latest-only intake" if self._plan_latest_only else ", FIFO intake")
         )
         # Planning on old geometry is worse than not planning: the robot reacts to
         # obstacles that have moved and misses ones that have not. map_node guards its
         # keyframes the same way (max_keyframe_age_s); planning had no age check at all.
-        self.max_input_age_s = 0.5
+        self.max_input_age_s = float(os.environ.get('TINYNAV_MAX_INPUT_AGE_S', '0.5'))
+        self._last_entry_age_s = 0.0
+        self._lat = LatStats('plan', self.get_logger().info)
         self._last_stale_log_ns = 0
         self.camerainfo_sub = self.create_subscription(CameraInfo, '/camera/camera/infra2/camera_info', self.info_callback, 10)
 
@@ -365,16 +538,41 @@ class PlanningNode(Node):
         # 也会被栅格自己截断。9 层 + 上抬后覆盖相机 -0.3 .. +0.6 m，够放 robot_z_top 到 0.5。
         # 曾经开到 13 层（上限 1.0 m），结果桌面之类的悬空物全投影成地面障碍，走廊被关死：
         # front_clearance 掉到 0.11 m、106 条轨迹里 101 条被拒，车只能原地打转（2026-08-25）。
-        self.grid_shape = (100, 100, 9)
-        self.resolution = 0.1
-        # 地面在相机下方 0.18 m，往下留 1 层余量够了；省下的层全给上方。
-        self.grid_offset = np.array([0.0, 0.0, 0.15])
+        # 🔴 2026-09-01：0.1 m -> 0.05 m，同时把框从 10 m 缩到 4 m，总格数几乎不变。
+        # 起因是一个可复现的现场：椅子之间物理净宽 0.50 m，而车需要 0.344 m —— 本该能过，
+        # 但过道相对栅格轴斜 54°，0.1 m 轴对齐栅格对斜过道每侧最多吃 0.1*(|cos|+|sin|)
+        # = 0.140 m，净宽被栅格化成 0.30 m 就判死了。同一帧用原始深度独立重建，逐点得到
+        # 一样的 0.30 m ——**地图是忠实的，是分辨率不够**（详见 docs/x5/grid_resolution.md）。
+        # 只改这个局部避障栅格；全局地图（map_node）保持 0.1 m，两者本来就解耦。
+        #   格数 80x80x14 = 89,600  vs  100x100x9 = 90,000  (1.00x)
+        #   2D 平面 6,400 vs 10,000 (0.64x，EDT 反而更便宜)
+        #   z 覆盖相机 -0.20 .. +0.475 m；band 是 [-0.20,+0.40]，正好用掉 12 层、上方留余量
+        # 2 m 半径够用：3 s 轨迹 @max_vx 0.25 只有 0.75 m，前向探针 1.2 m，
+        # 最远需求 0.75+0.122+0.05 = 0.92 m << 2.0 m。
+        self.grid_shape = (80, 80, 14)
+        self.resolution = 0.05
+        # 地面在相机下方约 0.124 m。上抬 0.15 让栅格中心的 z 正好落在相机上（见下面 center
+        # 的算法），否则每周期都会判定需要重定心。
+        # z 分量决定体素层的水平切面落在地面哪个位置（"z 相位"）。位姿源是轮速里程计、
+        # z 是固定偏置，所以相位是【冻结】的一个值，不像 VIO 那样会漂。0.15 时地面所在
+        # 层的上沿离地 +24 mm，物体要够到再上一层（+74 mm）才有 0.10 的跨度 —— 6~7 cm
+        # 的椅脚正好差这几毫米。降它就整体下移：0.135 -> 门限 60 mm。代价是等量的地面
+        # 噪声容差（两者是同一条边界），改前必须在实际场地量一次空地误报。
+        self.grid_offset = np.array(
+            [0.0, 0.0, float(os.environ.get('TINYNAV_GRID_OFFSET_Z', '0.15'))])
         self.origin = np.array(self.grid_shape) * self.resolution / -2. + self.grid_offset
         # 深度图取样步长。10 时前方 1~3 m 的占据格单帧只召回 42~56%（以 step=2 为参考真值，
         # 2026-08-26 板上实测），而一个格子要连续两帧才越过阈值 —— 于是墙上全是洞。
         # 5 把召回提到 68~72%，代价 4.3 -> 14.0 ms（250 ms 周期的 4%）。这是填洞的正路：
         # 用膨胀填洞每格要付 0.1 m/侧的过道净宽，而这里付的是 CPU。
         self.step = int(os.environ.get('TINYNAV_RAYCAST_STEP', '5'))
+        # 刻空闲的取样步长，和标命中分开。一条射线要写约 40 个体素，其中只有 1 个是命中 ——
+        # 97% 的算力在刻空，而两件事需要的密度完全不同：命中稀了漏矮东西，刻空则相邻射线
+        # 刻的几乎是同一批体素。板上真录数据实测 3/8 vs 3/3：耗时 1/3.4，椅子那侧障碍格
+        # 94->208，空地近场假障碍仍 0。代价是清除延迟 —— 每帧被刻到的体素只少 13%，但
+        # "一帧就能清"的从 97% 降到 67%，即 1/3 的体素清除从 0.2 s 变 0.4 s。
+        # 设成和 step 相同就退回原版 run_raycasting_loopy（数学等价，实测差 3e-14）。
+        self.carve_step = int(os.environ.get('TINYNAV_CARVE_STEP', '8'))
         # 轨迹库的采样密度：omega 取 n 个、vx 取 max(3, n//2) 个，共 n*max(3,n//2) 条
         # 前进弧 + 5 条倒车。打分是 O(条数 x 31 步 x 20 个车体取样点)，加密要线性付钱。
         self.traj_samples = int(os.environ.get('TINYNAV_TRAJ_SAMPLES', '15'))
@@ -398,6 +596,24 @@ class PlanningNode(Node):
         # 0.2 的格子要 69 个周期(4.3 Hz 下约 16 s)才掉到阈值 0.1 以下。相比之下被射线穿过
         # 的格子一帧就清掉(0.2x0.99-0.1=0.098)。所以"障碍物停留很久"= 没人再看它一眼，
         # 而这两种情况以前没有任何数字能区分。
+        # 🔴 衰减必须按**时间**折算，不能按周期。栅格原来每周期 x0.99，注释里的"约 16 s
+        # 遗忘时间"隐含了 4.3 Hz 这个前提 —— 于是地图的新鲜度和 CPU 负载**静默耦合**：
+        # 2026-09-01 把 raycast step 5->3 之后 cycle 从 0.23 涨到 0.40 s（p90 0.77），
+        # 遗忘时间跟着变成 27.6 s。当天在过道里实测：mask 有 60% 的格子超过 20 s 没被再
+        # 看到、中位年龄 96 s、最老 358 s，把物理 0.50 m 的净宽收成 0.30 m，车不敢走。
+        # 折算到这个参考周期，遗忘时间就固定在秒上，不再随负载漂。
+        self._decay_ref_dt = 0.23
+        self._last_decay_stamp = None
+        self._min_vis_logged = False
+        # 规划环各段耗时的聚合。5 s 一行，不是每拍一行 —— TINYNAV_VERBOSE_TIMER=1 每拍
+        # 打 5~10 行，那本身就会干扰它要测的东西，而且静止时测出来的数不代表跑起来。
+        # codetiming 的 Timer.timers 一直在静默累计（logger=None 也累计），所以这里
+        # 只是读出来 + 清零，不用改那 10 个 with Timer 的调用点。
+        self.stage_log_s = float(os.environ.get('TINYNAV_STAGE_LOG_S', '5.0'))
+        self._stage_win_ns = 0
+        self._depth_dts = []
+        self._last_depth_stamp = None
+        self._stale_in_win = 0
         self._obstacle_first_seen = np.zeros(self.grid_shape[:2], dtype=np.float64)
         self._obstacle_last_seen = np.zeros(self.grid_shape[:2], dtype=np.float64)
         # 矮障碍（办公椅星形底盘、门槛、趴着的狗）的独立 2D 证据。z 跨度判据结构上看不见
@@ -416,7 +632,11 @@ class PlanningNode(Node):
         # 而「连续两帧才算」本身已经把单点飞点滤掉了。
         self.low_obs_min_pts = int(os.environ.get('TINYNAV_LOW_OBS_MIN_PTS', '2'))
         # 0 关掉这一路。
-        self.low_obs_enabled = os.environ.get('TINYNAV_LOW_OBS', '1') != '0'
+        # 🔴 默认关（2026-09-02 定案）。0.05 m 栅格下 z 跨度单独就够：仿真里 5 cm x
+        # 0.35 m 的椅腿开/关都是 3 个障碍格，这一层贡献 0。而板上它贡献 185/243 格
+        # (76%) —— 加的全是噪声：判据下限 0.05 m 比误差预算还小（实测俯仰固定偏置
+        # 1.38 度在它自己 1.5 m 的量程上就是 0.036 m，再加地毯绒毛）。
+        self.low_obs_enabled = os.environ.get('TINYNAV_LOW_OBS', '0') != '0'
         # 衰减 0.9 + 每帧 +0.1，判据 >0.1：和占据栅格一样要连续两帧，但会自己清掉 ——
         # 相机在 0.18 m 处向下只能看到身前 0.18 m 以外，车头前 13 cm 是盲区，靠这段记忆
         # （0.9^n，约 1.4 s / 0.3 m/s 下 0.42 m）盖过去。
@@ -436,6 +656,11 @@ class PlanningNode(Node):
         self._escape_sweep_side = None
         self._escape_goal_max_s = 15.0          # 锁死一个转不出去的朝向的上限
         self._escape_goal_reached_rad = math.radians(12.0)
+        # 从"发出转向指令"到"能改这条指令"之间的总环路延迟。2026-09-01 板上逐段实测：
+        # 位姿数据龄 stamp_lag p50 0.59 + 重规划周期 0.23 + 执行器 0.22 = 1.04 s。
+        # _pick_turn_toward 用它把档位按剩余误差选 —— 不做这件事就是 bang-bang 控制配
+        # 1 秒延迟，必然发散（实测 112 s 转了 3147°，净转角只有 1142°）。
+        self.escape_turn_delay_s = 1.0
         self._escape_scan_step_deg = 15
         # 后退脱困。占据栅格只由前向射线写入，所以车后方的格子从来没被看过 —— 盲退曾经
         # 造成 40 s 的 vx=-0.2 直接撞上去（2026-08-10 19:19），这也是 reverse 一直被门掉的
@@ -468,11 +693,19 @@ class PlanningNode(Node):
                 'TINYNAV_MIN_WALL_SPAN_M', self.robot.obstacle.min_wall_span_m)),
             dilation_cells=int(os.environ.get(
                 'TINYNAV_DILATION_CELLS', self.robot.obstacle.dilation_cells)),
+            # z 波段下界也做成开关：它决定「地面那一层算不算进来」。相对相机，
+            # 0.05 m 栅格下 -0.20 对应世界 z=-0.076，比地面还低 7.6 cm ——
+            # 地面自己就在波段里，跨度全靠它凑（见 robot_config 里那段实测）。
+            robot_z_bottom=float(os.environ.get(
+                'TINYNAV_ROBOT_Z_BOTTOM', self.robot.obstacle.robot_z_bottom)),
         )
         self.get_logger().info(
-            f"obstacle: raycast step={self.step} "
+            f"obstacle: raycast hit_step={self.step} carve_step={self.carve_step} "
             f"span>={self.obstacle_config.min_wall_span_m} "
+            f"zbot={self.obstacle_config.robot_z_bottom:+.2f}(离地"
+            f"{self.obstacle_config.robot_z_bottom + self.camera_height_m:+.3f}m) "
             f"dilation={self.obstacle_config.dilation_cells} "
+            f"verdict_base={self.verdict_base} "
             f"low_obs={'on' if self.low_obs_enabled else 'off'} "
             f"({self.low_obs_h_lo}~{self.low_obs_h_hi} m, <{self.low_obs_max_range_m} m, "
             f">={self.low_obs_min_pts} pts, cam_h={self.camera_height_m})")
@@ -496,6 +729,7 @@ class PlanningNode(Node):
         # 也就无法支撑一个随速度变大的门限。1.2 m 覆盖 max_vx=0.5 需要的 0.80 m。
         self.front_probe_max_m = 1.2
         # 一格。障碍图已经膨胀过 1 格(dilation_cells=1)，这一格是在那之上的余量。
+        # 方形底盘用：几何在取样偏置里，这只是纯余量。圆盘走 _prefix_gate_m。
         self.prefix_margin_m = 0.10
         # 从"承诺一条轨迹"到"能改指令"之间车会走 v x reaction_time_s。
         # 这个值由闭环仿真定，不是由"周期 + 滞后"直接推 —— tool/sim_front_gate.py 用真的
@@ -521,11 +755,61 @@ class PlanningNode(Node):
         # the target 172 deg behind produced best_gain = 0.05 m against a 0.05 m
         # threshold, so the escape missed by an epsilon and the robot stood still for
         # 69 s. Heading error measures the cause and has no scale to get wrong.
-        self.force_turn_heading_rad = math.radians(80.0)
+        # 80 -> 120（2026-09-01 实测）。前方开着时前进的靠拢速率是 v*cos(误差)，90° 以内
+        # 恒为正，而弧线还同时在把误差压小 —— 所以 80~120° 之间"停下来原地转"严格劣于走弧线。
+        # 实测这一档触发了 46 次原地转里的 39 次，且当时 blocked 中位只有 42/110（前方是开的）。
+        # 120° 以上目标真在身后，前进会走远，那时原地转才是对的。
+        # 🔴 代价函数的终点朝向项。没有它的时候，14 条原地转在所有位置类代价上**完全同值**
+        # （终点位置就是起点、路线剩余相同、贴合度相同、圆盘的碰撞分恒 0），唯一的区分项是
+        # smoothness = 10*|上一拍 omega - 本拍 omega| —— 纯惯性，方向一旦错就一直错。
+        # 2026-09-01 实测：目标在左 117°、前方大开（blocked 19/110、front_clearance>1.2 m）时
+        # 代价函数选原地右转（远路 243°），heading_err 从 +104 一路涨到 +123，直到越过
+        # force_turn_heading_rad 才被 escape=heading 拉回来，两者来回拉锯。
+        # 权重 20：smoothness 的上限是 10*2*max_yaw = 12，20*1 rad 就压得住；而前进轨迹的
+        # 位置项是 100*dist（0.75 m 给 75），所以「有路可进就别光对朝向」这个优先级不变。
+        self.w_heading = float(os.environ.get('TINYNAV_W_HEADING', '20.0'))
+        # 低于这个距离就不再谈"朝向目标"。0.3 m 与 map_node 的到达半径 0.4 m 同量级，
+        # 且大于相机光心到控制中心的 0.067 m 偏置。
+        self.heading_min_dist_m = float(os.environ.get('TINYNAV_HEADING_MIN_DIST_M', '0.3'))
+        # 障碍势垒的权重。原来是写死的 100000 配 1/(d-hard)：在 soft 边界上外侧 0 分、
+        # 内侧 99 万分，而「多推进 1 m」只值 100 分 —— 于是车一旦离障碍不到 soft，
+        # 站着不动就是全局最优，实测前 5 名候选全是 vx=0（2026-09-01）。
+        # 现在的量纲：1.0 表示「净空比 hard 多 0.03 m」约等于「少走 0.25 m」。
+        self.w_obstacle = float(os.environ.get('TINYNAV_W_OBSTACLE', '1.0'))
+        # 静止本身的代价。代价函数里三项都在惩罚运动（势垒、从 0 起步的 smoothness、朝向），
+        # 而最慢那档 0.042 m/s 在 3 s 里只推进 0.125 m、进展奖励只有 13 分，加起来必输 ——
+        # 于是 0.40 m 的窄缝前车永远站着（2026-09-01 实测：不动 207 分，最好前进 220 分）。
+        # 目标近了要归零：到达是靠"奖励消失让车自然停住"实现的，见上面 target_dist_xy 那段。
+        self.w_idle = float(os.environ.get('TINYNAV_W_IDLE', '40.0'))
+        # 位姿瞬移检测。固件 VIO 跟丢后会【内部】重启并把原点归零（进程不重启，我们这边
+        # 毫无察觉），世界系就此改了意义 —— 存下来的占据格记的都是旧世界的坐标，全部作废。
+        # 不处理的后果不是"地图不准"而是"地图看着一片开阔"：2026-09-01 实测重置后一拍就
+        # blocked=0/110、fwd_ok=90/90、front_clearance=>1.20m，规划器立刻发出 vx=0.250
+        # 满速冲进一张空白地图。门限按物理极限定，1.0 m/s 是 max_vx 的 4 倍。
+        self._pose_prev = None
+        self._pose_jump_speed = float(os.environ.get('TINYNAV_POSE_JUMP_SPEED', '1.0'))
+        # 占据要连续两帧才过阈值，5 Hz 下 0.4 s；留到 1.2 s 才敢再往前走。
+        self._blind_s = float(os.environ.get('TINYNAV_BLIND_AFTER_JUMP_S', '1.2'))
+        self._blind_until = 0.0
+        self.idle_free_m = float(os.environ.get('TINYNAV_IDLE_FREE_M', '0.5'))
+        # 「多慢算站着不动」。默认 1e-6 = 只罚严格 0，于是最慢那条 vx=0.067 完全躲过
+        # 惩罚。上游 xiaole/planning-cost-and-s-bend 用的是 min_linear_vel 这一档门限，
+        # 且权重 4000（我们 40 = 只值 0.4 m 路线进展）。留成旋钮，先在仿真里 A/B。
+        self.idle_vx_eps = float(os.environ.get('TINYNAV_IDLE_VX_EPS', '1e-6'))
+        self.force_turn_heading_rad = math.radians(120.0)
+        # no-progress 脱困的时间预算与之后的冷却，见 _noprogress_budget。
+        self._noprog_start_ns = 0
+        self._noprog_block_until_ns = 0
+        self._noprog_max_s = float(os.environ.get('TINYNAV_NOPROGRESS_ESCAPE_S', '5.0'))
+        self._noprog_cooldown_s = float(os.environ.get('TINYNAV_NOPROGRESS_COOLDOWN_S', '5.0'))
         # A heading counts as an escape only if the probe finds nothing within this
         # much. Above robot.front_blocked_m so the turn actually releases the gate
         # instead of handing back a heading that re-triggers it next cycle.
         self.escape_min_clearance_m = max(0.4, self.robot.front_blocked_m + 0.1)
+        # front_blocked 的解封门限：可行前进轨迹要到这么多条才算"前方不堵了"。
+        # 1 条不算 —— 见 _blocked_latched。0 = 关掉滞回，回到旧的瞬时判据。
+        self.blocked_release_ok = int(os.environ.get('TINYNAV_BLOCKED_RELEASE_OK', '5'))
+        self._blocked_latch = False
 
         # TRANSIENT_LOCAL because this topic carries state -- where the robot is going --
         # not a stream. map_node publishes it once per POI transition, so a volatile
@@ -559,6 +843,23 @@ class PlanningNode(Node):
         # remaining_map 在到达前就饱和到 0，最后一段要靠这项把车拉到精确目标上
         self.w_goal_terminal = float(os.environ.get('TINYNAV_W_GOAL_TERMINAL', '100.0'))
         self.route_terminal_band = float(os.environ.get('TINYNAV_ROUTE_TERMINAL_BAND', '0.5'))
+        # 决策日志的节流，Hz。0 = 每个规划周期都打。
+        # 🔴 默认曾是写死的 1 Hz，而规划周期是 0.25 s —— 于是 5 拍里只看得到 1 拍，
+        # 从日志量"障碍首次出现在多远"必然偏小 v*1.15s（0.4 m/s 时 0.46 m），我据此
+        # 给出过一版偏低的探测距离。复盘要用的那几个量必须逐拍可见。
+        self.decision_log_hz = float(os.environ.get('TINYNAV_DECISION_LOG_HZ', '0'))
+        # 沿全局路线往前探多远，用来判"路线自己撞进障碍里了"。
+        self.route_probe_m = float(os.environ.get('TINYNAV_ROUTE_PROBE_M', '2.0'))
+        # 路线自己穿进障碍时，本拍不再为【贴合】它罚分（进展项照旧保留）。
+        # 判据是 2026-09-03 板上实测，不是调出来的：route_clear >= hard 的 382 拍里
+        # esdf_at_robot 中位 0.56 m、可行前进 85/90；< hard 的 325 拍（占全程 46%）
+        # 中位掉到 0.27、可行 26/90，而那一趟 3 次真碰撞 + 17 次全速贴着走【全部】
+        # 落在后者。所以阈值就取碰撞门限本身。
+        # 🔴 只清 w_path_follow，不清 w_route_progress —— 整条路线丢掉会退回贪心终点
+        # 距离，那正是 PR #226 的路线打分修掉的绕角抖动（doorway 138 次变向）。
+        self.route_unpin_on_block = os.environ.get('TINYNAV_ROUTE_UNPIN_ON_BLOCK', '1') == '1'
+        # 势垒是否把起点算进最小净空。默认 0 = 不算，见 clear_min 处的注释。
+        self.barrier_include_start = os.environ.get('TINYNAV_BARRIER_INCLUDE_START', '0') == '1'
 
 
         # Whether a browser is actually looking at the local view. The overlay layers and
@@ -755,6 +1056,10 @@ class PlanningNode(Node):
         A circle rotating in place sweeps the area it already occupies, so the verdict is
         about the present, not the motion, and is unactionable. Measured 2026-08-10: it
         killed 12 of 14 turns, and the escape hatch then failed silently for 23 s.
+
+        🔴 这条豁免的前提是【碰撞圆的圆心就是旋转中心】。驱动轮后置 20 mm 之后车身不再
+        以盘心为圆心，所以 collision_radius 取的是绕驱动轴的扫掠半径（0.1375 = 盘半径
+        0.1175 + 后移 0.020）。谁要是把它改回盘半径，这条豁免就静默地变成错的。
         """
         front_len, rear_len, half_w = self.robot.footprint_from_control()
         if path_dist_map is None:
@@ -777,8 +1082,12 @@ class PlanningNode(Node):
         return max(self.robot.front_blocked_m,
                    (self.robot.max_vx / 6.0) * self.reaction_time_s)
 
+    def _prefix_gate_m(self):
+        """承诺段的可行门限。圆盘：车体在门限里，和碰撞判据同一个数，两处不会再打架。"""
+        return self.robot.hard_clearance if self.robot.is_circle else self.prefix_margin_m
+
     def _prefix_clearance(self, trajectories, esdf):
-        """每条轨迹在它**将要执行的那一段**上，车体五点的最小 ESDF。
+        """每条轨迹在它**将要执行的那一段**上的最小 ESDF（圆盘查中心，方形查车体五点）。
 
         为什么不是沿当前朝向的一条直线：转开的弧线在自己那条路上是空的，直线探针却因为
         正前方有东西把它一起禁掉 —— 2026-08-26 闭环仿真里，0.9 m 宽的缝在直线探针下
@@ -790,6 +1099,13 @@ class PlanningNode(Node):
         n_pref = max(2, min(trajectories.shape[1],
                             int(round(self.reaction_time_s / self.dt)) + 1))
         P = trajectories[:, :n_pref, :]
+        if self.robot.is_circle:
+            # 圆盘查中心一次就够，车体半径在门限里（见 hard_clearance）。按外接方形取四角
+            # 是把半径算第二遍：角在 0.166 m 处，再要 0.10 m 净空等于要求过道净宽
+            # 2x(0.1175+0.10)=0.435 m，而真实需求 2x0.172=0.344 m。实测 0.40 m 的过道
+            # 因此被判成堵，90 条前进轨迹只放行 6 条（改后 30 条）。
+            # score_trajectories_by_ESDF 早就是 is_circle -> 单点，这里当初漏了。
+            return self._esdf_lookup(esdf, P[..., 0], P[..., 1]).min(axis=1)
         fl, rl, hw = self.robot.footprint_from_control()
         qx, qy, qz, qw = P[..., 3], P[..., 4], P[..., 5], P[..., 6]
         fx = 2.0 * (qx * qz + qw * qy)
@@ -804,12 +1120,95 @@ class PlanningNode(Node):
         ys = np.stack([P[..., 1],
                        P[..., 1] + fy * fl + ly * hw, P[..., 1] + fy * fl - ly * hw,
                        P[..., 1] - fy * rl + ly * hw, P[..., 1] - fy * rl - ly * hw], axis=-1)
+        return self._esdf_lookup(esdf, xs, ys).min(axis=(1, 2))
+
+    _STAGES = ('preprocess', 'raycasting', 'obstacle map', 'vis',
+               'vis:mask', 'vis:heightmap', 'vis:footprint', 'vis:verdict', 'vis:voxels',
+               'pub:prefix', 'pub:cost', 'pub:emit', 'pub:log',
+               'traj gen', 'traj score', 'pub')
+
+    def _log_stage_timing(self, now_ns, depth_stamp_s):
+        """规划环的逐段耗时 + 实际消费到的深度间隔。一行一个窗口。
+
+        depth_dt 是【真正被规划消费的】相邻两帧的间隔，不是话题频率 —— bridge 丢帧、
+        执行器排不上都会体现在这里，而话题频率看不出来。"""
+        if depth_stamp_s is not None:
+            if self._last_depth_stamp is not None:
+                dt = depth_stamp_s - self._last_depth_stamp
+                if 0.0 < dt < 10.0:
+                    self._depth_dts.append(dt)
+            self._last_depth_stamp = depth_stamp_s
+        if self.stage_log_s <= 0.0:
+            return
+        if self._stage_win_ns == 0:
+            self._stage_win_ns = now_ns
+            return
+        win_s = (now_ns - self._stage_win_ns) / 1e9
+        if win_s < self.stage_log_s:
+            return
+        self._stage_win_ns = now_ns
+
+        def q(name):
+            if name not in Timer.timers:
+                return None
+            return (Timer.timers.median(name) * 1e3, Timer.timers.max(name) * 1e3)
+        loop = q('Planning Loop')
+        parts = []
+        for st in self._STAGES:
+            v = q(st)
+            if v is not None:
+                parts.append(f"{st.replace(' ', '')} {v[0]:.0f}/{v[1]:.0f}")
+        n = Timer.timers.count('Planning Loop') if 'Planning Loop' in Timer.timers else 0
+        Timer.timers.clear()
+
+        dts = sorted(self._depth_dts); self._depth_dts = []
+        if dts:
+            d50 = dts[len(dts) // 2]
+            d90 = dts[min(len(dts) - 1, int(0.9 * len(dts)))]
+            gaps = sum(1 for d in dts if d > 0.30)
+            dtxt = (f"depth_dt p50={d50:.2f}s p90={d90:.2f}s >0.30s={gaps}/{len(dts)} "
+                    f"({1.0 / d50:.1f} Hz)")
+        else:
+            dtxt = "depth_dt n/a"
+        stale = self._stale_in_win; self._stale_in_win = 0
+        self.get_logger().info(
+            f"stage ms (n={n}, {win_s:.1f}s): "
+            + (f"total {loop[0]:.0f}/{loop[1]:.0f} | " if loop else "")
+            + " ".join(parts) + f" | {dtxt} | stale={stale}")
+
+    def _min_visible_height_m(self, origin_z, robot_z):
+        return min_visible_height_m(origin_z, robot_z, self.grid_shape[2],
+                                    self.resolution, self.camera_height_m,
+                                    self.obstacle_config)
+
+    def _esdf_lookup(self, esdf, xs, ys):
+        """格外的点返回 inf（当作没约束），不是 0 —— 否则栅格边缘会把轨迹全禁掉。"""
         ii = ((xs - self.origin[0]) / self.resolution).astype(np.int32)
         jj = ((ys - self.origin[1]) / self.resolution).astype(np.int32)
         inb = ((ii >= 0) & (ii < esdf.shape[0]) & (jj >= 0) & (jj < esdf.shape[1]))
-        d = np.where(inb, esdf[np.clip(ii, 0, esdf.shape[0] - 1),
-                               np.clip(jj, 0, esdf.shape[1] - 1)], np.inf)
-        return d.min(axis=(1, 2))
+        return np.where(inb, esdf[np.clip(ii, 0, esdf.shape[0] - 1),
+                                  np.clip(jj, 0, esdf.shape[1] - 1)], np.inf)
+
+    def _route_block_ahead(self, esdf, route_xy, init_p):
+        """沿全局路线往前找第一个被挡点，返回 (弧长 m, 这段路线上的最小净空 m)。
+
+        全局搜索只认建图那一刻的占据图（map_node 一次性 np.load，全程不更新），建图之后
+        搬进来的东西它完全看不见 —— 而局部这边还在为贴合这条路线付 w_path_follow。
+        没有这个量，"卡在障碍前"和"绕不过去"在日志里长得一模一样。"""
+        nan = float('nan')
+        if route_xy is None or len(route_xy) < 2:
+            return nan, nan
+        r = np.asarray(route_xy, dtype=float)[:, :2]
+        seg = r[int(np.argmin(np.linalg.norm(r - init_p[:2], axis=1))):]
+        if len(seg) < 2:
+            return nan, nan
+        arc = np.concatenate(([0.0], np.cumsum(np.linalg.norm(np.diff(seg, axis=0), axis=1))))
+        keep = arc <= self.route_probe_m
+        d = self._esdf_lookup(esdf, seg[keep, 0], seg[keep, 1])
+        if d.size == 0:
+            return nan, nan
+        hit = np.flatnonzero(d < self.robot.hard_clearance)
+        return (float(arc[keep][hit[0]]) if hit.size else float('inf')), float(d.min())
 
     def _motion_gate_penalty(self, param, idx, forward_ok, front_blocked):
         """1e9 on any motion this sensor cannot vouch for, 0.0 otherwise.
@@ -923,6 +1322,22 @@ class PlanningNode(Node):
         return (escape_clear < self.escape_min_clearance_m
                 or escape_age_s > self._escape_before_retreat_s)
 
+    def _blocked_latched(self, raw_blocked, n_fwd_ok):
+        """给 front_blocked 加滞回。
+
+        🔴 原来它是瞬时判据：90 条前进轨迹里只要有 1 条可行就翻成 False，于是
+        `escape_reason` 掉回 ""、`escape_age` 归零。2026-09-02 板上卡死 12.5 s 那段
+        `fwd_ok` 在 0 和 1~2 之间每拍来回，`escape_age` 因此在 0.2/1.4/0.5/0.2 之间
+        重置、**从没累积到 `_escape_before_retreat_s`**，倒车永不触发；13 秒里净位移
+        0.04 m，最后要人去搬。
+        判据是量出来的：那段里"解封"的那些拍 `fwd_ok` 从没超过 **2/90**，所以
+        「要 5 条才算解封」在整段里都保持锁定，而真的走得动时是 71~90 条。"""
+        if raw_blocked:
+            self._blocked_latch = True
+        elif n_fwd_ok >= self.blocked_release_ok:
+            self._blocked_latch = False
+        return self._blocked_latch
+
     def _escape_reason(self, front_blocked, stand_dist, heading_err_abs, best_gain):
         """Why the robot should turn in place instead of following the ranking, or "".
 
@@ -947,6 +1362,30 @@ class PlanningNode(Node):
             return "no-progress"
         return ""
 
+    def _noprogress_budget(self, escape_reason, now_ns):
+        """给 no-progress 脱困一个时间预算，超了就放手让排序自己走。
+
+        这一支唯一的出口是"真的选了 vx>0 的轨迹"，可脱困模式恒发原地转，出口永远够不着。
+        2026-09-02 板上：33 拍里脱困目标在 +169°/+148° 之间换边 15 次，朝向误差反而从 39°
+        涨到 100°，35 s 一步没走，其间可行前进轨迹有 88/90 条、前方净空 >1.2 m。
+        放手是安全的：这一支的前提就是前方没堵（front_blocked 先被 "blocked" 截走），
+        而 120° 以内前进的靠拢速率 v*cos(误差) 为正、弧线同时在把朝向误差压小。"""
+        if escape_reason != "no-progress":
+            self._noprog_start_ns = 0
+            return escape_reason
+        if now_ns < self._noprog_block_until_ns:
+            return ""
+        if not self._noprog_start_ns:
+            self._noprog_start_ns = now_ns
+        if (now_ns - self._noprog_start_ns) / 1e9 <= self._noprog_max_s:
+            return escape_reason
+        self._noprog_start_ns = 0
+        self._noprog_block_until_ns = now_ns + int(self._noprog_cooldown_s * 1e9)
+        self.get_logger().info(
+            f"no-progress 脱困用满 {self._noprog_max_s:.0f}s 仍无进展，"
+            f"放手 {self._noprog_cooldown_s:.0f}s 让排序走弧线")
+        return ""
+
     def _open_heading(self, center, obstacle_mask, yaw_now, yaw_to_target, min_deg=0):
         """最近的一个「走廊在探针内是空的」朝向，平手时偏目标那一侧。
 
@@ -969,22 +1408,63 @@ class PlanningNode(Node):
                     best_c = c
         return None, best_c
 
+    @staticmethod
+    def _world_yaw_rate(param):
+        """轨迹库参数里的角速度换成**世界系** yaw 角速度。
+
+        🔴 `params[..][1]` 是绕**相机 Y 轴**的角速度（`generate_trajectory_library_3d` 里
+        `rotvec_to_matrix([0, omega*dt, 0])`），而相机光学约定 +y **朝下** —— 绕 +y 正转
+        是俯视顺时针，也就是世界 yaw **负**向。所以两者恒为反号。
+
+        2026-09-01 实测佐证：同一次运行的 79 条决策里，日志打的 `omega`（params 那个）
+        和跟踪器实收的 `w_ref`（世界 wz）**96% 反号、63/72 对绝对值相等**。
+
+        `_pick_turn_toward` 原来直接拿 `params[i][1]` 的符号去和世界系的 `goal_err` 比，
+        于是**恒定选反方向**：车朝着锁定朝向的反面转，一路转到对面 180° 附近才因为 wrap
+        翻号而卡住 —— 实测 `|goal_err|` 中位 158°、**一次都没进过 12° 的到位窗口**。
+        三个现场症状（能走不走一直摆头 / 摆头收敛到与 POI 完全反向 / POI 在反向更不走）
+        全部是这一个符号错。
+
+        车身接近水平时就是取负（俯仰 1° 的量级可以忽略）。"""
+        return -float(param[1])
+
+    def _fastest_within_budget(self, cand, params, err_abs):
+        """剩余误差 err_abs 下转过去不会冲出到位窗口的最快一档。
+
+        全都太快时取**最慢**的那一档而不是最快的：站着不动会让 escape_age 一直涨，
+        而低于轨迹库最小档的角速度本来也发不出来。"""
+        budget = (max(err_abs - self._escape_goal_reached_rad * 0.5, 0.0)
+                  / self.escape_turn_delay_s)
+        mag = lambda i: abs(float(params[i][1]))
+        ok = [i for i in cand if mag(i) <= budget]
+        return max(ok, key=mag) if ok else min(cand, key=mag)
+
     def _pick_turn_toward(self, turns, params, err):
         """转向锁定朝向的那条可行原地转，(下标, 是否走远路) 或 (None, False)。
 
         近路是 |err|，远路是 2*pi-|err|，**两条都收敛到同一个锁定朝向** —— 朝向是固定的，
         所以允许走远路不会来回摆。少了这条会死锁：仿真里出现过 `goal_err=-170deg turns=7`
         而 7 条可行原地转全是反号，于是每一拍都"保持朝向不动"，永远不动。
+
+        🔴 档位按剩余误差选，不是永远选最快的那一档（2026-09-01 撞击后第二次实测定案）。
+        原来是 bang-bang：不管还差 90° 还是差 15° 都发 max_yaw。而 max_yaw x 环路延迟
+        = 1.05 x 1.04 = 62.6°，是 12° 到位窗口的 5.2 倍 —— 每次都冲过头，reached 触发后
+        重扫 _open_heading 得到一个**不同**的朝向（实测 111 s 里换了 12 个），于是车一直
+        转下去：累计 3147°，净转角 1142°，vx=0 占 65% 的决策，而 gate=forward 有 75/78
+        次是开着的（**根本没被堵住**）。按误差选档让"来不及改的转角 <= 剩余误差"自动成立。
         """
+        # err 是世界系的角度差，所以比的必须是世界系的 yaw 角速度，见 _world_yaw_rate
         want = math.copysign(1.0, err)
         near = [int(i) for i in turns
-                if params[i][1] != 0.0 and math.copysign(1.0, params[i][1]) == want]
+                if params[i][1] != 0.0
+                and math.copysign(1.0, self._world_yaw_rate(params[i])) == want]
         if near:
-            return max(near, key=lambda i: abs(float(params[i][1]))), False
+            return self._fastest_within_budget(near, params, abs(err)), False
         far = [int(i) for i in turns if params[i][1] != 0.0]
         if not far:
             return None, False
-        return max(far, key=lambda i: abs(float(params[i][1]))), True
+        return self._fastest_within_budget(
+            far, params, 2.0 * math.pi - abs(err)), True
 
     @staticmethod
     def _fmt_clearance(d, max_dist=0.5):
@@ -1095,20 +1575,26 @@ class PlanningNode(Node):
         msg.data = array.array('b', data.tobytes())
         self.obstacle_mask_pub.publish(msg)
 
-    def _publish_height_color(self, depth, T, fx, fy, cx, cy, floor_z, stamp):
-        """Camera-view height above the floor, fixed palette, for side-by-side with infra1.
+    def _publish_height_color(self, depth, T, fx, fy, cx, cy, floor_z, stamp,
+                              obstacle_mask=None):
+        """相机视角的逐像素判决图，和 infra1 并排看。
 
-        Only the world z is needed, so only R's third row is used -- a full projection
-        would be three times the multiply-adds for two coordinates nothing looks at.
+        默认 obstacle 模式：每个像素投到栅格，报它所在格子被 z 跨度判据判成什么。
+        `TINYNAV_HEIGHT_COLOR_MODE=height` 回到旧的离地高度配色。
         """
         if self.height_color_pub.get_subscription_count() == 0:
             return
+        if (self._infra_sub is None and self.height_color_mode == 'obstacle'
+                and self.verdict_base == 'infra'):
+            self._infra_sub = self.create_subscription(
+                Image, self.infra_topic, self._infra_callback,
+                QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT))
+            self.get_logger().info(f"判决图底图: 订阅 {self.infra_topic}")
         now = self.get_clock().now().nanoseconds
         if now - self._height_color_last_ns < 1e9 / max(self.height_color_hz, 0.1):
             return
         self._height_color_last_ns = now
         # 半分辨率：预览链路本来就把帧缩到 320 px 边长再编码，全分辨率算完全是白花的。
-        # 全分辨率在 PC 上 7.2 ms，板上按 5~8 倍推是 40 ms 级别，而这是 5 Hz 的规划循环。
         d = depth[::self.height_color_stride, ::self.height_color_stride]
         if self._height_color_uv is None or self._height_color_uv[0].shape != d.shape:
             st = self.height_color_stride
@@ -1118,12 +1604,59 @@ class PlanningNode(Node):
         gu, gv = self._height_color_uv
         R = T[:3, :3]
         pw_z = d * (R[2, 0] * gu + R[2, 1] * gv + R[2, 2]) + T[2, 3]
-        idx = np.searchsorted(_HEIGHT_BINS, pw_z - floor_z).astype(np.uint8)
-        idx[d <= 0] = len(_HEIGHT_LUT) - 1
-        msg = self.bridge.cv2_to_imgmsg(_HEIGHT_LUT[idx], encoding='bgr8')
+
+        if self.height_color_mode != 'obstacle' or obstacle_mask is None:
+            idx = np.searchsorted(_HEIGHT_BINS, pw_z - floor_z).astype(np.uint8)
+            idx[d <= 0] = len(_HEIGHT_LUT) - 1
+            img = _HEIGHT_LUT[idx]
+        else:
+            img = self._verdict_image(d, gu, gv, T, pw_z, obstacle_mask)
+        msg = self.bridge.cv2_to_imgmsg(img, encoding='bgr8')
         msg.header.stamp = stamp
         msg.header.frame_id = 'camera'
         self.height_color_pub.publish(msg)
+
+    def _infra_callback(self, msg):
+        # 只存引用，转换留给 2 Hz 的判决图去做 —— 这个回调要尽量便宜。
+        self._infra_msg = msg
+
+    def _verdict_base(self, d):
+        """判决图的底图：红外图优先，没有就用深度当亮度（能看出轮廓但没纹理）。"""
+        msg = self._infra_msg
+        if msg is not None:
+            try:
+                g = self.bridge.imgmsg_to_cv2(msg, desired_encoding='mono8')
+                g = g[::self.height_color_stride, ::self.height_color_stride]
+                if g.shape == d.shape:
+                    return cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
+            except Exception:
+                pass
+        v = np.clip((3.0 - d) / 2.8, 0.0, 1.0) * 0.70 + 0.30
+        v[d <= 0] = 0.22
+        return cv2.cvtColor((v * 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+
+    def _verdict_image(self, d, gu, gv, T, pw_z, obstacle_mask):
+        R = T[:3, :3]
+        pw_x = d * (R[0, 0] * gu + R[0, 1] * gv + R[0, 2]) + T[0, 3]
+        pw_y = d * (R[1, 0] * gu + R[1, 1] * gv + R[1, 2]) + T[1, 3]
+        verdict, st = classify_verdict(
+            self.occupancy_grid, self.origin, self.resolution, T[2, 3],
+            self.camera_height_m, obstacle_mask, d, pw_x, pw_y, pw_z,
+            self.verdict_low_h, self.obstacle_config)
+        if self.stage_log_s > 0.0:
+            tot = verdict.size
+            cnt = np.bincount(verdict.ravel(), minlength=len(_VERDICT_NAMES))
+            self.get_logger().info(
+                "verdict %: " + " ".join(
+                    f"{nm}={100.0 * c / tot:.0f}" for nm, c in zip(_VERDICT_NAMES, cnt))
+                + f" | 格子: 障碍={st['obstacle_cells']}"
+                  f" 矮物被否={st['low_rejected_cells']}"
+                  f" 只有地面={st['ground_only_cells']}"
+                  f" 空列={st['empty_cols']}"
+                  f" 门限={self.obstacle_config.min_wall_span_m:.2f}m"
+                  f" 离地界={self.verdict_low_h:.2f}m",
+                throttle_duration_sec=self.stage_log_s)
+        return tint_verdict(self._verdict_base(d), verdict)
 
     def publish_height_map(self, origin, esdf_map, header):
         height_normalized = np.clip(esdf_map / 2.0 * 255, 0, 255).astype(np.uint8)
@@ -1307,6 +1840,8 @@ class PlanningNode(Node):
     def _worst_footprint_point(self, esdf_map, init_p, init_q):
         """车体取样点里 ESDF 最小的那个 —— 侵入最深处，梯度在那里取才有意义。
         取样铺满方式和 score_trajectories_by_ESDF 一致，别让两处判据不同。"""
+        if self.robot.is_circle:
+            return (float(init_p[0]), float(init_p[1]))
         fl, rl, hw = self.robot.footprint_from_control()
         fwd = self._forward_of(init_q)
         left = (-fwd[1], fwd[0])
@@ -1396,11 +1931,54 @@ class PlanningNode(Node):
             return np.asarray(raw).astype(np.float32) / 1000.0
         return self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='32FC1')
 
-    @Timer(name="Planning Loop", text="\n\n[{name}] Elapsed time: {milliseconds:.0f} ms", logger=_TIMER_LOGGER)
     def sync_callback(self, depth_msg, pose_msg):
+        """只存最新的一对，真正的规划在 _plan_tick 里做。
+
+        🔴 message_filters 是 FIFO：在回调里直接干活，就永远在处理队列头那个【最旧的、
+        还没过期的】集合，即使后面已经躺着一个新 0.2 s 的。实测 /slam/depth 到手时
+        数据龄 163 ms，而决策做出时 stamp_lag 已经 590 ms —— 中间 ~230 ms 纯粹是排队。
+        队列深度不能动（30 改 3 那次把发布间隔从 1.17 s 打到 3.2 s，车停了），
+        所以改的是取用策略：回调只赋值，让队列全速排空，定时器永远拿最新那一个。
+        """
+        if not self._plan_latest_only:
+            self._plan_measured(depth_msg, pose_msg)
+            return
+        self._pending_set = (depth_msg, pose_msg)
+
+    def _plan_tick(self):
+        pending, self._pending_set = self._pending_set, None
+        if pending is not None:
+            self._plan_measured(*pending)
+
+    def _lat_age(self, stamp) -> float:
+        now = self.get_clock().now().nanoseconds
+        return (now - (stamp.sec * 1_000_000_000 + stamp.nanosec)) / 1e9
+
+    def _plan_measured(self, depth_msg, pose_msg):
+        """深度和位姿是两条独立的戳，必须分开记。
+
+        位姿由 diffcar_control 在【发布时】打 now，所以 p_in 不含任何传感器延迟，
+        纯粹是 ROS 侧的传输+排队；深度的戳是相机采集时刻，d_in 含双目计算。
+        混成一个数会把这两件完全不同的事算到一起 —— 我就栽过。
+        """
+        if not self._lat.enabled:
+            self._plan_once(depth_msg, pose_msg)
+            return
+        d_in = self._lat_age(depth_msg.header.stamp)
+        p_in = self._lat_age(pose_msg.header.stamp)
+        self._lat.add('d_in', d_in)
+        self._lat.add('p_in', p_in)
+        self._lat.add('skew', d_in - p_in)
+        self._plan_once(depth_msg, pose_msg)
+        self._lat.add('d_out', self._lat_age(depth_msg.header.stamp))
+        self._lat.tick()
+
+    @Timer(name="Planning Loop", text="\n\n[{name}] Elapsed time: {milliseconds:.0f} ms", logger=_TIMER_LOGGER)
+    def _plan_once(self, depth_msg, pose_msg):
         if self.K is None:
             return
         age_s = (self.get_clock().now() - Time.from_msg(pose_msg.header.stamp)).nanoseconds / 1e9
+        self._last_entry_age_s = age_s
         if age_s > self.max_input_age_s:
             now_ns = self.get_clock().now().nanoseconds
             if now_ns - self._last_stale_log_ns >= 1_000_000_000:
@@ -1409,7 +1987,10 @@ class PlanningNode(Node):
                     f"dropping stale synced set: {age_s:.2f}s old (limit {self.max_input_age_s:.2f}s) -- "
                     "planning is not keeping up with the depth rate"
                 )
+            self._stale_in_win += 1
             return
+        self._log_stage_timing(self.get_clock().now().nanoseconds,
+                               Time.from_msg(depth_msg.header.stamp).nanoseconds / 1e9)
         with Timer(name='preprocess', text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=_TIMER_LOGGER):
             depth = self._depth_meters(depth_msg)
             stamp = Time.from_msg(pose_msg.header.stamp).nanoseconds / 1e9
@@ -1430,6 +2011,20 @@ class PlanningNode(Node):
             center = (self.origin + np.array(self.grid_shape) * self.resolution / 2
                       - self.grid_offset)
             robot_pos = T[:3, 3]
+            if self._pose_prev is not None:
+                pdt = max(stamp - self._pose_prev[0], 1e-3)
+                pmv = float(np.linalg.norm(robot_pos[:2] - self._pose_prev[1]))
+                if pmv > self._pose_jump_speed * pdt:
+                    self.get_logger().error(
+                        f"位姿瞬移 {pmv:.2f}m/{pdt:.2f}s = {pmv / pdt:.2f} m/s "
+                        f"(上限 {self._pose_jump_speed:.2f}) —— 世界系变了，整张障碍图作废，"
+                        f"接下来 {self._blind_s:.1f}s 不前进")
+                    self.occupancy_grid[:] = 0.0
+                    self._low_obstacle[:] = 0.0
+                    self._obstacle_first_seen[:] = 0.0
+                    self._last_decay_stamp = None
+                    self._blind_until = stamp + self._blind_s
+            self._pose_prev = (stamp, robot_pos[:2].copy())
             delta = robot_pos - center
             if np.linalg.norm(delta) > .1:
                 new_center = robot_pos
@@ -1438,8 +2033,25 @@ class PlanningNode(Node):
                 shift_xy = np.round((new_origin[:2] - self.origin[:2]) / self.resolution).astype(int)
                 self.occupancy_grid, self.origin = roll_occupancy_grid(self.occupancy_grid, self.origin, new_origin, self.resolution)
                 self._low_obstacle = _roll_2d(self._low_obstacle, shift_xy)
-            new_occ = run_raycasting_loopy(depth, T, self.grid_shape, fx, fy, cx, cy, self.origin, self.step, self.resolution)
-            self.occupancy_grid *= 0.99
+                # 🔴 年龄数组也得跟着挪。以前没挪：车一走栅格就整体平移，年龄数组留在
+                # 原索引上，于是"连续存在时长"在移动时恒为 0 —— 是记账假象，不是图在闪。
+                self._obstacle_first_seen = _roll_2d(self._obstacle_first_seen, shift_xy)
+                self._obstacle_last_seen = _roll_2d(self._obstacle_last_seen, shift_xy)
+            if self.carve_step == self.step:
+                new_occ = run_raycasting_loopy(depth, T, self.grid_shape, fx, fy, cx, cy,
+                                               self.origin, self.step, self.resolution)
+            else:
+                new_occ = run_raycasting_split(depth, T, self.grid_shape, fx, fy, cx, cy,
+                                               self.origin, self.step, self.carve_step,
+                                               self.resolution)
+            # 夹在 [1, 8] 个参考周期内：丢帧后 dt 可能很大，不夹会把整张图一次抹掉；
+            # 而 dt 反常地小（时间戳倒退）时至少衰减一次。
+            dt_decay = (self._decay_ref_dt if self._last_decay_stamp is None
+                        else min(max(stamp - self._last_decay_stamp, self._decay_ref_dt),
+                                 8.0 * self._decay_ref_dt))
+            self._last_decay_stamp = stamp
+            n_ref = dt_decay / self._decay_ref_dt
+            self.occupancy_grid *= 0.99 ** n_ref
             self.occupancy_grid += new_occ
             # In place: np.clip without out= allocated a fresh grid every cycle and
             # dropped the old one. On this board that is pure DDR traffic in the loop
@@ -1452,18 +2064,18 @@ class PlanningNode(Node):
                     depth, T, self.grid_shape, fx, fy, cx, cy, self.origin,
                     self.step, self.resolution, T[2, 3] - self.camera_height_m,
                     self.low_obs_h_lo, self.low_obs_h_hi, self.low_obs_max_range_m)
-                self._low_obstacle *= 0.9
+                self._low_obstacle *= 0.9 ** n_ref
                 self._low_obstacle[hits >= self.low_obs_min_pts] += 0.1
                 np.clip(self._low_obstacle, 0.0, 0.2, out=self._low_obstacle)
-            self._publish_height_color(depth, T, fx, fy, cx, cy,
-                                       T[2, 3] - self.camera_height_m,
-                                       depth_msg.header.stamp)
-
             # Nothing but the app's 3D local view consumes this, so it follows the same
             # gate as the overlays below rather than get_subscription_count() -- see
             # _ui_active for why the count cannot answer the question.
-            if self._ui_active:
-                self.publish_3d_occupancy_cloud(self.occupancy_grid, self.resolution, self.origin)
+            # 只要局部视图开着就发，而它只在 3D 模式下被画 —— 「要不要 3D」那个标志
+            # (_want_voxels) 只在后端，planning 不知道。所以给一个总开关：3D 视图用得少，
+            # 关掉是纯削减。TINYNAV_PUBLISH_VOXELS=0 关。
+            if self._ui_active and _PUBLISH_VOXEL_CLOUD:
+                with Timer(name='vis:voxels', text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=_TIMER_LOGGER):
+                    self.publish_3d_occupancy_cloud(self.occupancy_grid, self.resolution, self.origin)
 
         # 每周期都看，包括没有目标的时候 —— 卡住之后要回溯的正是卡住之前走过的地方。
         self._record_centre(self.camera_to_robot_center(T),
@@ -1476,6 +2088,14 @@ class PlanningNode(Node):
             )
             if self.low_obs_enabled:
                 obstacle_mask = obstacle_mask | (self._low_obstacle > 0.1)
+            if not self._min_vis_logged:
+                self._min_vis_logged = True
+                self.get_logger().info(
+                    f"obstacle 最小可见高度: "
+                    f"{self._min_visible_height_m(self.origin[2], T[2, 3]) * 1000:.0f} mm "
+                    f"(离地; 低于它的东西 z 跨度不够，恒不是障碍) "
+                    f"origin_z={self.origin[2]:+.3f} grid_offset_z={self.grid_offset[2]:.4f} "
+                    f"cam_h={self.camera_height_m:.3f}")
             self._track_obstacle_age(obstacle_mask)
             ESDF_map = distance_transform_edt(~obstacle_mask).astype(np.float32) * self.resolution
             # Before the no-target return below, so the UI keeps reading a clearance
@@ -1486,6 +2106,12 @@ class PlanningNode(Node):
             self._publish_diagnostics(front_clearance, obstacle_mask, ESDF_map, T, stamp)
 
         with Timer(name='vis', text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=_TIMER_LOGGER):
+            # 判决图要 obstacle_mask，所以必须在 build_obstacle_map 之后 —— 以前它在
+            # raycasting 段里、拿不到 mask。放在 vis 段里计时归属也才对。
+            with Timer(name='vis:verdict', logger=None):
+                self._publish_height_color(depth, T, fx, fy, cx, cy,
+                                           T[2, 3] - self.camera_height_m,
+                                           depth_msg.header.stamp, obstacle_mask)
             if _PUBLISH_ESDF_CLOUD:
                 self.publish_3d_occupancy_cloud_with_esdf(self.occupancy_grid, ESDF_map, self.resolution, self.origin)
             # These three are the app's local-view layers, and they are one group, not
@@ -1621,6 +2247,11 @@ class PlanningNode(Node):
             route_xy = self._route_xy if self.route_cost_enabled else None
             path_dist_map, remaining_map, has_route = build_route_fields(
                 route_xy, ESDF_map.shape, self.origin, self.resolution)
+            _rb_arc, _rb_min = self._route_block_ahead(ESDF_map, route_xy, init_p)
+            route_unpinned = bool(
+                self.route_unpin_on_block and has_route
+                and _rb_min == _rb_min and _rb_min < self.robot.hard_clearance)
+            w_path_follow = 0.0 if route_unpinned else self.w_path_follow
             scores, occ_points, path_costs, end_remainings = self._score_trajectories(
                 trajectories, ESDF_map, params, path_dist_map, remaining_map)
 
@@ -1631,17 +2262,77 @@ class PlanningNode(Node):
             # 「前方堵住」= 一条前进轨迹都不可行，不再是一条直线探针跨过某个数字。
             # 这同时去掉了一个抖动源：旧判据在阈值附近来回跨越，堵/不堵两个状态的可行集
             # 完全不同，于是车在两套动作之间跳（2026-08-25 实测摆了 10 s）。
+            _t_prefix = Timer(name='pub:prefix', logger=None); _t_prefix.start()
             prefix_clear = self._prefix_clearance(trajectories, ESDF_map)
-            forward_ok = prefix_clear >= self.prefix_margin_m
-            front_blocked = not any(
-                forward_ok[i] for i in range(len(params))
-                if params[i][0] > 0.0 and not self._is_turn_in_place(params[i]))
+            forward_ok = prefix_clear >= self._prefix_gate_m()
+            fwd_idx = [i for i in range(len(params))
+                       if params[i][0] > 0.0 and not self._is_turn_in_place(params[i])]
+            n_fwd_ok = sum(1 for i in fwd_idx if forward_ok[i])
+            front_blocked = self._blocked_latched(
+                not any(forward_ok[i] for i in fwd_idx), n_fwd_ok)
+            _t_prefix.stop()
+
+            def heading_cost(traj, target_pose):
+                """轨迹终点处「车头朝向」与「终点到目标的方位」之差的绝对值（弧度）。
+
+                对位移轨迹这一项几乎不变（弧线终点朝向≈行进方向），对原地转却是唯一有意义
+                的判据 —— 见 self.w_heading 的注释。"""
+                if target_pose is None:
+                    return 0.0
+                ex, ey = float(traj[-1, 0]), float(traj[-1, 1])
+                qx, qy, qz, qw = (float(traj[-1, 3]), float(traj[-1, 4]),
+                                  float(traj[-1, 5]), float(traj[-1, 6]))
+                fx = 2.0 * (qx * qz + qw * qy)
+                fy = 2.0 * (qy * qz - qw * qx)
+                if fx * fx + fy * fy < 1e-12:
+                    return 0.0
+                yaw_end = math.atan2(fy, fx)
+                dx, dy = float(target_pose[0]) - ex, float(target_pose[1]) - ey
+                # 目标很近时"到目标的方位"纯是噪声，1 mm 的门限等于没有门限：
+                # 2026-09-02 实测目标只差 0.067 m（相机光心与控制中心的偏置）时，
+                # 这一项仍是原地转的唯一区分项，把车带得持续慢转 127 拍。
+                if dx * dx + dy * dy < self.heading_min_dist_m ** 2:
+                    return 0.0
+                return abs(self._wrap(math.atan2(dy, dx) - yaw_end))
+
+            # 分项留痕。「为什么选了这条」以前完全不可观测，只能靠离线复算猜，而内部 ESDF
+            # 和发布出去的 obstacle_mask 不是同一份，复算必然对不上。
+            cost_parts = [None] * len(trajectories)
+            # 圆盘的整条轨迹中心最小净空 —— 和内核的碰撞判据同源（内核对圆也是中心单点）。
+            # 🔴 从第 1 步起，不含起点。所有轨迹的第 0 点是【同一个】当前位姿，所以只要
+            # 车已经贴着障碍（当前位置就是全程最紧的点），min 里的那个值对 110 条候选
+            # 完全相同 —— 障碍势垒退化成常数，一条也区分不出来。
+            # 2026-09-03 仿真实测：route_thru_wall 卡住时 110 条候选全是
+            # `clr=0.200 obst=25`，唯一还在区分的是朝向项，于是车原地转到超时（121 次变向）。
+            # 势垒本该回答"往哪走更安全"，含起点时它只能回答"我现在危不危险"。
+            _c0 = 0 if self.barrier_include_start else 1
+            clear_min = (self._esdf_lookup(ESDF_map, trajectories[:, _c0:, 0],
+                                           trajectories[:, _c0:, 1]).min(axis=1)
+                         if self.robot.is_circle else None)
+
+            def obstacle_cost(idx, score):
+                """soft 处连续归零、往 hard 发散的势垒。方形底盘保持原样不动。"""
+                if score == float('inf'):
+                    return float('inf')
+                if clear_min is None:
+                    return score * 100000
+                d = float(clear_min[idx])
+                soft, hard = self.robot.soft_clearance, self.robot.hard_clearance
+                if not math.isfinite(d) or d >= soft:
+                    return 0.0
+                return self.w_obstacle * (1.0 / (max(d, hard) - hard + 1e-3)
+                                          - 1.0 / (soft - hard + 1e-3))
+
+            idle_scale = min(1.0, max(0.0,
+                (target_dist_xy - self.idle_free_m) / max(self.idle_free_m, 1e-6)))
 
             def cost_function(traj, param, score, target_pose, idx):
                 gate_penalty = self._motion_gate_penalty(
                     param, idx, forward_ok, front_blocked)
                 smoothness = (40 * abs(self.last_param[0] - param[0])
                               + 10 * abs(self.last_param[1] - param[1]))
+                # 原地转和完全停住拿到同一个值，所以它们内部的相对排名不变。
+                idle = self.w_idle * idle_scale if abs(param[0]) < self.idle_vx_eps else 0.0
 
                 if not has_route:
                     # 没有路线就退回原来的贪心终点距离。
@@ -1652,7 +2343,10 @@ class PlanningNode(Node):
                     traj_end = np.array(traj[-1, :3])
                     target_end = target_pose if target_pose is not None else traj_end
                     dist = np.linalg.norm(traj_end[:2] - target_end[:2])
-                    return score * 100000 + 100 * dist + smoothness + gate_penalty
+                    hd = self.w_heading * heading_cost(traj, target_pose)
+                    ob = obstacle_cost(idx, score)
+                    cost_parts[idx] = (ob, 100 * dist, 0.0, smoothness, gate_penalty, hd, idle)
+                    return ob + 100 * dist + smoothness + gate_penalty + hd + idle
 
                 # 有路线：按"沿路线还剩多远"算进展，按"离路线最远多少"算贴合度。
                 # 直线距离在绕障时是个局部极小，这两项没有 —— 路线本身已经绕过去了。
@@ -1660,12 +2354,20 @@ class PlanningNode(Node):
                 if end_remainings[idx] < self.route_terminal_band and target_pose is not None:
                     terminal = self.w_goal_terminal * float(
                         np.linalg.norm(traj[-1, :2] - target_pose[:2]))
-                return (score * 100000
+                hd = self.w_heading * heading_cost(traj, target_pose)
+                ob = obstacle_cost(idx, score)
+                cost_parts[idx] = (ob,
+                                   self.w_route_progress * end_remainings[idx] + terminal,
+                                   w_path_follow * path_costs[idx],
+                                   smoothness, gate_penalty, hd, idle)
+                return (ob
                         + self.w_route_progress * end_remainings[idx]
-                        + self.w_path_follow * path_costs[idx]
+                        + w_path_follow * path_costs[idx]
                         + terminal
                         + smoothness
-                        + gate_penalty)
+                        + gate_penalty
+                        + hd
+                        + idle)
 
             # path
             path = Path()
@@ -1677,6 +2379,15 @@ class PlanningNode(Node):
                 self._publish_static_path(
                     init_p, init_q, depth_msg.header, base_time, len(trajectories[0]),
                     "No target pose"
+                )
+                return
+
+            if stamp < self._blind_until:
+                self._publish_static_path(
+                    init_p, init_q, depth_msg.header, base_time, len(trajectories[0]),
+                    f"位姿刚瞬移，障碍图重建中（还剩 {self._blind_until - stamp:.1f}s）"
+                    f"—— 这时候的空白地图不代表没有障碍",
+                    log_key="blind after jump",
                 )
                 return
 
@@ -1713,8 +2424,10 @@ class PlanningNode(Node):
             yaw_to_target = math.atan2(float(to_t[1]), float(to_t[0]))
 
             top_k = 1
-            costs = np.array([cost_function(trajectories[i], params[i], scores[i], self.target_pose, i)
-                              for i in range(len(trajectories))])
+            with Timer(name='pub:cost', logger=None):
+                costs = np.array([cost_function(trajectories[i], params[i], scores[i],
+                                                self.target_pose, i)
+                                  for i in range(len(trajectories))])
             top_indices = np.argsort(costs, kind='stable')[:top_k]
             turned_in_place = False
             long_way = False
@@ -1794,6 +2507,7 @@ class PlanningNode(Node):
                 escape_reason = self._escape_reason(
                     front_blocked, stand_dist,
                     abs(self._wrap(yaw_to_target - yaw_now)), best_gain)
+                escape_reason = self._noprogress_budget(escape_reason, now_ns)
 
                 if escape_reason and turns:
                     # 连续计时，不是"上次脱困以来"。全灭/无解那两条分支是提前 return 的，
@@ -1811,12 +2525,27 @@ class PlanningNode(Node):
                                 if self._escape_goal_yaw is not None else 0.0)
                     reached = abs(goal_err) < self._escape_goal_reached_rad
                     if self._escape_goal_yaw is None or expired or reached:
-                        # 转到位了但前面还是堵着，说明这个朝向选错了 —— 重新扫，且要求新朝向
-                        # 至少偏出"已到位"的容差，否则会原地反复选中同一个朝向。
-                        g, escape_clear = self._open_heading(
-                            centre, obstacle_mask, yaw_now, yaw_to_target,
-                            min_deg=(math.degrees(self._escape_goal_reached_rad)
-                                     if reached and self._escape_goal_yaw is not None else 0))
+                        # 🔴 escape=heading 要转向**目标**，不能用 _open_heading（2026-09-01
+                        # 实测定案）。_open_heading 是从当前朝向往外扫、返回第一个够空的方向，
+                        # 是为"前方堵住、找最近的出口"设计的；而 heading 这一支恰恰是**前方
+                        # 开着**（实测 39 次里 blocked 中位只有 42/110），于是 step=0 就命中，
+                        # 返回的就是当前朝向本身 —— 日志里 `goal=-1deg yaw=-1deg
+                        # to_target=+127deg` 就是它。goal_err 立刻为 0 -> reached -> 带
+                        # min_deg=12° 重扫 -> 得到 yaw±12° -> 转 12° -> 又 reached，成了一个
+                        # 朝目标那侧的 12° 棘轮：111 s 累计转 3147°、净转 1142°，而 vx=0
+                        # 占了 65% 的决策。转向目标之后 heading_err 落回门限内，脱困自然退出。
+                        if escape_reason == "heading":
+                            g = yaw_to_target
+                            escape_clear = float(self._clearance_along(
+                                centre, math.cos(g), math.sin(g), obstacle_mask))
+                        else:
+                            # 转到位了但前面还是堵着，说明这个朝向选错了 —— 重新扫，且要求
+                            # 新朝向至少偏出"已到位"的容差，否则会反复选中同一个朝向。
+                            g, escape_clear = self._open_heading(
+                                centre, obstacle_mask, yaw_now, yaw_to_target,
+                                min_deg=(math.degrees(self._escape_goal_reached_rad)
+                                         if reached and self._escape_goal_yaw is not None
+                                         else 0))
                         if g is None:
                             # 一圈都没有能证明是空的朝向。朝一边扫 90°，别站着。方向只在
                             # 本次脱困第一次进到这里时定，之后一直沿用。
@@ -1887,15 +2616,23 @@ class PlanningNode(Node):
                 self._escape_goal_yaw = None
                 self._escape_goal_ns = 0
                 self._escape_sweep_side = None
-            if now_ns - self._last_static_log_ns.get("decision", 0) >= 1_000_000_000:
+            _dec_gap_ns = 0 if self.decision_log_hz <= 0 else int(1e9 / self.decision_log_hz)
+            _t_log = Timer(name='pub:log', logger=None)
+            if now_ns - self._last_static_log_ns.get("decision", 0) >= _dec_gap_ns:
+                _t_log.start()
                 cycle_s = (now_ns - self._last_cycle_ns) / 1e9 if self._last_cycle_ns else float('nan')
                 self._last_static_log_ns["decision"] = now_ns
                 self.get_logger().info(
                     f"decision: {'RETREAT ' if retreating else ''}"
-                    f"{'TURN-IN-PLACE ' if turned_in_place else ''}chose vx={params[best_idx][0]:+.3f} omega={params[best_idx][1]:+.3f} "
+                    # omega 打**世界系**的值。原来打的是 params 里绕相机 Y 轴那个，
+                    # 和同一行的 yaw/to_target/heading_err/goal（全是世界系）差一个负号
+                    # —— 2026-09-01 我据此误判了两轮，以为是跟踪器把符号弄反了。
+                    f"{'TURN-IN-PLACE ' if turned_in_place else ''}chose vx={params[best_idx][0]:+.3f} "
+                    f"omega={self._world_yaw_rate(params[best_idx]):+.3f} "
                     f"(cap {self.robot.max_vx:.2f}) blocked={n_blocked}/{len(scores)} "
                     f"front_clearance={self._fmt_clearance(front_clearance, self.front_probe_max_m)} "
                     f"gate={'turn-only' if front_blocked else 'forward'} "
+                    f"fwd_ok={int(np.count_nonzero(forward_ok[fwd_idx]))}/{len(fwd_idx)} "
                     f"escape={escape_reason or 'off'} turns={len(turns)} "
                     f"goal={'-' if self._escape_goal_yaw is None else f'{math.degrees(self._escape_goal_yaw):+.0f}deg'}"
                     f"{'(long way)' if turned_in_place and long_way else ''} "
@@ -1910,10 +2647,33 @@ class PlanningNode(Node):
                     f"esdf_at_robot={self._esdf_at(ESDF_map, init_p):.2f}m "
                     f"yaw={math.degrees(yaw_now):+.0f}deg to_target={math.degrees(yaw_to_target):+.0f}deg "
                     f"heading_err={math.degrees(self._wrap(yaw_to_target - yaw_now)):+.0f}deg "
-                    f"cycle={cycle_s:.2f}s stamp_lag={(now_ns / 1e9 - stamp):.2f}s"
+                    f"cycle={cycle_s:.2f}s stamp_lag={(now_ns / 1e9 - stamp):.2f}s "
+                    # 进回调时就已经这么老 = 相机+bridge+排队；stamp_lag 减它 = 本节点计算
+                    f"pose_age={self._last_entry_age_s:.2f}s "
+                    # 路线自己被挡在前方多远（inf=没挡）、以及这段路线上的最小净空。
+                    f"route_block={_rb_arc:.2f}m route_clear={_rb_min:.2f}m"
+                    f"{' ROUTE-UNPINNED' if route_unpinned else ''}"
                 )
+                def _cand(i):
+                    o, pr, pf, sm, g, h, idl = cost_parts[i]
+                    cl = (f" clr={clear_min[i]:.3f}" if clear_min is not None else "")
+                    return (f"vx={params[i][0]:+.3f} w={self._world_yaw_rate(params[i]):+.3f}"
+                            f"{cl} obst={o:.0f} prog={pr:.0f} path={pf:.0f} sm={sm:.1f}"
+                            f" gate={g:.0e} head={h:.1f} idle={idl:.0f} = {costs[i]:.0f}")
+                rank = [int(i) for i in np.argsort(costs, kind='stable')
+                        if cost_parts[i] is not None]
+                self.get_logger().info(
+                    "candidates: " + " | ".join(_cand(i) for i in rank[:4]))
+                # 前进轨迹单独排一次：整体前几名常常被 vx=0 那一排 15 条占满，看不到
+                # 「最好的前进选项差在哪一项」——而那才是「该走不走」唯一要看的东西。
+                fwd_rank = [i for i in rank if params[i][0] > 0.0][:4]
+                if fwd_rank:
+                    self.get_logger().info(
+                        "best forward: " + " | ".join(_cand(i) for i in fwd_rank))
+                _t_log.stop()
             self._last_cycle_ns = now_ns
 
+            _t_emit = Timer(name='pub:emit', logger=None); _t_emit.start()
             for i in top_indices:
                 for j in range(0, len(trajectories[i]), 1):
                     x,y,z,qx,qy,qz,qw = trajectories[i][j, :7]
@@ -1930,6 +2690,7 @@ class PlanningNode(Node):
                     pose.pose.orientation.w = qw
                     path.poses.append(pose)
             self.path_pub.publish(path)
+            _t_emit.stop()
             if now_ns - self._last_static_log_ns.get("traj_pub", 0) >= 1_000_000_000:
                 self._last_static_log_ns["traj_pub"] = now_ns
                 pts = np.array([[q.pose.position.x, q.pose.position.y, q.pose.position.z]

@@ -32,7 +32,7 @@ from nav_msgs.msg import OccupancyGrid, Odometry, Path as RosPath
 from pydantic import BaseModel
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, QoSProfile
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import CameraInfo, Image, PointCloud
 from std_msgs.msg import Bool
@@ -265,9 +265,13 @@ class RosPlanningSimNode(Node):
 
         self.create_subscription(Twist, "/cmd_vel", self.cmd_callback, 10)
         self.create_subscription(RosPath, "/planning/trajectory_path", self.path_callback, 10)
-        self.create_subscription(PointCloud, "/planning/footprint", self.footprint_callback, 10)
-        self.create_subscription(OccupancyGrid, "/planning/obstacle_mask", self.obstacle_callback, 10)
-        self.create_subscription(OccupancyGrid, "/planning/occupancy_grid", self.esdf_callback, 10)
+        # 🔴 这三个是 planning_node 的可视化话题，发布端是 BEST_EFFORT。用默认的 RELIABLE
+        # 订阅就是零投递且完全静默 —— 于是 footprint 永远是空的，clearance_to_objects 返回
+        # inf，「最小净空」打成 nan 而「压进障碍」恒为 0。也就是碰撞判据整个失效而测试照样报 OK。
+        viz_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+        self.create_subscription(PointCloud, "/planning/footprint", self.footprint_callback, viz_qos)
+        self.create_subscription(OccupancyGrid, "/planning/obstacle_mask", self.obstacle_callback, viz_qos)
+        self.create_subscription(OccupancyGrid, "/planning/occupancy_grid", self.esdf_callback, viz_qos)
         self.create_timer(1.0 / 8.0, self.tick)
 
     def _apply_map_from_config(self, config: dict[str, Any]) -> None:
@@ -753,7 +757,8 @@ def sim_state() -> dict[str, Any]:
 def main() -> None:
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8766)
+    # 端口可配：上游那份仿真也写死 8766，要两边同时开就得错开。
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("TINYNAV_SIM_PORT", "8766")))
 
 
 if __name__ == "__main__":

@@ -40,6 +40,28 @@ _MAX_BUNDLES = 10
 # it was there to record.
 _STATS_PY = '/userdata/x5/tinynav/tool/x5_board/run_stats.py'
 _STATS_PERIOD_S = '1'
+# 第二个"start 真的会启动"的写入者：指令 / 编码器实测 / VIO 三路速度的数值时间序列。
+# 节点日志只说规划器**认为**发生了什么，这个说车**实际**怎么动的 —— 撞车分析要分开
+# "决策错了"和"执行错了"，缺一边就只能猜。
+# nice +10：板上 CPU 常态 7/8 核，瓶颈是排队不是吞吐，让它输给所有导航节点。
+# TINYNAV_RUN_PROBE=0 关掉（要一次 app 重启），用来取"没有探针"的延迟基线。
+_PROBE_PY = '/userdata/x5/tinynav/tool/x5_board/abcd_probe.py'
+_PROBE_STREAMS = ('cmd', 'teleop', 'odom', 'vio')
+
+
+def _nav_pose_topic() -> str:
+    """导航实际闭环用的位姿话题。
+
+    探针那一路的默认值是 /camera/camera/vio_image，而关掉固件 VIO 之后
+    （user_params.json 的 vio_enabled=false）那个话题【根本不 advertise】——
+    订阅它只会安静地产出一个空 CSV，采回来才发现白跑一趟。
+    跟着 TINYNAV_ODOM_SOURCE 走，和 node_manager._control_pose_topic() 同一个判据。
+    文件名仍叫 *_vio.csv：改名会打断所有已有的分析脚本，而"哪条话题"写在
+    CSV 头里更可靠。"""
+    return ('/wheel/camera_pose'
+            if os.environ.get('TINYNAV_ODOM_SOURCE', 'vio') == 'wheel'
+            else '/camera/camera/vio_image')
+_PROBE_MAX_S = '7200'
 
 
 def _log_dir() -> Path:
@@ -85,6 +107,55 @@ def _start_sampler() -> str | None:
 
 def _stop_sampler() -> None:
     subprocess.run(['pkill', '-f', f'python3 {_STATS_PY}'], capture_output=True)
+
+
+def _probe_enabled() -> bool:
+    return os.environ.get('TINYNAV_RUN_PROBE', '1').strip() not in ('0', 'false', 'no')
+
+
+def _start_probe() -> str | None:
+    """三路速度采集。返回文件名前缀（不含 _cmd.csv 那一截），或 None。"""
+    if not _probe_enabled() or not Path(_PROBE_PY).exists():
+        return None
+    d = _log_dir()
+    before = set(d.glob('abcd_*_odom.csv'))
+    try:
+        # 环境靠继承：app_start.sh 已经 source 过 env.sh，uvicorn 自己就带着 ROS 的
+        # AMENT_PREFIX_PATH / PYTHONPATH，另拼一份反而会漏。
+        subprocess.Popen(['nice', '-n', '10', 'python3', _PROBE_PY,
+                          '--drive', 'none', '--duration', _PROBE_MAX_S,
+                          '--vio-topic', _nav_pose_topic(),
+                          '--out', str(d / 'abcd')],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except Exception:
+        return None
+    # 它按自己的时钟命名，所以只能找不能猜；四个文件在 spin 之前就建好了。
+    for _ in range(30):
+        time.sleep(0.1)
+        fresh = set(d.glob('abcd_*_odom.csv')) - before
+        if fresh:
+            return fresh.pop().name[:-len('_odom.csv')]
+    return None
+
+
+def _stop_probe() -> None:
+    # SIGTERM 不是 SIGKILL：脚本自己捕获了它，会把缓冲刷干净再退。
+    subprocess.run(['pkill', '-TERM', '-f', f'python3 {_PROBE_PY}'], capture_output=True)
+
+
+def _probe_rows(prefix: str | None) -> dict | None:
+    """每一路已经落了多少行。某一路 0 行本身就是证据：没人在发那个话题。"""
+    if not prefix:
+        return None
+    out = {}
+    for name in _PROBE_STREAMS:
+        try:
+            out[name] = max(0, (_log_dir() / f'{prefix}_{name}.csv'
+                                ).read_bytes().count(b'\n') - 1)
+        except Exception:
+            out[name] = None
+    return out
 
 
 def _validate_bundle(name: str) -> str:
@@ -175,6 +246,8 @@ def collect_status() -> dict:
         'startedAt': m.get('t') if m else None,
         'elapsedS': round(time.time() - m['t'], 1) if m else None,
         'label': m.get('label') if m else None,
+        'probe': m.get('probe') if m else None,
+        'probeRows': _probe_rows(m.get('probe')) if m else None,
     }
 
 
@@ -186,7 +259,9 @@ def collect_start(label: str = '') -> dict:
         p = d / name
         marker['files'][name] = p.stat().st_size if p.exists() else 0
     _stop_sampler()          # 上一次没正常停的话，别留两个采样器同时写
+    _stop_probe()
     marker['stats'] = _start_sampler()
+    marker['probe'] = _start_probe()
     _marker_path().write_text(json.dumps(marker, indent=2))
     return collect_status()
 
@@ -197,6 +272,8 @@ def collect_stop() -> dict:
     if m is None:
         raise HTTPException(409, 'Not collecting')
     _stop_sampler()
+    _stop_probe()
+    time.sleep(0.4)          # 探针捕获了 SIGTERM，给它把最后一批行刷完的时间
     d = _log_dir()
     stamp = time.strftime('%Y%m%d_%H%M%S', time.localtime(m['t']))
     out = _bundle_dir() / f'run_{stamp}.tar.gz'
@@ -216,6 +293,28 @@ def collect_stop() -> dict:
             raw = (d / stats).read_bytes()
             contents.append({'name': stats, 'size': len(raw),
                              'lines': raw.count(b'\n')})
+        probe = m.get('probe')
+        if probe:
+            pdir = staged / 'abcd'
+            pdir.mkdir()
+            for name in _PROBE_STREAMS:
+                src = d / f'{probe}_{name}.csv'
+                if src.exists() and src.stat().st_size:
+                    shutil.copy2(src, pdir / src.name)
+                    raw = src.read_bytes()
+                    contents.append({'name': f'abcd/{src.name}', 'size': len(raw),
+                                     'lines': raw.count(b'\n')})
+        # 跟踪器的逐条指令记录。它是唯一能分开"规划器选错了"和"跟踪器执行反了"的东西。
+        dbg = d / 'cmd_vel_debug'
+        if dbg.is_dir():
+            ddir = staged / 'cmd_vel_debug'
+            ddir.mkdir()
+            for src in sorted(dbg.iterdir()):
+                if src.is_file() and src.stat().st_size:
+                    shutil.copy2(src, ddir / src.name)
+                    raw = src.read_bytes()
+                    contents.append({'name': f'cmd_vel_debug/{src.name}',
+                                     'size': len(raw), 'lines': raw.count(b'\n')})
         for name in _WHOLE:
             src = d / name
             if src.exists() and src.stat().st_size:
@@ -244,7 +343,9 @@ def collect_stop() -> dict:
         # 哪些节点这次一个字都没写下来 —— 这本身就是证据，不该靠"包里少一个文件"去推。
         (staged / 'run.json').write_text(json.dumps(
             {'startedAt': m['t'], 'stoppedAt': time.time(),
-             'label': m.get('label', ''), 'nodesSilent': node_missing}, indent=2))
+             'label': m.get('label', ''), 'nodesSilent': node_missing,
+             'probe': m.get('probe'), 'probeRows': _probe_rows(m.get('probe'))},
+            indent=2))
         with tarfile.open(out, 'w:gz') as tf:
             for item in sorted(staged.iterdir()):
                 tf.add(item, arcname=item.name)
@@ -253,7 +354,7 @@ def collect_stop() -> dict:
     _prune()
     return {'name': out.name, 'size': out.stat().st_size,
             'durationS': round(time.time() - m['t'], 1), 'contents': contents,
-            'nodesSilent': node_missing}
+            'nodesSilent': node_missing, 'probeRows': _probe_rows(m.get('probe'))}
 
 
 @router.get('/bundles')

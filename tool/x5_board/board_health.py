@@ -186,6 +186,20 @@ def insight_state():
     return "none"
 
 
+def battery_v():
+    """后端报的电池电压。掉压是瞬时硬复位的头号嫌疑，而这是本日志唯一缺的字段。
+    走 HTTP 而不是串口：串口被 diffcar_control 独占（ttyS3 只能一个进程开）。"""
+    try:
+        import json
+        import urllib.request
+        with urllib.request.urlopen(
+                "http://127.0.0.1:8000/device/status", timeout=2) as r:
+            v = json.load(r).get("batteryVolts")
+        return "%.2f" % v if isinstance(v, (int, float)) else "none"
+    except Exception:                                                # noqa: BLE001
+        return "none"
+
+
 def emit(line):
     """落盘一份。超过 MAXBYTES 就轮转一次，不做多代 —— 掉线排查只看最近的。"""
     try:
@@ -193,6 +207,10 @@ def emit(line):
             os.replace(LOGFILE, LOGFILE + ".1")
         with open(LOGFILE, "a") as f:
             f.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), line))
+            # 🔴 必须 fsync。2026-09-02 三次瞬时硬复位，日志尾部是撕裂的二进制 ——
+            # 缓冲区里那几行正好是判因用的，全丢了。每 10 s 一次 fsync 的代价可忽略。
+            f.flush()
+            os.fsync(f.fileno())
     except OSError:
         pass
 
@@ -201,7 +219,8 @@ def main():
     print("board_health 起动, 每 %.0fs 一行, ping %s" % (PERIOD_S, PC), flush=True)
     while True:
         try:
-            line = "%s %s %s pc=%s" % (sysline(), wifi(), netstate(), ping_ms(PC))
+            line = "%s %s %s pc=%s volt=%s" % (
+                sysline(), wifi(), netstate(), ping_ms(PC), battery_v())
             print(line, flush=True)
             emit(line)
         except Exception as e:                                        # noqa: BLE001
