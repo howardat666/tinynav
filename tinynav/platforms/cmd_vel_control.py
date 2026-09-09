@@ -262,7 +262,7 @@ class CmdVelControlNode(Node):
         self.declare_parameter("pose_topic", "/camera/camera/vio_100hz")
         self._pose_topic = str(self.get_parameter("pose_topic").value)
         self.get_logger().info(f"control pose source: {self._pose_topic}")
-        # Depth 1, not 50. This topic runs at 99 Hz and _odom_cb ends by calling
+        # Depth 1, not 50. This topic runs at 20 Hz (diffcar; 99 on the LeKiwi) and
         # _control_loop, so a queue is a backlog of *control iterations*: if this node
         # stalls for half a second, a depth-50 queue makes it replay 50 loops against
         # poses that are already history before it catches up. A controller only ever
@@ -272,11 +272,13 @@ class CmdVelControlNode(Node):
         # Timer-driven, which is what main does: it runs cmd_timer_callback at
         # cmd_rate_hz = 12.0 and never ties the loop to the pose rate. x5 had _odom_cb
         # end by calling _control_loop, so the whole controller ran at the pose topic's
-        # 99 Hz -- measured 73.8% of a core during navigation on a board already at load
-        # 14.7/8. The comment above justifies a depth-1 queue, which is about pose
+        # rate -- 99 Hz on the LeKiwi, measured 73.8% of a core during navigation on a
+        # board already at load 14.7/8. The diffcar's /wheel/camera_pose is 20 Hz, so
+        # the saving is smaller now, but tying the loop to the sensor is still wrong. The comment above justifies a depth-1 queue, which is about pose
         # freshness, and says nothing about needing the loop itself that often.
         #
-        # Pose ingest stays at 99 Hz: storing the newest sample is nearly free, and the
+        # Pose ingest stays at the sensor rate: storing the newest sample is nearly
+        # free, and the
         # 0.35 low-pass in _odom_cb is per-message, so throttling the subscription would
         # change its time constant. Only the loop is throttled.
         #
@@ -293,7 +295,8 @@ class CmdVelControlNode(Node):
         self.declare_parameter("cmd_rate_hz", 25.0)
         self._cmd_rate_hz = float(self.get_parameter("cmd_rate_hz").value)
         self.create_timer(1.0 / self._cmd_rate_hz, self._control_loop)
-        self.get_logger().info(f"control loop {self._cmd_rate_hz:.0f} Hz (pose in at ~99 Hz)")
+        self.get_logger().info(
+            f"control loop {self._cmd_rate_hz:.0f} Hz, pose from {self._pose_topic}")
         self.create_subscription(Path, "/planning/trajectory_path", self._traj_cb, 10)
         self.cmd_pub = self.create_publisher(Twist, "/cmd_vel", 10)
 

@@ -2097,7 +2097,11 @@ class PlanningNode(Node):
                     f"origin_z={self.origin[2]:+.3f} grid_offset_z={self.grid_offset[2]:.4f} "
                     f"cam_h={self.camera_height_m:.3f}")
             self._track_obstacle_age(obstacle_mask)
-            ESDF_map = distance_transform_edt(~obstacle_mask).astype(np.float32) * self.resolution
+            # 有符号：障碍外为正、内部为负。无符号版在障碍内部恒为 0，邻域也是 0，于是
+            # _esdf_gradient 的中心差分退化成 0，_gradient_escape 拿不到"往哪出去"。
+            ESDF_map = ((distance_transform_edt(~obstacle_mask)
+                         - distance_transform_edt(obstacle_mask))
+                        * self.resolution).astype(np.float32)
             # Before the no-target return below, so the UI keeps reading a clearance
             # while the robot is parked -- which is exactly when you want to know
             # whether it thinks something is in front of it.
@@ -2299,9 +2303,12 @@ class PlanningNode(Node):
             # 和发布出去的 obstacle_mask 不是同一份，复算必然对不上。
             cost_parts = [None] * len(trajectories)
             # 圆盘的整条轨迹中心最小净空 —— 和内核的碰撞判据同源（内核对圆也是中心单点）。
-            # 🔴 从第 1 步起，不含起点。所有轨迹的第 0 点是【同一个】当前位姿，所以只要
-            # 车已经贴着障碍（当前位置就是全程最紧的点），min 里的那个值对 110 条候选
-            # 完全相同 —— 障碍势垒退化成常数，一条也区分不出来。
+            # 🔴 从第 1 步起，不含起点。轨迹是先积分再存，所以第 0 点是 0.1 s 之后而不是
+            # 当前位姿本身 —— 但最快那档一步只走 0.04 m，不到一格（0.05 m），而 ESDF 是
+            # 按格量化的，于是只要车已经贴着障碍（当前格就是全程最紧的点），min 取到的
+            # 就是同一格的同一个值，对 110 条候选完全相同 —— 势垒退化成常数。
+            # 圆盘才会这样：碰撞判据是中心单点。main 的矩形底盘查 4 个会转的角点，
+            # 第 0 步在候选之间本来就不同，所以那边这个退化被天然稀释了。
             # 2026-09-03 仿真实测：route_thru_wall 卡住时 110 条候选全是
             # `clr=0.200 obst=25`，唯一还在区分的是朝向项，于是车原地转到超时（121 次变向）。
             # 势垒本该回答"往哪走更安全"，含起点时它只能回答"我现在危不危险"。
@@ -2329,6 +2336,10 @@ class PlanningNode(Node):
             def cost_function(traj, param, score, target_pose, idx):
                 gate_penalty = self._motion_gate_penalty(
                     param, idx, forward_ok, front_blocked)
+                # ⚠️ 40 是 6754818「Add planning controller debug tools」里顺带进来的，
+                # 提交信息没提平滑度，所以它没有依据（main 是 10/10）。两个已知问题：
+                # (1) abs 让加速和减速罚一样多 —— 「别猛加速」有理，「别减速」没理；
+                # (2) omega 只罚 10，左右翻一次 3.4 分 ≈ 3.4 cm 路程，压不住摆头。
                 smoothness = (40 * abs(self.last_param[0] - param[0])
                               + 10 * abs(self.last_param[1] - param[1]))
                 # 原地转和完全停住拿到同一个值，所以它们内部的相对排名不变。
