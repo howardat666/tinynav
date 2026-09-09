@@ -781,6 +781,8 @@ class PlanningNode(Node):
         # 于是 0.40 m 的窄缝前车永远站着（2026-09-01 实测：不动 207 分，最好前进 220 分）。
         # 目标近了要归零：到达是靠"奖励消失让车自然停住"实现的，见上面 target_dist_xy 那段。
         self.w_idle = float(os.environ.get('TINYNAV_W_IDLE', '40.0'))
+        # 转向平滑度。见 smoothness 处的注释 —— 10 压不住左右翻转。
+        self.w_omega_smooth = float(os.environ.get('TINYNAV_W_OMEGA_SMOOTH', '40.0'))
         # 位姿瞬移检测。固件 VIO 跟丢后会【内部】重启并把原点归零（进程不重启，我们这边
         # 毫无察觉），世界系就此改了意义 —— 存下来的占据格记的都是旧世界的坐标，全部作废。
         # 不处理的后果不是"地图不准"而是"地图看着一片开阔"：2026-09-01 实测重置后一拍就
@@ -2338,12 +2340,16 @@ class PlanningNode(Node):
             def cost_function(traj, param, score, target_pose, idx):
                 gate_penalty = self._motion_gate_penalty(
                     param, idx, forward_ok, front_blocked)
-                # ⚠️ 40 是 6754818「Add planning controller debug tools」里顺带进来的，
-                # 提交信息没提平滑度，所以它没有依据（main 是 10/10）。两个已知问题：
-                # (1) abs 让加速和减速罚一样多 —— 「别猛加速」有理，「别减速」没理；
-                # (2) omega 只罚 10，左右翻一次 3.4 分 ≈ 3.4 cm 路程，压不住摆头。
+                # ⚠️ vx 的 40 是 6754818「Add planning controller debug tools」里顺带进来的，
+                # 提交信息没提平滑度，所以它没有依据（main 是 10/10）。它还有个形状问题：
+                # abs 让加速和减速罚一样多 —— 「别猛加速」有理，「别减速」没理。
+                # 🔴 omega 10 -> 40（2026-09-09）。10 的时候左右翻一次只花
+                # 10*2*0.171 = 3.4 分 ≈ 3.4 cm 路程，而路线项的尺度是 100 分/米 ——
+                # 等于免费，所以两条候选在路线项上打平手时代价函数就在两拍之间来回翻。
+                # 40 让同样一次翻转变成 13.7 分。同时 max_yaw 刚从 0.6 放宽到 1.0，
+                # 翻转幅度更大了，不压住会更糟。
                 smoothness = (40 * abs(self.last_param[0] - param[0])
-                              + 10 * abs(self.last_param[1] - param[1]))
+                              + self.w_omega_smooth * abs(self.last_param[1] - param[1]))
                 # 原地转和完全停住拿到同一个值，所以它们内部的相对排名不变。
                 idle = self.w_idle * idle_scale if abs(param[0]) < self.idle_vx_eps else 0.0
 
