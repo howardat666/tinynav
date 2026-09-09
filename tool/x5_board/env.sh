@@ -154,7 +154,9 @@ export TINYNAV_ALLOW_REVERSE="${TINYNAV_ALLOW_REVERSE:-1}"
 # —— 中间 0.23 s 是纯排队。判据就看 in_age 有没有掉到 ~0.19 s。
 # 要退回旧行为：改成 0（队列深度别动，30 改 3 那次把车弄停了）。
 export TINYNAV_PLAN_LATEST_ONLY="${TINYNAV_PLAN_LATEST_ONLY:-1}"
-# 多线程执行器的线程数（只在 LATEST_ONLY=1 时生效）。>1 时同步回调换成可重入组，
-# 于是 planning 算的那 127 ms 里新深度帧还能被接下来。1 = 回到单线程。
-# 09-09 同日志对照：计算 48->127 ms 让取用等待 164->213 ms，那 49 ms 就是这里省的。
-export TINYNAV_PLAN_EXEC_THREADS="${TINYNAV_PLAN_EXEC_THREADS:-2}"
+# 🔴 多线程执行器已回退（commit 4bc3634），代码不再读这个变量 —— 留在这里只为记住结论。
+# 09-09 20:20 板上实测：开了之后要降的那一跳反而变差（d_in 213->240），planning 计算
+# 126->261、每个阶段均匀慢 2~3 倍、load p50 6.09->8.18、depth 间隔>0.30s 从 0/25 变
+# 533/3046。原因是可重入组让 0.7MB 深度图的反序列化和 planning 计算并发跑在已经超订
+# 的 8 核上。要拿那 49 ms 只能让 planning 本身变便宜，不能靠并发。
+# export TINYNAV_PLAN_EXEC_THREADS=2
