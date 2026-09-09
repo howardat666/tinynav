@@ -953,7 +953,9 @@ class PlanningNode(Node):
         # inferred by diffing two surviving lines. Report the step and the gap it happened
         # over; map_node's "nav path changed" tells you whether the path moved under it.
         if self.target_pose is not None and self._last_target_rx_ns:
-            step = float(np.linalg.norm(new_target - self.target_pose))
+            # xy only：车在一个平面上开，而目标的 z 来自地图位姿 —— VIO 地图实测有
+            # 0.618 m 的 z 漂移，三维范数会被它撑大，把正常的前视点滚动报成"跳变"。
+            step = float(np.linalg.norm(new_target[:2] - self.target_pose[:2]))
             dt = (now_ns - self._last_target_rx_ns) / 1e9
             if step > self.target_jump_warn_m:
                 self.get_logger().warning(
