@@ -113,7 +113,7 @@ export TINYNAV_LAT_LOG_S="${TINYNAV_LAT_LOG_S:-10}"
 export TINYNAV_PUBLISH_VOXELS="${TINYNAV_PUBLISH_VOXELS:-0}"
 # 逐候选代价那条日志实测 11~18ms/周期，而延迟数已挪到独立的 LAT 行，
 # 所以这里限速不再影响延迟分析。要看选轨迹的细节就设 0。
-export TINYNAV_DECISION_LOG_HZ="${TINYNAV_DECISION_LOG_HZ:-2}"
+export TINYNAV_DECISION_LOG_HZ="${TINYNAV_DECISION_LOG_HZ:-0}"  # 0 = 逐拍；数变向次数必须逐拍可见
 # 判决图的代价。板上逐段实测 stride=2 共 64 ms（classify 34.9 + tint 17.8 + 投影 9.4），
 # stride=4 降到 24 ms。它 2 Hz 渲染而规划 5 Hz，所以 stride=2/hz=2 等于每周期平均
 # 摊 26 ms —— 和 raycasting 一个量级，全花在给人看的图上。
@@ -154,3 +154,7 @@ export TINYNAV_ALLOW_REVERSE="${TINYNAV_ALLOW_REVERSE:-1}"
 # —— 中间 0.23 s 是纯排队。判据就看 in_age 有没有掉到 ~0.19 s。
 # 要退回旧行为：改成 0（队列深度别动，30 改 3 那次把车弄停了）。
 export TINYNAV_PLAN_LATEST_ONLY="${TINYNAV_PLAN_LATEST_ONLY:-1}"
+# 多线程执行器的线程数（只在 LATEST_ONLY=1 时生效）。>1 时同步回调换成可重入组，
+# 于是 planning 算的那 127 ms 里新深度帧还能被接下来。1 = 回到单线程。
+# 09-09 同日志对照：计算 48->127 ms 让取用等待 164->213 ms，那 49 ms 就是这里省的。
+export TINYNAV_PLAN_EXEC_THREADS="${TINYNAV_PLAN_EXEC_THREADS:-2}"

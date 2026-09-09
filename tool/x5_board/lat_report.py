@@ -12,6 +12,7 @@
 只用 stdlib，板上和 PC 上都能跑。
 """
 import argparse
+import bisect
 import os
 import re
 import sys
@@ -82,6 +83,34 @@ def window(rows):
     if lo > hi:
         return rows, None
     return [r for r in rows if r[0] is None or lo - 1e-6 <= r[0] <= hi + 1e-6], (lo, hi, span)
+
+
+def nav_windows(rows, min_compute_s=0.080):
+    """真在导航的那些 plan 窗口的时刻。
+
+    🔴 window() 的交集**不排除空闲拍**，而一趟里绝大多数 LAT 窗口是空闲的
+    （2026-09-09 实测 216/251 = 86%）。空闲时 planning 只花 48 ms、导航时 127 ms，
+    混在一起把中位数整体拉低约 85 ms —— 我据此报过一个不存在的 361 ms 和一个
+    不存在的 79 ms 回归。判据用 planning 自己的计算时长，因为它是空闲/导航之间
+    唯一的定量分界（48 vs 127，中间没有样本），而 tag 的有无只能证明节点活着。
+    """
+    w = {}
+    for t, tag, k, p50, *_ in rows:
+        if t is not None and tag == "plan":
+            w.setdefault(t, {})[k] = p50
+    return sorted(t for t, kv in w.items()
+                  if "d_out" in kv and "d_in" in kv
+                  and kv["d_out"] - kv["d_in"] >= min_compute_s)
+
+
+def nav_filter(rows, navt, tol=6.0):
+    """只留离某个导航窗口不超过 tol 秒的行。各 tag 的窗口边界不对齐，所以要容差。"""
+    if not navt:
+        return rows
+    def ok(t):
+        i = bisect.bisect_left(navt, t)
+        return any(0 <= j < len(navt) and abs(navt[j] - t) <= tol for j in (i - 1, i))
+    return [r for r in rows if r[0] is None or ok(r[0])]
 
 
 def fold(rows):
@@ -176,6 +205,10 @@ def main():
     ap.add_argument("--all-runs", action="store_true", help="把目录里所有趟混在一起（一般不要）")
     ap.add_argument("--no-window", action="store_true",
                     help="不取交集时间窗（会把空闲和导航混在一起，一般不要）")
+    ap.add_argument("--no-nav-filter", action="store_true",
+                    help="不逐窗口剔除空闲拍（中位数会低估约 85 ms，一般不要）")
+    ap.add_argument("--nav-compute-ms", type=float, default=80.0,
+                    help="planning 计算超过这个值才算「真在导航」（默认 80）")
     ap.add_argument("--by-prev", action="store_true",
                     help="按 LATENV 的 prev=（在预览什么）把一趟切成若干段分别出表")
     ap.add_argument("--stale-h", type=float, default=2.0,
@@ -224,6 +257,17 @@ def main():
 
     rows = collect(paths)
     rows, win = window(rows) if not a.no_window else (rows, None)
+    if not a.no_nav_filter:
+        navt = nav_windows(rows, a.nav_compute_ms / 1000.0)
+        n_plan = len({r[0] for r in rows if r[1] == "plan" and r[0] is not None})
+        before = len(rows)
+        rows = nav_filter(rows, navt)
+        print(f"逐窗口剔除空闲拍：plan 窗口 {n_plan} 个，其中真在导航 {len(navt)} 个"
+              f"（planning 计算 >= {a.nav_compute_ms:.0f} ms）；LAT 行 {before} -> {len(rows)}")
+        if not navt:
+            print("⚠️ 一个导航窗口都没有 —— 这一趟可能全程没跑导航，下面的数是空闲工况")
+        elif len(navt) < 5:
+            print("⚠️ 导航窗口不足 5 个，中位数只能当参考")
     if win:
         lo, hi, span = win
         print(f"交集时间窗 {hi - lo:.0f}s（各 tag 覆盖："

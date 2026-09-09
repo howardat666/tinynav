@@ -101,6 +101,15 @@ def body_circle_xy(frame, body):
 
 
 def run(name, sc, poll_hz=5.0):
+    """跑一个场景并返回判据。
+
+    🔴 **不要拿单次完整套的失败集合下结论。** 2026-09-09 用同一份代码、同一个配置连跑
+    四次完整套，只有 dead_end 四次全败，其余失败项每次都在漂：一次是
+    doorway_turn/s_bend/route_grazes_leg（s_bend 路程 5.7->14.7 m、8 次压进障碍），
+    下一次这三个全过而 route_thru_blocked_door 败。这些场景**单跑都过**。
+    我据此把套件的抖动误判成 grid_offset_z 的效应，推了一轮全错的结论。
+    判据：要么单跑，要么同一改动前后各跑 2~3 次看失败集合的交集。
+    """
     # 场景由服务端按 x5_presets 那一份定义生成，且 load-scene 会把 planning 和 control
     # 都换新的。少了这个隔离，planning 带着上一个场景的障碍图、control 带着累积的路径
     # 参考，下一个场景会「单独跑过、连着跑不动」—— 看着像规划器的 bug，实际不是。

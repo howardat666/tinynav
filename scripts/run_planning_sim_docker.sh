@@ -20,6 +20,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE="${TINYNAV_IMAGE:-uniflexai/tinynav:latest}"
 
 docker rm -f tinynav_sim >/dev/null 2>&1 || true
+# GRID_OFFSET_Z 跟板上 env.sh 保持一致。它是体素层的 z 相位，决定「最矮能看见多高的
+# 障碍」，实测仿真里 0.15 -> 50mm 门限、0.1625 -> 63mm，障碍格数只差 3%（s_bend p50
+# 113 vs 116、doorway_turn 111 vs 108、空地都是 0）—— 仿真里几乎无差别。
+# ⚠️ 但不要拿仿真调它：仿真深度没有噪声，而这条边界同时也是地面噪声容差，板上的
+# 0.1625 正是为了消掉空地上的假障碍才定的（真实深度扫出来的）。仿真调不出这一面。
 exec docker run --rm --net=host --name tinynav_sim \
   -v "$ROOT":/tinynav -w /tinynav \
   -e PYTHONPATH=/tinynav \
@@ -30,8 +35,12 @@ exec docker run --rm --net=host --name tinynav_sim \
   -e TINYNAV_TRAJ_SAMPLES="${TINYNAV_TRAJ_SAMPLES:-15}" \
   -e TINYNAV_SIM_SCENE="${TINYNAV_SIM_SCENE:-wall_ahead}" \
   -e TINYNAV_SIM_PORT="${TINYNAV_SIM_PORT:-8766}" \
-  -e TINYNAV_GRID_OFFSET_Z="${TINYNAV_GRID_OFFSET_Z:-0.15}" \
+  -e TINYNAV_GRID_OFFSET_Z="${TINYNAV_GRID_OFFSET_Z:-0.1625}" \
   -e TINYNAV_W_IDLE="${TINYNAV_W_IDLE:-40.0}" \
+  -e TINYNAV_W_OMEGA_SMOOTH="${TINYNAV_W_OMEGA_SMOOTH:-40.0}" \
+  -e TINYNAV_MAX_YAW="${TINYNAV_MAX_YAW:-1.0}" \
+  -e TINYNAV_PLAN_LATEST_ONLY="${TINYNAV_PLAN_LATEST_ONLY:-0}" \
+  -e TINYNAV_PLAN_EXEC_THREADS="${TINYNAV_PLAN_EXEC_THREADS:-2}" \
   -e TINYNAV_IDLE_VX_EPS="${TINYNAV_IDLE_VX_EPS:-1e-6}" \
   -e TINYNAV_SIM_CAMERA="${TINYNAV_SIM_CAMERA:-match}" \
   --entrypoint bash "$IMAGE" -lc '
