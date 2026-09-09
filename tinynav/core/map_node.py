@@ -429,6 +429,26 @@ class MapNode(Node):
         # 20 s 把长尾按下去而相邻抖动中位仍是 0.6 度。0 = 关掉衰减，回到旧行为。
         self.map_odom_half_life_s = float(
             os.environ.get('TINYNAV_MAP_ODOM_HALF_LIFE_S', '20.0'))
+        # 按检索候选散布给约束降权：spread 大 = 候选自己散得开 = 解可能落在错的盆地。
+        # 内点率(ratio)已经在当权重，但它对这类错解不敏感 —— 09-09 20:20 那趟 12 个
+        # 「地图位移 != 里程计位移」的坏解 ratio 中位 0.33、其中一个 0.79，而 spread
+        # 中位 1.07（好解 0.35）；害人白站 28 s 的那次是 inliers=108 / ratio=0.78 /
+        # spread=1.29，只有 spread 异常。
+        # 🔴 默认 0（关）：同一天 20:44 那趟坏解只 3 个，且 spread/ratio 全落在好解分布
+        # 里（好解 spread p90 4.12 vs 坏解 max 2.67），run2 调的门限在 run3 会误拒 28.5%。
+        # 所以做成连续权重而不是门限，且要用真实数据 A/B 过才开。参考值 0.5 时
+        # spread 1.29 -> 权重 0.39、6.55 -> 0.08、0.35 -> 1.0。
+        self.map_odom_spread_ref_m = float(
+            os.environ.get('TINYNAV_MAP_ODOM_SPREAD_REF_M', '0.0'))
+        # 用闭式加权平均替掉 pose_graph_solve。这里只有一个自由参数块（节点 1 固定为
+        # 单位阵），所以问题本质是「把 N 个 SE(3) 观测按权重平均」，闭式解确定、无局部极小。
+        # 判据是求解器在【自己的目标函数】上从没赢过闭式：09-09 两趟全体位置残差
+        # 0.585 vs 0.505 和 0.455 vs 0.375；而 20:20 那趟出事那 8 秒里求解器残差
+        # 3.02~3.63 m、闭式 1.45~2.14 m，gap 最大 2.05 m，314 次里 92 次(29%) gap>0.30 m。
+        # 同一天 20:44 那趟 gap max 只有 0.20 m、一次都没超 0.30 —— 所以它是间歇性发作的
+        # 局部极小，不是常态偏差。默认关：换求解器是行为改变，要板上 A/B 过再开。
+        self.map_odom_closed_form = os.environ.get(
+            'TINYNAV_MAP_ODOM_CLOSED_FORM', '0') == '1'
         # 倾角门。map 和 odom 都是地面坐标系，它们之间的变换**几何上不可能有大倾角**，
         # 所以 tilt 是个免费的坏解判据 —— 而且是唯一一个在引导阶段就有效的。
         # 实测 592 次拟合：p50 1.00° / p90 1.70° / **p99 2.90°** / max 29.4°，
@@ -1838,6 +1858,11 @@ class MapNode(Node):
                 camera_in_odom_world = self.pose_graph_used_pose[timestamp]
                 observation_T_from_map_to_odom =  camera_in_odom_world @ se3_inv(camera_in_map_world)
                 weight = self.relocalization_pose_weights[timestamp]
+                if self.map_odom_spread_ref_m > 0.0:
+                    spread_m = (self.relocalization_pose_quality.get(timestamp)
+                                or (0.0, 0.0))[0]
+                    if spread_m > self.map_odom_spread_ref_m:
+                        weight *= self.map_odom_spread_ref_m / spread_m
                 if self.map_odom_half_life_s > 0.0:
                     age_s = (newest_ns - timestamp) / 1e9
                     weight *= 0.5 ** (age_s / self.map_odom_half_life_s)
@@ -1846,6 +1871,19 @@ class MapNode(Node):
         relative_pose_constraint = relative_pose_constraint[-100:]
         optimized_parameters = pose_graph_solve(optimized_parameters, relative_pose_constraint, constant_pose_index_dict, max_iteration_num = 1000)
         T_new = optimized_parameters[0]
+        obs = [c[2] for c in relative_pose_constraint]
+        w = np.array([float(c[3][0]) for c in relative_pose_constraint])
+        T_cf = None
+        if obs:
+            # 闭式：平移按权重加权平均，旋转用 SVD 投影回 SO(3)
+            W = w / max(w.sum(), 1e-9)
+            t_cf = np.sum([W[i] * obs[i][:3, 3] for i in range(len(obs))], axis=0)
+            R_acc = np.sum([W[i] * obs[i][:3, :3] for i in range(len(obs))], axis=0)
+            U, _, Vt = np.linalg.svd(R_acc)
+            R_cf = U @ np.diag([1.0, 1.0, float(np.linalg.det(U @ Vt))]) @ Vt
+            T_cf = np.eye(4); T_cf[:3, :3] = R_cf; T_cf[:3, 3] = t_cf
+            if self.map_odom_closed_form:
+                T_new = T_cf     # 倾角门必须判真正要用的那个解
         tilt_deg = math.degrees(math.acos(max(-1.0, min(1.0, float(T_new[2, 2])))))
         if (self.map_odom_max_tilt_deg > 0.0 and tilt_deg > self.map_odom_max_tilt_deg
                 and self.T_from_map_to_odom is not None):
@@ -1868,8 +1906,6 @@ class MapNode(Node):
         # 「把 N 个 SE(3) 观测平均起来」，不是位姿图。闭式解是确定性的、不会跑偏，
         # 拿它当基准就能判断非线性求解器有没有必要留着。
         T = self.T_from_map_to_odom
-        obs = [c[2] for c in relative_pose_constraint]
-        w = np.array([float(c[3][0]) for c in relative_pose_constraint])
         if obs:
             def _resid(Tx):
                 te, re_ = [], []
@@ -1879,13 +1915,6 @@ class MapNode(Node):
                     ct = (np.trace(E[:3, :3]) - 1.0) / 2.0
                     re_.append(math.degrees(math.acos(max(-1.0, min(1.0, ct)))))
                 return np.array(te), np.array(re_)
-            # 闭式：平移按权重加权平均，旋转用 SVD 投影回 SO(3)
-            W = w / max(w.sum(), 1e-9)
-            t_cf = np.sum([W[i] * obs[i][:3, 3] for i in range(len(obs))], axis=0)
-            R_acc = np.sum([W[i] * obs[i][:3, :3] for i in range(len(obs))], axis=0)
-            U, _, Vt = np.linalg.svd(R_acc)
-            R_cf = U @ np.diag([1.0, 1.0, float(np.linalg.det(U @ Vt))]) @ Vt
-            T_cf = np.eye(4); T_cf[:3, :3] = R_cf; T_cf[:3, 3] = t_cf
             te_s, re_s = _resid(T)
             te_c, re_c = _resid(T_cf)
             gap = float(np.linalg.norm(T[:3, 3] - T_cf[:3, 3]))
@@ -1899,6 +1928,7 @@ class MapNode(Node):
                 f"closed-form resid t_p50={np.median(te_c):.2f}m "
                 f"r_p50={np.median(re_c):.1f}deg | gap={gap:.2f}m "
                 f"cf_yaw={self._transform_yaw_deg(T_cf):+.1f}deg"
+                + (" [用的是闭式解，所以 gap 恒为 0]" if self.map_odom_closed_form else "")
             )
         prev = self._last_T_map_to_odom_logged
         d_t = float(np.linalg.norm(T[:3, 3] - prev[:3, 3])) if prev is not None else 0.0
