@@ -8,9 +8,6 @@ import threading
 import time
 
 import rclpy
-from rclpy.callback_groups import (MutuallyExclusiveCallbackGroup,
-                                   ReentrantCallbackGroup)
-from rclpy.executors import MultiThreadedExecutor
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from sensor_msgs.msg import Image, CameraInfo, PointField
@@ -444,26 +441,7 @@ class PlanningNode(Node):
         self.occupancy_cloud_pub = self.create_publisher(PointCloud2, '/planning/occupied_voxels', self._viz_qos)
         self.occupancy_cloud_esdf_pub = self.create_publisher(PointCloud2, '/planning/occupied_voxels_with_esdf', self._viz_qos)
         self.occupancy_grid_pub = self.create_publisher(OccupancyGrid, '/planning/occupancy_grid', self._viz_qos)
-        # 取用策略：直接在回调里干活(FIFO，永远处理最旧的未过期集合)，还是回调只存、
-        # 定时器取最新。默认沿用旧行为 —— 09-02 的仿真套件在这个改动下从 9/9 变 7/9，
-        # 但那两个失败场景【单跑都过】，套件本身不可复现，所以既不能定罪也不能放行。
-        # 板上 env.sh 显式设了 1。要 A/B 就 TINYNAV_PLAN_LATEST_ONLY=1，判据见 in_age= 那一列。
-        # 🔴 读取必须在订阅之前 —— 回调组的选择依赖它。
-        self._plan_latest_only = os.environ.get('TINYNAV_PLAN_LATEST_ONLY', '0') == '1'
-        # 单线程执行器下，planning 算的那 127 ms 里同步回调也动不了，于是新到的深度帧
-        # 全堆在 message_filters 队列里没人接，算完才回头处理 —— 先付一次排队。
-        # 2026-09-09 同一份日志的对照：空闲窗口计算 48 ms / d_in 164 ms，导航窗口
-        # 127 / 213 —— 计算多花 79 ms，取用就多等 49 ms（比值 0.62 = 占空比 127/200）。
-        # latest-only 下 sync_callback 只做一次赋值，可重入没有共享状态之争；FIFO 下它
-        # 直接调 _plan_measured，重入就会让两个规划周期叠在一起，所以只在前者放开。
-        self._intake_group = (ReentrantCallbackGroup() if self._plan_latest_only
-                              else MutuallyExclusiveCallbackGroup())
-        # 规划本身永远互斥：last_param / _escape_goal_yaw / _escape_tried_yaws 都是
-        # 逐周期读改写的，两个周期叠起来就是数据竞争。
-        self._plan_group = MutuallyExclusiveCallbackGroup()
-        self._pending_lock = threading.Lock()
-        self.depth_sub = message_filters.Subscriber(self, Image, '/slam/depth',
-                                                    callback_group=self._intake_group)
+        self.depth_sub = message_filters.Subscriber(self, Image, '/slam/depth')
         # Where this node takes the robot pose from. A parameter rather than a
         # literal for two reasons: /insight/vio_20hz does not exist on current
         # Looper firmware (it is /camera/camera/vio_image, measured 19.99 Hz), and
@@ -472,8 +450,7 @@ class PlanningNode(Node):
         self.declare_parameter('pose_topic', '/camera/camera/vio_image')
         pose_topic = str(self.get_parameter('pose_topic').value)
         self.get_logger().info(f"planning pose source: {pose_topic}")
-        self.pose_sub = message_filters.Subscriber(self, PoseStamped, pose_topic,
-                                                   callback_group=self._intake_group)
+        self.pose_sub = message_filters.Subscriber(self, PoseStamped, pose_topic)
 
         # Exact vs approximate matching, and why it cannot be a constant.
         #
@@ -533,10 +510,16 @@ class PlanningNode(Node):
                 [self.depth_sub, self.pose_sub], queue_size=30, slop=pose_sync_slop
             )
         self.ts.registerCallback(self.sync_callback)
+        # 取用策略：直接在回调里干活(FIFO，永远处理最旧的未过期集合)，还是回调只存、
+        # 定时器取最新。默认沿用旧行为 —— 09-02 的仿真套件在这个改动下从 9/9 变 7/9，
+        # 但那两个失败场景【单跑都过】，套件本身不可复现，所以既不能定罪也不能放行。
+        # 要 A/B 就 TINYNAV_PLAN_LATEST_ONLY=1，判据见 in_age= 那一列。
+        self._plan_latest_only = os.environ.get('TINYNAV_PLAN_LATEST_ONLY', '0') == '1'
         self._pending_set = None
         if self._plan_latest_only:
-            # 20 Hz：必须快过深度帧(4.8 Hz)，否则 pending 会白等一拍。
-            self.create_timer(0.05, self._plan_tick, callback_group=self._plan_group)
+            # 20 Hz：必须快过深度帧(4.8 Hz)，否则 pending 会白等一拍。单线程执行器 +
+            # 默认互斥回调组，所以它和 sync_callback 不会重入。
+            self.create_timer(0.05, self._plan_tick)
         self.get_logger().info(
             "planning pose sync: "
             + ("exact" if use_exact_pose_sync else f"approximate slop={pose_sync_slop}s")
@@ -1976,14 +1959,10 @@ class PlanningNode(Node):
         if not self._plan_latest_only:
             self._plan_measured(depth_msg, pose_msg)
             return
-        # 交换是 LOAD + STORE 两步，可重入的写会插在中间 —— 丢的是最新那一帧，
-        # 而 latest-only 的全部意义就是要最新那一帧。
-        with self._pending_lock:
-            self._pending_set = (depth_msg, pose_msg)
+        self._pending_set = (depth_msg, pose_msg)
 
     def _plan_tick(self):
-        with self._pending_lock:
-            pending, self._pending_set = self._pending_set, None
+        pending, self._pending_set = self._pending_set, None
         if pending is not None:
             self._plan_measured(*pending)
 
@@ -2767,19 +2746,8 @@ def main(args=None):
     rclpy.init(args=args)
     node = PlanningNode()
 
-    # 线程数 2 就够：一根接帧、一根规划。板上 8 个核已经超订（[[x5-cpu-is-saturated-
-    # before-nav]]），线程开多了只是多付调度开销。
-    threads = int(os.environ.get('TINYNAV_PLAN_EXEC_THREADS', '2'))
-    executor = (MultiThreadedExecutor(num_threads=threads)
-                if node._plan_latest_only and threads > 1 else None)
-    node.get_logger().info(
-        f"planning executor: {'multi-threaded, %d threads' % threads if executor else 'single-threaded'}")
     try:
-        if executor is None:
-            rclpy.spin(node)
-        else:
-            executor.add_node(node)
-            executor.spin()
+        rclpy.spin(node)
         node.destroy_node()
         rclpy.shutdown()
     except KeyboardInterrupt:
