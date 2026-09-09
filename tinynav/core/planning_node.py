@@ -662,6 +662,12 @@ class PlanningNode(Node):
         # 1 秒延迟，必然发散（实测 112 s 转了 3147°，净转角只有 1142°）。
         self.escape_turn_delay_s = 1.0
         self._escape_scan_step_deg = 15
+        # 本次脱困已试过的朝向。少了它就是个 12° 棘轮：到位门限和重扫下限是同一个 12°，
+        # 新目标恰好落在"还没到位"的边界上，转一拍(约 2°)就跨进去、再往外挪 12°。
+        # 2026-09-09 板上实测 err 每拍精确等于 ±12°、13.1 s 一步没走而前方净空 1.20 m。
+        # 每个试过的朝向封住 ±30°(两倍扫描步长)，候选单调减少，扫完落到 90° 兜底。
+        self._escape_tried_yaws = deque(maxlen=24)   # 24 = 360/15，一整圈
+        self._escape_avoid_sep_rad = math.radians(30.0)
         # 后退脱困。占据栅格只由前向射线写入，所以车后方的格子从来没被看过 —— 盲退曾经
         # 造成 40 s 的 vx=-0.2 直接撞上去（2026-08-10 19:19），这也是 reverse 一直被门掉的
         # 原因。这里换一个能证明安全的判据：只退到**自己刚刚待过**的位置去。
@@ -1390,7 +1396,8 @@ class PlanningNode(Node):
             f"放手 {self._noprog_cooldown_s:.0f}s 让排序走弧线")
         return ""
 
-    def _open_heading(self, center, obstacle_mask, yaw_now, yaw_to_target, min_deg=0):
+    def _open_heading(self, center, obstacle_mask, yaw_now, yaw_to_target, min_deg=0,
+                      avoid=(), avoid_sep=0.0, prefer_side=None):
         """最近的一个「走廊在探针内是空的」朝向，平手时偏目标那一侧。
 
         扫的是整整一圈的候选朝向，而不是那 1~3 条可行原地转的**终点朝向** —— 前方 0.2 m
@@ -1399,11 +1406,16 @@ class PlanningNode(Node):
 
         返回 (朝向, 净空)；一圈都没有能证明是空的就返回 (None, 最好的那个净空)。
         """
-        prefer = 1.0 if self._wrap(yaw_to_target - yaw_now) >= 0.0 else -1.0
+        # prefer_side 传进来时用它：偏好侧每次按"目标在左还是右"重算的话，车一转过
+        # 目标方位就翻边，而净空探针的结论本身也随车头转动在变 —— 两者叠起来就是摆头。
+        prefer = prefer_side if prefer_side is not None else (
+            1.0 if self._wrap(yaw_to_target - yaw_now) >= 0.0 else -1.0)
         best_c = float('nan')
         for step in range(int(min_deg), 181, self._escape_scan_step_deg):
             for sgn in ((prefer, -prefer) if step else (1.0,)):
                 y = self._wrap(yaw_now + sgn * math.radians(step))
+                if any(abs(self._wrap(y - a)) < avoid_sep for a in avoid):
+                    continue
                 c = float(self._clearance_along(center, math.cos(y), math.sin(y),
                                                 obstacle_mask))
                 if c >= self.escape_min_clearance_m:
@@ -2558,13 +2570,19 @@ class PlanningNode(Node):
                             escape_clear = float(self._clearance_along(
                                 centre, math.cos(g), math.sin(g), obstacle_mask))
                         else:
-                            # 转到位了但前面还是堵着，说明这个朝向选错了 —— 重新扫，且要求
-                            # 新朝向至少偏出"已到位"的容差，否则会反复选中同一个朝向。
+                            # 转到位了但前面还是堵着，说明这个朝向选错了 —— 重新扫，排除
+                            # 本次脱困已经试过的。下限用一个扫描步长(15°)而不是到位门限
+                            # (12°)：两者相等时新目标恰好落在到位边界上，见 _escape_tried_yaws。
+                            if self._escape_sweep_side is None:
+                                self._escape_sweep_side = (
+                                    1.0 if self._wrap(yaw_to_target - yaw_now) >= 0.0
+                                    else -1.0)
                             g, escape_clear = self._open_heading(
                                 centre, obstacle_mask, yaw_now, yaw_to_target,
-                                min_deg=(math.degrees(self._escape_goal_reached_rad)
-                                         if reached and self._escape_goal_yaw is not None
-                                         else 0))
+                                min_deg=self._escape_scan_step_deg,
+                                avoid=self._escape_tried_yaws,
+                                avoid_sep=self._escape_avoid_sep_rad,
+                                prefer_side=self._escape_sweep_side)
                         if g is None:
                             # 一圈都没有能证明是空的朝向。朝一边扫 90°，别站着。方向只在
                             # 本次脱困第一次进到这里时定，之后一直沿用。
@@ -2576,6 +2594,7 @@ class PlanningNode(Node):
                                            + self._escape_sweep_side * math.pi / 2.0)
                         self._escape_goal_yaw = g
                         self._escape_goal_ns = now_ns
+                        self._escape_tried_yaws.append(g)
                         goal_err = self._wrap(g - yaw_now)
                     else:
                         escape_clear = float(self._clearance_along(
@@ -2635,6 +2654,7 @@ class PlanningNode(Node):
                 self._escape_goal_yaw = None
                 self._escape_goal_ns = 0
                 self._escape_sweep_side = None
+                self._escape_tried_yaws.clear()
             _dec_gap_ns = 0 if self.decision_log_hz <= 0 else int(1e9 / self.decision_log_hz)
             _t_log = Timer(name='pub:log', logger=None)
             if now_ns - self._last_static_log_ns.get("decision", 0) >= _dec_gap_ns:
