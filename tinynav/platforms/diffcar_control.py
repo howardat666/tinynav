@@ -29,7 +29,7 @@ import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, String
 from rclpy.node import Node
 
 # Not omni-specific despite the module name: a generic planar-base -> camera-optical
@@ -186,6 +186,10 @@ class DiffCarControlNode(Node):
         # 百分比契约，前端直接当 "%" 渲染 —— 把电压发进去会显示成 "10%"，而 3S 锂电
         # 9.98V 的真实余量恰好也是 5~10%，于是错数看着像对的，比明显错的更危险。
         self.batt_pub = self.create_publisher(Float32, "/battery_voltage", 10)
+        # ttyS3 被本节点独占，所以查 ESP32 状态原本只能插 COM 线。开一条中继：固件的每一行
+        # 都转发到 /diffcar/esp_reply，命令从 /diffcar/esp_cmd 进来。
+        self.esp_reply_pub = self.create_publisher(String, "/diffcar/esp_reply", 50)
+        self.create_subscription(String, "/diffcar/esp_cmd", self._on_esp_cmd, 10)
         self._fw_seen_noise: set[str] = set()
         self._batt_period = float(g("battery_period_s").value)
         self._batt_warn = float(g("battery_warn_v").value)
@@ -343,9 +347,21 @@ class DiffCarControlNode(Node):
     # 锁住 —— 跑导航时这几件正是最需要知道的，而它们只在串口上说一次。
     _FW_ALERT = ("BOOT ", "失联保护", "堵转保护", "闭环已锁", "低压", "电压过低")
 
+    _ESP_CMD_ALLOW = ("N", "Nv", "Nl")   # 纯查询。Ni/Nk/Nx/Nn 会改桥接状态或注入故障，
+                                         # t 会让轮子转 3 秒 —— 一律不放行
+
+    def _on_esp_cmd(self, msg: String) -> None:
+        cmd = msg.data.strip()
+        if cmd not in self._ESP_CMD_ALLOW:
+            self.get_logger().warning(
+                f"拒收 ESP32 命令 {cmd!r}：只放行只读查询 {list(self._ESP_CMD_ALLOW)}")
+            return
+        self.link.send(cmd)
+
     def _on_firmware_line(self, line: str) -> None:
         if not line:
             return
+        self.esp_reply_pub.publish(String(data=line))
         if any(k in line for k in self._FW_ALERT):
             self.get_logger().warning(f"firmware: {line}")
             return
