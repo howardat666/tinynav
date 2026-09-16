@@ -51,7 +51,9 @@ def wifi():
     except OSError:
         pass
     if base is None:
-        return "wifi=none"
+        # 2026-09-16：USB WiFi 网卡已拆，射频指标全在 ESP32 那侧，Looper 根本读不到。
+        # 写 n/a 而不是 none —— none 看着像"没有无线"，会让人往错的方向查。
+        return "wifi=n/a(在ESP32侧)"
     out = []
     sig = read(os.path.join(base, "rx_signal"))
     for key, tag in (("rssi:", "rssi"), ("signal_qual:", "qual")):
@@ -77,24 +79,23 @@ def wifi():
 
 
 def netstate():
-    """载波 + USB 网卡是否还在枚举里。这两个合起来能分开"网卡掉电"和"射频/AP 问题"：
-    usb=0 -> 网卡自己掉了(供电塌陷)；usb=1 但 carrier=0 -> 空口或 AP 那头。"""
+    """网卡是否还在、载波、以及收发计数。
+    🔴 rx 冻结而 tx 仍在涨 = USB 链路死了(ESP32 的 NCM 发送卡死，它自己三道检测都看不见)，
+    这是 2026-09-16 那次永久失联唯一的可见指纹 —— 当时只能靠临时脚本抓，所以固化进来。
+    网卡名不写死：换网络方案/换板子都会变，写死的失败形态是完全静默的。"""
     out = []
+    nic = None
     for name in sorted(os.listdir("/sys/class/net")):
-        if name.startswith("wl"):
-            out.append("carrier=%s" % read("/sys/class/net/%s/carrier" % name, "?").strip())
+        # 只认 en*/wl*：usb0 是 gadget 口，有 IP 也出不了网
+        if (name.startswith("en") or name.startswith("wl")) and not name.startswith("usb"):
+            nic = name
             break
-    seen = 0
-    try:
-        for d in os.listdir("/sys/bus/usb/devices"):
-            v = read("/sys/bus/usb/devices/%s/idVendor" % d).strip()
-            p = read("/sys/bus/usb/devices/%s/idProduct" % d).strip()
-            if v and "%s:%s" % (v, p) == USB_WIFI:
-                seen = 1
-                break
-    except OSError:
-        seen = -1
-    out.append("usb=%d" % seen)
+    if nic is None:
+        return "nic=none"                      # 网卡整个没了 = USB 设备掉了或没枚举
+    out.append("nic=%s" % nic)
+    out.append("carrier=%s" % read("/sys/class/net/%s/carrier" % nic, "?").strip())
+    for key, tag in (("rx_packets", "rx"), ("tx_packets", "tx"), ("rx_dropped", "rxdrop")):
+        out.append("%s=%s" % (tag, read("/sys/class/net/%s/statistics/%s" % (nic, key), "?").strip()))
     return " ".join(out)
 
 
