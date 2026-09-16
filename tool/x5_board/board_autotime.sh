@@ -7,8 +7,6 @@
 #   systemctl enable --now board-autotime
 set -u
 
-IFACE=wlx80ea07cb5d4a
-GW=192.168.19.254
 # 不用网关做时间源：实测它自己比公网 NTP 慢 822 秒
 SERVERS="ntp.aliyun.com cn.pool.ntp.org ntp1.aliyun.com"
 FLAG=/etc/init.d/looper/setting/is_time_sync
@@ -18,21 +16,35 @@ WAIT_NET=60
 mkdir -p "$(dirname "$LOG")"
 log() { echo "[$(date '+%F %T')] $*" >> "$LOG"; }
 
+# 网卡名由 MAC 生成(enx...)，换板子或从 USB 网卡换成 ESP32 网桥就变，所以探测不写死。
+# 只认 en*/wl*：usb0 是 gadget 口，有 IP 也出不了网。
+detect_iface() {
+    ifconfig 2>/dev/null | awk '
+        /^[^ \t]/ { n=""; if ($1 ~ /^(en|wl)/) { n=$1; sub(/:$/, "", n) } }
+        /inet /   { if (n != "") { print n; exit } }'
+}
+
 log "=== autotime 启动 ==="
 
-# 1. 等网卡拿到 IP（开机时 wifi-connect.sh 可能还没跑完）
+# 1. 等网卡拿到 IP（开机时 wifi-connect.sh / USB 枚举可能还没跑完）
+IFACE=""
 i=0
 while [ $i -lt $WAIT_NET ]; do
-    ifconfig "$IFACE" 2>/dev/null | grep -q "inet " && break
+    IFACE=$(detect_iface)
+    [ -n "$IFACE" ] && break
     i=$((i + 1)); sleep 1
 done
-if ! ifconfig "$IFACE" 2>/dev/null | grep -q "inet "; then
-    log "没网($IFACE 无 IP)，放弃对时"; exit 0
+if [ -z "$IFACE" ]; then
+    log "没网(等 ${WAIT_NET}s 没有任何 en*/wl* 拿到 IP)，放弃对时"; exit 0
 fi
+log "出网网卡 $IFACE (等了 ${i}s)"
 
-# 2. 默认路由：DHCP 装不上，因为死掉的 usb0 那条一直占着 metric 0
+# 2. 默认路由：ip_config.sh 无条件给 usb0 加了一条 metric 0 的，而 host 模式下 gadget
+#    口没有载波，公网流量全被它吞成黑洞 —— 不删就对不上时。
+busybox ip route del default dev usb0 2>/dev/null && log "删掉 usb0 的黑洞默认路由"
 if ! route -n | awk '$1=="0.0.0.0"{print $8}' | grep -q "$IFACE"; then
-    busybox ip route del default 2>/dev/null
+    GW=$(route -n | awk -v i="$IFACE" '$1=="0.0.0.0" && $8==i {print $2; exit}')
+    [ -n "$GW" ] || GW=192.168.19.254
     busybox ip route add default via "$GW" dev "$IFACE" 2>/dev/null \
         && log "默认路由改到 $IFACE via $GW"
 fi
