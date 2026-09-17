@@ -65,8 +65,15 @@ def sh(cmd, timeout=90):
 
 
 def iface():
+    """🔴 不能只认 wl*：USB WiFi 网卡正是本项目要删掉的东西，现在的出口是 ESP32 网桥的 enx*。
+    只找 wl* 会让这里恒为 None，main 每轮直接 continue —— 整个自愈服务空转、从不动手。
+    2026-09-17 每次链路断死都只能人工断电重启，根因就是这一行。"""
     try:
-        for n in sorted(os.listdir("/sys/class/net")):
+        names = sorted(os.listdir("/sys/class/net"))
+        for n in names:
+            if n.startswith("enx"):
+                return n
+        for n in names:
             if n.startswith("wl"):
                 return n
     except OSError:
@@ -188,6 +195,18 @@ def emit(line):
 
 def steps(dev):
     """梯度。每一项是 (名字, 动作, 之后等多少秒再复验)。"""
+    if dev.startswith("enx"):
+        # ESP32 网桥：wifi-connect 那级是 USB WiFi 专用脚本，对它无意义甚至有害。
+        # 重新枚举等效于人工断电重启，是实测唯一能救回断死的手段。
+        return [
+            ("dhcp-renew",
+             lambda: sh("pkill -f 'udhcp[c].*%s' 2>/dev/null; udhcpc -i %s -n -q -t 8" % (dev, dev), 40),
+             15),
+            ("link-bounce", lambda: sh("ifconfig %s down; sleep 2; ifconfig %s up" % (dev, dev), 30), 25),
+            ("usb-reauthorize",
+             lambda: sh("echo 0 > %s/authorized; sleep 3; echo 1 > %s/authorized" % (USB_DEV, USB_DEV), 30),
+             35),
+        ]
     return [
         # 2026-08-25 定案:掉线现场是 `link=1 carrier=1 ip=none` —— 关联好着,丢的是 IP
         # (速率塌到 CCK_1M 后 DHCP 续租失败)。所以第一步只重新拿 IP,不要动关联:第2级的
