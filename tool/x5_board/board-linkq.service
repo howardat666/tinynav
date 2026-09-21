@@ -1,0 +1,17 @@
+[Unit]
+Description=板子自测链路质量（板子->USB->ESP32->WiFi->AP 整条），出门在外 PC 够不着时用
+After=network.target
+
+[Service]
+Type=simple
+# 采样周期和每次的包数。30s x 20 包 ≈ 每小时 2400 个包，对链路的额外负载可以忽略。
+Environment=LQ_PERIOD=30
+Environment=LQ_NPING=20
+Environment=LQ_OUT=/userdata/x5/logs/link_quality.tsv
+ExecStart=/usr/bin/python3 -u /userdata/x5/bin/link_quality.py
+Restart=always
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

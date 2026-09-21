@@ -129,6 +129,62 @@ def t_no_gateway_is_acted_on():
     assert "dhcp_renew" not in old, "判据没有鉴别力"
 
 
+# ------------------------------------------------------------- 事件驱动快速通道
+def t_fast_paths():
+    """换 AP 时 USB 网卡整个消失再出现（实测 usb=0 + SIOCGIFINDEX: No such device）。
+    等"网关探测连续失败 6 次"要 90 秒，而网卡序号变化是确定性信号，可以立刻动手；
+    "根本没有地址"同理 —— 没地址就探不了网关，等 6 次毫无意义。
+    这样既快又不用降低 FAIL_N，不会因为网络抖一下就误触发。"""
+    src = open("/home/dm/looper/tinynav-x5/tool/x5_board/board_netheal.py").read()
+    body = src.split("def main(")[1]
+    fast = body.split("ensure_pinned(dev)")[2].split("ok, why =")[0]
+    assert "ifindex" in fast and "dhcp_renew" in fast, "缺少网卡重新出现这条快速通道"
+    assert "ipv4(dev) is None" in fast, "缺少没有地址这条快速通道"
+    assert "NOIP_COOLDOWN_S" in fast, "没地址那条缺节流，真断网时会每轮打 udhcpc"
+    assert "last_idx and idx != last_idx" in fast, "开机第一次观测就会误触发"
+    # 反向验证：这条判据对旧写法（直接进 probe）必须判红
+    assert "ifindex" not in "        ok, why = probe(gw)", "判据没有鉴别力"
+    assert N.NOIP_COOLDOWN_S >= 30, "节流太松"
+
+
+def t_usb_path_is_discovered():
+    """第 3 级 usb-reauthorize 写死 /sys/bus/usb/devices/1-1，这块板子上不存在 ——
+    2026-09-21 日志实证 rc=2 Directory nonexistent，那一级从来没真执行过。"""
+    src = open("/home/dm/looper/tinynav-x5/tool/x5_board/board_netheal.py").read()
+    fn = src.split("def usb_dev_path(")[1].split("\ndef ")[0]
+    assert "realpath" in fn and "authorized" in fn, "没有按网卡反查，还是写死路径"
+    ladder = src.split("def steps(")[1].split("\ndef ")[0]
+    assert "USB_DEV" not in ladder, "梯度里还直接引用写死的 USB_DEV"
+    assert callable(N.usb_dev_path)
+
+
+# ------------------------------------------------- 判活不能只靠对方回不回 ping
+def t_liveness_not_only_icmp():
+    """2026-09-21 实测：手机热点的网关根本不回 ICMP（ESP32 的 ICMP 对帐里几十个请求
+    只换回 3 个回复），而数据一直在正常流动。只靠 ping 判活会让 netheal 永远以为断网，
+    第 2 级 ifconfig down/up 把连接实打实掐断 —— "一直断连"是自愈自己造成的。"""
+    src = open("/home/dm/looper/tinynav-x5/tool/x5_board/board_netheal.py").read()
+    blk = src.split("ok, why = (False, \"forced\") if FORCE_FAIL else probe(gw)")[1] \
+             .split("if ok:")[0]
+    assert "rx_packets" in blk and "arp_complete" in blk, "还是只靠 ICMP 判活"
+    assert "not ok and" in blk, "兜底判据必须只在 ping 失败时才用"
+    assert "and arp_complete" in blk, "两个条件必须同时成立，否则会把真故障也判成正常"
+    # 反向验证：旧写法只有一行 probe，这条判据必须判红
+    assert "rx_packets" not in "        ok, why = probe(gw)", "判据没有鉴别力"
+    # ARP 解析本身
+    sample = ("IP address  HW type  Flags  HW address         Mask  Device\n"
+              "10.0.0.1    0x1      0x2    c6:cf:3f:4a:3e:1a  *     enx0\n"
+              "10.0.0.2    0x1      0x0    00:00:00:00:00:00  *     enx0\n")
+    real = N.read
+    N.read = lambda p, d="": sample if "arp" in p else d
+    try:
+        assert N.arp_complete("10.0.0.1") is True
+        assert N.arp_complete("10.0.0.2") is False, "flags=0x0 不算已解析"
+        assert N.arp_complete("10.0.0.9") is False, "表里没有不算已解析"
+    finally:
+        N.read = real
+
+
 # ------------------------------------------------------------------ 梯度形状
 def t_ladder_shape():
     """enx*(ESP32 网桥) 这条路不该出现 wifi-connect 那一级 —— 那是 USB WiFi 网卡
@@ -146,6 +202,9 @@ if __name__ == "__main__":
     check("别名功能默认关且名字不超长", t_pinned_alias_disabled)
     check("续租会请求固定地址", t_requests_fixed_ip)
     check("没有默认路由时会补跑 dhcp", t_no_gateway_is_acted_on)
+    check("事件驱动的两条快速通道", t_fast_paths)
+    check("USB 路径按网卡反查而非写死", t_usb_path_is_discovered)
+    check("判活不只看 ICMP", t_liveness_not_only_icmp)
     check("enx 梯度不含 wifi-connect", t_ladder_shape)
     print("\n%s" % ("全部通过" if not FAILS else "失败: %s" % FAILS))
     sys.exit(1 if FAILS else 0)

@@ -31,6 +31,8 @@ GRACE_S = 90.0             # 开机宽限，别和 wifi-connect.sh 抢
 BACKOFF_S = 120.0          # 整条梯度都没救回来之后歇多久再重来
 NOGW_GRACE = 4             # 连续这么多轮没有默认路由（=60s）才补跑 dhcp，躲开开机时的枚举抖动
 NOGW_COOLDOWN_S = 120.0    # 补跑之间的最小间隔
+NOIP_COOLDOWN_S = 45.0     # "根本没有地址"这一类的补救间隔
+RX_ALIVE_PKTS = 5          # 一个周期内收到这么多包就算"数据在流"（配合 ARP 判据一起用）
 LOG = "/userdata/x5/logs/board_netheal.log"
 MAXBYTES = 4 << 20
 WIFI_UP = "/etc/init.d/looper/wifi-connect.sh"
@@ -240,6 +242,54 @@ def emit(line):
         pass
 
 
+def usb_reauthorize():
+    p = usb_dev_path() or USB_DEV
+    return sh("echo 0 > %s/authorized; sleep 3; echo 1 > %s/authorized" % (p, p), 30)
+
+
+def ifindex(dev):
+    """网卡的内核序号。换 AP 时 USB 网卡会整个消失再出现，序号随之变化 —— 这是
+    "网络被重新插过"的确定性信号，比等网关探测失败 6 次(90s)快得多且不会误判。"""
+    if not dev:
+        return None
+    v = read("/sys/class/net/%s/ifindex" % dev).strip()
+    return v or None
+
+
+def usb_dev_path():
+    """USB 设备目录。原来写死 /sys/bus/usb/devices/1-1，这块板子上它不存在 ——
+    2026-09-21 日志里第 3 级 usb-reauthorize 报 rc=2 'Directory nonexistent'，
+    那一级从来没真执行过。改成按网卡反查：net 设备的 device 链接指向 USB 接口目录
+    (形如 1-1:1.0)，它的上一级就是 USB 设备目录。"""
+    dev = iface()
+    if not dev:
+        return None
+    try:
+        intf = os.path.realpath("/sys/class/net/%s/device" % dev)
+    except OSError:
+        return None
+    parent = os.path.dirname(intf)
+    return parent if os.path.exists(os.path.join(parent, "authorized")) else None
+
+
+def rx_packets(dev):
+    v = read("/sys/class/net/%s/statistics/rx_packets" % dev).strip()
+    return int(v) if v.isdigit() else None
+
+
+def arp_complete(gw):
+    """网关在 ARP 表里是不是"已解析"。/proc/net/arp 的 flags 位 0x2 = complete。
+    ARP 由对方的协议栈回，和它回不回 ICMP 无关。"""
+    for line in read("/proc/net/arp").splitlines()[1:]:
+        f = line.split()
+        if len(f) >= 4 and f[0] == gw:
+            try:
+                return bool(int(f[2], 16) & 0x2) and f[3] != "00:00:00:00:00:00"
+            except ValueError:
+                return False
+    return False
+
+
 def drop_stale_default(gw):
     """删掉指向链路本地地址的默认路由。
 
@@ -270,9 +320,7 @@ def steps(dev):
         return [
             ("dhcp-renew", lambda: dhcp_renew(dev), 15),
             ("link-bounce", lambda: sh("ifconfig %s down; sleep 2; ifconfig %s up" % (dev, dev), 30), 25),
-            ("usb-reauthorize",
-             lambda: sh("echo 0 > %s/authorized; sleep 3; echo 1 > %s/authorized" % (USB_DEV, USB_DEV), 30),
-             35),
+            ("usb-reauthorize", lambda: usb_reauthorize(), 35),
         ]
     return [
         # 2026-08-25 定案:掉线现场是 `link=1 carrier=1 ip=none` —— 关联好着,丢的是 IP
@@ -285,7 +333,7 @@ def steps(dev):
         ("link-bounce", lambda: sh("ifconfig %s down; sleep 2; ifconfig %s up" % (dev, dev), 30), 25),
         ("wifi-connect", lambda: sh("sh %s" % WIFI_UP, 120), 25),
         ("usb-reauthorize", lambda: (
-            sh("echo 0 > %s/authorized; sleep 3; echo 1 > %s/authorized" % (USB_DEV, USB_DEV), 30),
+            usb_reauthorize(),
             time.sleep(0 if DRY else 8),
             sh("sh %s" % WIFI_UP, 120))[0], 35),
     ]
@@ -302,6 +350,9 @@ def main():
     nogw = 0
     last_nogw_fix = 0.0
     req_ip_forced = False
+    last_idx = ifindex(iface())
+    last_noip_fix = 0.0
+    last_rx = None
     armed = FORCE_FAIL
     rung = 0
     down_since = None
@@ -312,6 +363,22 @@ def main():
         gw = gateway() or gw
         dev = iface() or dev
         ensure_pinned(dev)
+        # 快速通道 1：网卡重新出现（换 AP 时 USB 网卡会整个消失再回来）。
+        idx = ifindex(dev)
+        if idx and last_idx and idx != last_idx:
+            rc, out = dhcp_renew(dev)
+            emit("网卡重新出现 ifindex %s->%s，立即续租 rc=%s 之后 ip=%s gw=%s"
+                 % (last_idx, idx, rc, ipv4(dev), gateway()))
+            gw = gateway() or gw
+            last_noip_fix = time.time()
+        if idx:
+            last_idx = idx
+        # 快速通道 2：压根没有地址。等 6 次网关探测毫无意义 —— 没地址就探不了。
+        if dev and ipv4(dev) is None and time.time() - last_noip_fix > NOIP_COOLDOWN_S:
+            last_noip_fix = time.time()
+            rc, out = dhcp_renew(dev)
+            emit("网卡没有地址，立即续租 rc=%s 之后 ip=%s gw=%s" % (rc, ipv4(dev), gateway()))
+            gw = gateway() or gw
         # 拿不到网卡、或默认路由是 usb0 的链路本地地址，说明现在的状态本身不可信 ——
         # 这时候动手只会拿 None 去拼命令、或者去 ping 一个和 WiFi 无关的目标。
         if dev is None or gw is None or gw.startswith("169.254."):
@@ -344,6 +411,19 @@ def main():
                 emit("地址 %s 不是约定的 %s，换一次 rc=%s 之后 ip=%s"
                      % (cur, REQUEST_IP, rc, ipv4(dev)))
         ok, why = (False, "forced") if FORCE_FAIL else probe(gw)
+        # 🔴 不能只信"对方回不回 ping"。2026-09-21 实测：手机热点的网关**根本不回 ICMP**
+        # （ESP32 的 ICMP 对帐里几十个请求只换回 3 个回复），而数据一直在正常流动。
+        # 只靠 ping 判活会让 netheal 永远以为断网，一遍遍跑梯度，第 2 级 ifconfig down/up
+        # 会实打实把连接掐断 —— 用户看到的就是"一直断连"，而这是自愈自己造成的。
+        # 兜底判据要两个条件同时成立，才不会反过来把真故障也判成正常：
+        #   网关的 ARP 表项是完整的（ARP 由对方协议栈回，与 ICMP 策略无关）
+        #   且这一轮确实收到了包（链路在被使用）
+        rx = rx_packets(dev)
+        if not ok and not FORCE_FAIL and rx is not None and last_rx is not None:
+            d = rx - last_rx
+            if d >= RX_ALIVE_PKTS and arp_complete(gw):
+                ok, why = True, "ping无回应但链路在用(收%d包+网关ARP已解析)" % d
+        last_rx = rx
         if ok:
             if down_since is not None:
                 lad = steps(dev)
