@@ -90,6 +90,45 @@ def t_pinned_alias_disabled():
         N.sh, N.emit, N.ipv4 = real_sh, real_emit, real_ipv4
 
 
+# --------------------------------------------------------------- 固定地址请求
+def t_requests_fixed_ip():
+    """热点每次给的地址都不同，而小米热点页不显示 IP，人根本找不到板子。
+    用 DHCP 自带的 requested-ip 让它每次都要同一个地址。板上实测：网段对不上时
+    服务器给别的地址、udhcpc 照常拿到租约，所以两个网络通用。"""
+    calls = []
+    real = N.sh
+    N.sh = lambda c, t=90, quiet=False: (calls.append(c), (0, ""))[-1]
+    try:
+        assert N.REQUEST_IP, "默认该带一个请求地址"
+        N.dhcp_renew(DEV)
+        assert "-r %s" % N.REQUEST_IP in calls[1], calls[1]
+        # 反向验证：关掉它就不该再带 -r
+        calls.clear()
+        N.REQUEST_IP = ""
+        N.dhcp_renew(DEV)
+        assert "-r" not in calls[1], calls[1]
+    finally:
+        N.REQUEST_IP = "10.140.21.9"
+        N.sh = real
+
+
+# ------------------------------------------------------- 没有默认路由不能空转
+def t_no_gateway_is_acted_on():
+    """原来 gw 为空就 continue，于是"跑到新网段却没拿到地址"永远没人管 —— 而那恰恰
+    是最该重新要地址的时刻。开机时 USB 重新枚举会短暂无路由，所以要有宽限和节流。"""
+    src = open("/home/dm/looper/tinynav-x5/tool/x5_board/board_netheal.py").read()
+    head = src.split("def main(")[1]
+    blk = head.split("nogw += 1")[1].split("nogw = 0")[0]
+    assert "dhcp_renew" in blk, "无默认路由的分支里没有补救动作，还是在空转"
+    assert "NOGW_GRACE" in blk and "NOGW_COOLDOWN_S" in blk, "缺宽限或节流"
+    assert "drop_stale_default" in blk, "没先删掉指向链路本地的僵尸默认路由，dhcp 装不上路由"
+    assert N.NOGW_GRACE >= 3, "宽限太短，会和开机时的 USB 枚举抖动打架"
+    assert N.NOGW_COOLDOWN_S >= 60, "节流太松，真没网时会每轮都打 udhcpc"
+    # 反向验证：这条判据对旧写法（只有 continue）必须判红
+    old = "\n            if fails % 8 == 0:\n                emit(...)\n            fails += 1\n            continue\n"
+    assert "dhcp_renew" not in old, "判据没有鉴别力"
+
+
 # ------------------------------------------------------------------ 梯度形状
 def t_ladder_shape():
     """enx*(ESP32 网桥) 这条路不该出现 wifi-connect 那一级 —— 那是 USB WiFi 网卡
@@ -105,6 +144,8 @@ if __name__ == "__main__":
     check("pkill 不会打死自己", t_pkill_not_suicidal)
     check("rc 非零会报 ERROR", t_rc_is_loud)
     check("别名功能默认关且名字不超长", t_pinned_alias_disabled)
+    check("续租会请求固定地址", t_requests_fixed_ip)
+    check("没有默认路由时会补跑 dhcp", t_no_gateway_is_acted_on)
     check("enx 梯度不含 wifi-connect", t_ladder_shape)
     print("\n%s" % ("全部通过" if not FAILS else "失败: %s" % FAILS))
     sys.exit(1 if FAILS else 0)

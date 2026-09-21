@@ -29,6 +29,8 @@ FAIL_N = 6                 # 连续失败这么多次才动手 = 90 s。2026-08-
 TIMEOUT_S = 2.5
 GRACE_S = 90.0             # 开机宽限，别和 wifi-connect.sh 抢
 BACKOFF_S = 120.0          # 整条梯度都没救回来之后歇多久再重来
+NOGW_GRACE = 4             # 连续这么多轮没有默认路由（=60s）才补跑 dhcp，躲开开机时的枚举抖动
+NOGW_COOLDOWN_S = 120.0    # 补跑之间的最小间隔
 LOG = "/userdata/x5/logs/board_netheal.log"
 MAXBYTES = 4 << 20
 WIFI_UP = "/etc/init.d/looper/wifi-connect.sh"
@@ -42,6 +44,12 @@ WIFI_PROC = "/proc/net/rtl8710bu"
 PIN_IP = os.environ.get("NETHEAL_PIN_IP", "")
 PIN_MASK = os.environ.get("NETHEAL_PIN_MASK", "255.255.255.0")
 IFNAMSIZ_MAX = 15          # 内核 IFNAMSIZ=16 含结尾 NUL
+# 续租时主动请求这个地址（DHCP 的 requested-ip，不是静态配置，也不是别名）。
+# 手机热点那一侧地址每次都不同，人就得去设备列表里翻，而小米热点页根本不显示 IP。
+# 请求成功 => 热点上永远是这个地址，网页地址固定。
+# 🔎 2026-09-21 板上实测：在网段对不上的 DEEP-RD 上请求它，服务器给别的地址、udhcpc
+#    照常拿到租约，不会卡住 —— 所以两边通用，不用按网络切换。
+REQUEST_IP = os.environ.get("NETHEAL_REQUEST_IP", "10.140.21.9")
 ALLOW_REBOOT = os.environ.get("NETHEAL_ALLOW_REBOOT") == "1"
 DRY = "--dry-run" in sys.argv
 # 真掉线才验梯度就太晚了。--force-fail 假装探测一直失败，配 --dry-run 就能把整条梯度和
@@ -232,6 +240,17 @@ def emit(line):
         pass
 
 
+def drop_stale_default(gw):
+    """删掉指向链路本地地址的默认路由。
+
+    🔎 2026-09-21 实测：usb0 这个 USB gadget 口已经不在 /sys/class/net 里了（设备没了），
+    却留下一条 `default via 169.254.10.2 dev usb0 metric 0` 的僵尸路由，metric 比 DHCP
+    装的那条小，于是真正的出口永远装不上 —— udhcpc 报 `RTNETLINK answers: File exists`
+    然后一切照常返回 rc=0。netheal 原来只是躲开这种局面（gw 是 169.254 就跳过），
+    躲开的结果是板子永远出不去。"""
+    return sh("route del default gw %s" % gw, 20)
+
+
 def dhcp_renew(dev):
     """🔴 两步必须分开跑。写成 `pkill ...; udhcpc -i <dev> ...` 一条命令时，执行它的这个
     shell 自己的命令行里就含着 `udhcpc -i <dev>`，pkill 当场把自己连同后半句一起打死 ——
@@ -239,7 +258,8 @@ def dhcp_renew(dev):
     `udhcp[c]` 的括号只保护得了模式串本身，保护不了同一行里的那个真实命令。"""
     # quiet：pkill 没匹配到进程就返回 1，那是常态不是故障，别让它每次都打 ERROR。
     sh("pkill -f 'udhcp[c].*%s'" % dev, 20, quiet=True)
-    return sh("udhcpc -i %s -n -q -t 8" % dev, 40)
+    req = (" -r " + REQUEST_IP) if REQUEST_IP else ""
+    return sh("udhcpc -i %s -n -q -t 8%s" % (dev, req), 40)
 
 
 def steps(dev):
@@ -279,6 +299,9 @@ def main():
     ensure_pinned(dev)
     t_start = time.time()
     fails = 0
+    nogw = 0
+    last_nogw_fix = 0.0
+    req_ip_forced = False
     armed = FORCE_FAIL
     rung = 0
     down_since = None
@@ -292,10 +315,34 @@ def main():
         # 拿不到网卡、或默认路由是 usb0 的链路本地地址，说明现在的状态本身不可信 ——
         # 这时候动手只会拿 None 去拼命令、或者去 ping 一个和 WiFi 无关的目标。
         if dev is None or gw is None or gw.startswith("169.254."):
+            # 🔴 这里原来只是 continue，于是"跑到新网段却没拿到地址"这种局面**永远**没人管
+            # —— 没有默认路由恰恰是最该重新要地址的时刻，不是"状态不可信"。
+            # 但开机时 USB 重新枚举确实会短暂如此，所以给 NOGW_GRACE 轮宽限再动手，
+            # 并且自己节流，免得在真没网的环境里每 15 秒打一次 udhcpc。
+            nogw += 1
             if fails % 8 == 0:
-                emit("状态不可信，先等:iface=%s gw=%s（USB 重新枚举后会短暂如此）" % (dev, gw))
+                emit("状态不可信:iface=%s gw=%s 第%d轮（%d 轮后补一次 dhcp）" % (dev, gw, nogw, NOGW_GRACE))
+            if dev and nogw >= NOGW_GRACE and time.time() - last_nogw_fix > NOGW_COOLDOWN_S:
+                last_nogw_fix = time.time()
+                if gw and gw.startswith("169.254."):
+                    rc0, _ = drop_stale_default(gw)
+                    emit("删掉指向 %s 的僵尸默认路由 rc=%s" % (gw, rc0))
+                rc, out = dhcp_renew(dev)
+                emit("无默认路由，补跑 dhcp-renew rc=%s 之后 gw=%s | %s"
+                     % (rc, gateway(), out.strip().replace("\n", " / ")[-140:]))
             fails += 1
             continue
+        nogw = 0
+        # 固定地址只在续租时才请求，而冷启动时如果热点已经开着，开机那次 udhcpc 会随便
+        # 拿一个地址、网络还是通的，于是永远不会续租 —— 地址就一直是随机的。这里补一刀：
+        # 已经在 REQUEST_IP 所在网段却不是那个地址，就主动换一次。每次开机最多一次。
+        if REQUEST_IP and not req_ip_forced and dev:
+            cur = ipv4(dev)
+            if cur and cur != REQUEST_IP and cur.rsplit(".", 1)[0] == REQUEST_IP.rsplit(".", 1)[0]:
+                req_ip_forced = True
+                rc, out = dhcp_renew(dev)
+                emit("地址 %s 不是约定的 %s，换一次 rc=%s 之后 ip=%s"
+                     % (cur, REQUEST_IP, rc, ipv4(dev)))
         ok, why = (False, "forced") if FORCE_FAIL else probe(gw)
         if ok:
             if down_since is not None:
