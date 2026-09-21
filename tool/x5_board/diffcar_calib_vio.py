@@ -2,7 +2,8 @@
 """用 Looper 的 VIO 当真值标定差速车的两个机械常量。在板上跑。
 
   python3 diffcar_calib_vio.py dist [米]    直线 -> 反推每轮 ppr
-  python3 diffcar_calib_vio.py spin [圈]    原地转 -> 反推 WHEEL_BASE
+  python3 diffcar_calib_vio.py spin [圈] [rad/s] [m/s]  转 -> 反推 WHEEL_BASE
+      圈取负=右转；给 m/s 就是走弧线（半径 = m/s ÷ rad/s），不给就是原地转
 
 替代 calib.py 的 dist/spin：那两个要人拿卷尺量距离、用眼睛数圈数。VIO 的米制标度来自
 出厂标定的 0.1002 m 立体基线，是独立于轮速的参考，而且不需要人在现场。
@@ -104,16 +105,34 @@ class Vio(Node):
         return self.rot / n if n > 1e-6 else self.rot
 
 
+# `e` 这条退路读不到轮距，但 base_true = 2*ds/vio_rad 把它约掉了，只用于打印对照。
+# 与 diffcar_esp32/src/main.cpp 的 WHEEL_BASE 保持一致。
+BASE_PRINT_ONLY = 0.2083
+
+
 def firmware(car):
-    """轮周长/轮距/两轮 ppr 从固件现读，绝不写死。"""
+    """轮周长/两轮 ppr 从固件现读，绝不写死。
+
+    优先 `?`；它不在串口来源白名单里(main.cpp:907)时退到 `e`，靠 里程=圈数*轮周长
+    反推 —— 累计几十圈之后这个比值比 `?` 打印的 4 位小数还准。"""
     import re
     txt = '\n'.join(car.ask('?', 1.5))
     circ = re.search(r'轮周长=([\d.]+)m', txt)
     base = re.search(r'轮距=([\d.]+)m', txt)
     ppr = re.findall(r'脉冲/圈=([\d.]+)', txt)
-    if not (circ and base and len(ppr) >= 2):
-        sys.exit('读不到固件参数，`?` 回的是:\n' + txt)
-    return float(circ.group(1)), float(base.group(1)), float(ppr[0]), float(ppr[1])
+    if circ and base and len(ppr) >= 2:
+        return float(circ.group(1)), float(base.group(1)), float(ppr[0]), float(ppr[1])
+
+    txt = '\n'.join(car.ask('e', 1.2))
+    rows = re.findall(r'脉冲/圈=([\d.]+) 计数=-?\d+ 圈数=(-?[\d.]+) 里程=(-?[\d.]+)m', txt)
+    if len(rows) < 2:
+        sys.exit('读不到固件参数，`?` 和 `e` 回的都是:\n' + txt)
+    circs = [abs(float(m)) / abs(float(r)) for _p, r, m in rows if abs(float(r)) > 5.0]
+    if not circs:
+        sys.exit('累计圈数不足 5 圈，反推不出轮周长；先让车走一段再标')
+    print('⚠️ `?` 被串口白名单挡住，改从 `e` 反推：轮周长 %s'
+          % ' '.join('%.5f' % c for c in circs))
+    return sum(circs) / len(circs), BASE_PRINT_ONLY, float(rows[0][0]), float(rows[1][0])
 
 
 def vbat(car):
@@ -125,9 +144,9 @@ def vbat(car):
     return None
 
 
-def drive(node, car, v, w, stop_when, limit_s):
+def drive(node, car, v, w, stop_when, limit_s, watch=None):
     """20Hz 重发（固件 2s 失联保护），每次重发之间抽干 VIO 回调。
-    返回中止原因，None = 正常达成条件。"""
+    返回中止原因，None = 正常达成条件。watch(t) 返回非空就中止。"""
     t0 = last_v = time.time()
     while True:
         rclpy.spin_once(node, timeout_sec=0.01)
@@ -138,6 +157,10 @@ def drive(node, car, v, w, stop_when, limit_s):
             return 'VIO 位姿跳变 %.3f m，跟踪可能重定位了' % node.jump
         if stop_when(now - t0):
             return None
+        if watch is not None:
+            why = watch(now - t0)
+            if why:
+                return why
         if now - last_v > 0.05:
             car.twist(v, w)
             last_v = now
@@ -195,6 +218,11 @@ def do_dist(node, car, target):
           % (vio, node.path, node.n))
     if abs(fw) < 0.2 or vio < 0.2:
         sys.exit('位移太小，没走起来')
+    # 指令直行时闭环让两轮计数相等，此时 VIO 还看到偏航 => 左右轮有效周长不等。
+    # theta = N/ppr*(C_r-C_l)/B  =>  (C_r-C_l)/C = theta*B/d。改轮距修不掉这一项。
+    dc = node.yaw_rad * BASE_PRINT_ONLY / max(vio, 1e-6)
+    print('VIO 偏航      = %.2f 度  => 左右轮有效周长差 %.2f%%（改轮距修不掉）'
+          % (math.degrees(node.yaw_rad), dc * 100))
     k = vio / fw
     print('\n修正系数 k = VIO / 固件 = %.4f  (固件%s %.1f%%)'
           % (k, '少报' if k > 1 else '多报', abs(k - 1) * 100))
@@ -208,7 +236,7 @@ def do_dist(node, car, target):
             'ppr_new': [ppr_l / k, ppr_r / k], 'counts': list(counts)}
 
 
-def do_spin(node, car, turns):
+def do_spin(node, car, turns, rate=0.8, v=0.0):
     circ, base, ppr_l, ppr_r = firmware(car)
     v0 = vbat(car)
     print('固件: 轮周长=%.4fm 轮距=%.3fm   电压=%.2fV' % (circ, base, v0))
@@ -223,11 +251,34 @@ def do_spin(node, car, turns):
     node.reset()
 
     # 0.8 rad/s = 导航配置的 max_yaw。有效轮距要吸收原地转的打滑，而打滑跟转速有关，
-    # 所以必须在实际会用到的转速下标。
-    w = 0.8
-    total = turns * 2 * math.pi
-    print('原地左转 %.1f 圈 (%.1f rad) @ %.2f rad/s …' % (turns, total, w))
-    hit = drive(node, car, 0.0, w, lambda t: t * w >= total, total / w + 8.0)
+    # 所以必须在实际会用到的转速下标。turns 取负 = 右转，用来查左右是否对称。
+    w = rate if turns > 0 else -rate
+    total = abs(turns) * 2 * math.pi
+    # v>0 = 走弧线。原地转两轮反转、弧线两轮同向，接地打滑机理不同，量出来的
+    # 有效轮距也可能不同 —— 导航里两种都有，所以两种都要标。
+    if v > 0:
+        print('绕圈%s %.1f 圈 (%.1f rad) @ %.2f rad/s, v=%.2f m/s, 半径 %.2f m …'
+              % ('左' if w > 0 else '右', abs(turns), total, rate, v, v / rate))
+    else:
+        print('原地%s %.1f 圈 (%.1f rad) @ %.2f rad/s …'
+              % ('左转' if w > 0 else '右转', abs(turns), total, rate))
+    # 🔑 撞上东西不会让 VIO 位姿跳变，只会让车转不动 —— JUMP_ABORT_M 抓不到这一类。
+    # 用最近 3 秒的实际转速对照指令：整段平均会被没撞的那半段稀释掉，必须看滑动窗口。
+    hist = []
+
+    def watch(t):
+        hist.append((t, node.yaw_rad))
+        while len(hist) > 1 and hist[0][0] < t - 3.0:
+            hist.pop(0)
+        if t < 5.0 or t - hist[0][0] < 2.5:
+            return None
+        r = (node.yaw_rad - hist[0][1]) / (t - hist[0][0])
+        if r < 0.7 * rate:
+            return ('最近3秒实际转速 %.2f rad/s，只有指令 %.2f 的 %.0f%% —— 多半撞上东西了'
+                    % (r, rate, 100 * r / rate))
+        return None
+
+    hit = drive(node, car, v, w, lambda t: t * rate >= total, total / rate + 8.0, watch)
     stop(node, car)
     if hit:
         sys.exit('中止: ' + hit)
@@ -236,13 +287,14 @@ def do_spin(node, car, turns):
     fw_rad = math.radians(pose[2])
     # 固件的 theta 会绕回 ±180，转多圈时不能直接用；用两轮计数差重算。
     ds = (counts[1] - counts[0]) / 2.0 / ((ppr_l + ppr_r) / 2.0) * circ
-    fw_rad_counts = ds * 2 / base
+    fw_rad_counts = abs(ds * 2 / base)   # vio_rad 是模长恒正，这边也取绝对值才能比
     vio_rad = node.yaw_rad
     print('\n固件(计数反推) = %.3f rad = %.2f 圈   (报的 theta=%.1f度，多圈会绕回)'
           % (fw_rad_counts, fw_rad_counts / (2 * math.pi), math.degrees(fw_rad)))
     print('VIO 累加转角    = %.3f rad = %.2f 圈   转轴 %s'
           % (vio_rad, vio_rad / (2 * math.pi), np.round(node.axis, 3)))
-    print('VIO 平移        = %.3f m  (原地转应该很小，大了说明车在跑偏)' % node.straight_m)
+    print('VIO 平移        = %.3f m  路径长 %.3f m  (原地转两者都该很小)'
+          % (node.straight_m, node.path))
     if vio_rad < 0.5 or fw_rad_counts < 0.5:
         sys.exit('转角太小，没转起来')
     # 固件按 base_assumed 算 theta，实际按 base_true 转：theta_fw/theta_vio = base_true/base_assumed
@@ -267,7 +319,10 @@ def main():
     time.sleep(0.6)
     car.drain()
     try:
-        out = do_dist(node, car, arg) if sys.argv[1] == 'dist' else do_spin(node, car, arg)
+        rate = float(sys.argv[3]) if len(sys.argv) > 3 else 0.8
+        lin = float(sys.argv[4]) if len(sys.argv) > 4 else 0.0
+        out = (do_dist(node, car, arg) if sys.argv[1] == 'dist'
+               else do_spin(node, car, arg, rate, lin))
         path = '/userdata/x5/calib_%s.json' % sys.argv[1]
         with open(path, 'w') as f:
             json.dump(out, f, ensure_ascii=False, indent=1)

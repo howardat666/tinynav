@@ -85,6 +85,18 @@ else:
 # `flutter run -d chrome` on a different port and this directory does not exist,
 # so mounting is skipped and the API behaves exactly as before.
 _DEFAULT_WEB_ROOT = Path(__file__).resolve().parents[1] / 'frontend' / 'build' / 'web'
+class _RevalidateStatic(StaticFiles):
+    """main.dart.js 在 flutter_bootstrap.js 里是裸引用、不带版本号，浏览器会一直用缓存那份 ——
+    2026-09-15 前端改了默认相机话题，板上 bundle 已是新的(md5 一致)，页面却还在跑旧逻辑。
+    no-cache 不是不缓存，是每次必须带 ETag 回源校验，没改动时返回 304，几乎不费流量。"""
+
+    async def get_response(self, path, scope):
+        resp = await super().get_response(path, scope)
+        if path.endswith(('.js', '.html', '.json')):
+            resp.headers['Cache-Control'] = 'no-cache'
+        return resp
+
+
 WEB_ROOT = Path(os.environ.get('TINYNAV_WEB_ROOT', _DEFAULT_WEB_ROOT))
 
 if (WEB_ROOT / 'index.html').is_file():
@@ -93,7 +105,7 @@ if (WEB_ROOT / 'index.html').is_file():
     # here because this frontend keeps all its state in widgets and never puts a
     # route in the URL -- there are no deep links to preserve. Should it ever grow
     # URL routing, this mount would need a catch-all returning index.html instead.
-    app.mount('/', StaticFiles(directory=str(WEB_ROOT), html=True), name='web')
+    app.mount('/', _RevalidateStatic(directory=str(WEB_ROOT), html=True), name='web')
     print(f'[backend] serving web UI from {WEB_ROOT}', flush=True)
 else:
     print(f'[backend] no web bundle at {WEB_ROOT}, API only', flush=True)

@@ -130,7 +130,7 @@ class DiffCarControlNode(Node):
         p("link_probe_period_s", 3.0)
         p("battery_period_s", 2.0)
         # 必须与固件的 constexpr WHEEL_BASE 一致：只用来把每轮实测速度还原成整车 w。
-        p("wheel_base", 0.2035)
+        p("wheel_base", 0.2083)
         # 固件的低压闭锁是 9.60 V；这里早一点叫，好在日志里留下"塌之前"的样子
         p("battery_warn_v", 10.0)
 

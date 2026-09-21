@@ -1,6 +1,8 @@
 import rclpy
 import os
 from rclpy.node import Node
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path, Odometry
@@ -429,6 +431,38 @@ class MapNode(Node):
         # 20 s 把长尾按下去而相邻抖动中位仍是 0.6 度。0 = 关掉衰减，回到旧行为。
         self.map_odom_half_life_s = float(
             os.environ.get('TINYNAV_MAP_ODOM_HALF_LIFE_S', '20.0'))
+        # 解跟不上最近这一片时，丢掉陈旧约束。0=关。
+        # 门限由 5 份板上日志、2160 次拟合的离线回放扫出来（tool/x5_board/reloc_fit_replay.py）：
+        # 0.5 最好 —— 最长「跟不上」段 96.3s→12.3s、58.3s→12.3s，两份无事件的日志零触发；
+        # 1.0 次之；2.0 太松（96.3s 只降到 94.8s）。代价是拟合位移 >0.3m 的比例约翻倍
+        # （1.9%→3.8%），但仍远低于出问题那次的 29%。
+        # 多候选怎么合成一个位姿。pool=现状（三个候选的地标拼一个池子解一次 PnP）；
+        # best_inliers=上游 main 的做法（每候选各解一次，取内点最多的）。
+        # 池化能凑够地标数（每候选只有 29~50 个匹配），但三个候选指向不同地方时解是折衷。
+        self.reloc_fusion = os.environ.get('TINYNAV_RELOC_FUSION', 'pool')
+        # 拼错的值会一路穿过所有 if 落进最后那段 best_inliers_then_pool，既不报错也不回退默认，
+        # 于是 A/B 时你以为关掉的算法其实在跑。必须白名单校验。
+        if self.reloc_fusion not in ('pool', 'consensus', 'top1', 'best_inliers', 'best_inliers_then_pool'):
+            self.get_logger().error(
+                f"TINYNAV_RELOC_FUSION='{self.reloc_fusion}' 不认识，回退 pool")
+            self.reloc_fusion = 'pool'
+        self.reloc_consensus_m = float(os.environ.get('TINYNAV_RELOC_CONSENSUS_M', '1.0'))
+        # 拟合用最近几条约束。100 是原始值；2026-09-20 用 5 份板上日志、2160 次拟合回放
+        # 扫出来 5 最好：机器人实际用错 >0.5m 的时间占比 14.5%->1.1% / 18.2%->6.2%，
+        # 而最大误差全部持平或更好（担心的"小窗口放大坏解"没有发生）。代价是每拍位移
+        # 略增（0.4%->1.5% 超过 0.3m）。
+        self.map_odom_window = int(os.environ.get('TINYNAV_MAP_ODOM_WINDOW', '100'))
+        # 约束变陈旧是因为车【转了】而不是因为过了多少秒：车停着时旧约束依然有效，而原地
+        # 转 90 度只要 3 秒。>0 时取代上面的时间半衰期。2026-09-20 用 5 份板上日志回放，
+        # 10~20 度优于单纯截短窗口，且最大误差更小（20_20 那份 1.75m -> 1.10m）。
+        self.map_odom_half_life_deg = float(
+            os.environ.get('TINYNAV_MAP_ODOM_HALF_LIFE_DEG', '0.0'))
+        self.map_odom_stale_resid_m = float(
+            os.environ.get('TINYNAV_MAP_ODOM_STALE_RESID_M', '0.0'))
+        self.map_odom_stale_keep = int(
+            os.environ.get('TINYNAV_MAP_ODOM_STALE_KEEP', '10'))
+        self._stale_resid_streak = 0
+        self._stale_purges = 0
         # 按检索候选散布给约束降权：spread 大 = 候选自己散得开 = 解可能落在错的盆地。
         # 内点率(ratio)已经在当权重，但它对这类错解不敏感 —— 09-09 20:20 那趟 12 个
         # 「地图位移 != 里程计位移」的坏解 ratio 中位 0.33、其中一个 0.79，而 spread
@@ -644,8 +678,12 @@ class MapNode(Node):
         self.tf_broadcaster = TransformBroadcaster(self)
 
         self._save_completed = False
+        # 单独一组：一次重定位 555 ms 会把同线程的这个 2 Hz 定时器整拍挡住。给它自己的
+        # 互斥组（不是可重入组 —— 它只有一个调用点，重入没有意义，反而会自己踩自己）。
+        # 只有 TINYNAV_MAP_NODE_THREADS>1 时才真的并行，否则行为与改动前逐字相同。
         self.nav_target_timer = self.create_timer(
-            self.nav_target_period_s, self.nav_target_timer_callback)
+            self.nav_target_period_s, self.nav_target_timer_callback,
+            callback_group=MutuallyExclusiveCallbackGroup())
 
     def _start_nav_path_search_warmup(self):
         """Kick off the path-search JIT warmup without blocking the constructor.
@@ -810,9 +848,9 @@ class MapNode(Node):
     # pose being published is seconds stale.
     #
     # `max_keyframe_age_s` is the safety net. Note a "busy" flag would not work
-    # here: main() uses rclpy.spin(), a single-threaded executor, so callbacks are
-    # serialised and never re-enter -- by the time one returns, the backlog is
-    # already sitting in the executor queue. Rejecting on *age* does work, because
+    # here: this callback never re-enters (its group is mutually exclusive, and with
+    # TINYNAV_MAP_NODE_THREADS=1 the whole node is serialised anyway) -- by the time
+    # one returns, the backlog is already sitting in the executor queue. Rejecting on *age* does work, because
     # each stale item is discarded in microseconds and the queue drains almost
     # instantly, leaving the node working on the newest data.
     #
@@ -1444,6 +1482,7 @@ class MapNode(Node):
         if len(candidates) > 0:
             point_3d_in_world_arrays = []
             point_2d_in_keyframe_arrays = []
+            candidate_sims_used = []
             candidate_summaries = []
             candidate_timing_summaries = []
             for candidate in candidates:
@@ -1479,6 +1518,7 @@ class MapNode(Node):
                     timings["depth3d"] = timings.get("depth3d", 0.0) + depth_ms
                     point_3d_in_world_arrays.append(point_3d_in_world[inliers])
                     point_2d_in_keyframe_arrays.append(keyframe_matched_keypoints[inliers])
+                    candidate_sims_used.append(similarity)
                     candidate_summaries.append(
                         f"{timestamp_in_map}:sim={similarity:.3f},matches={len(matches)},"
                         f"valid_depth={int(np.count_nonzero(inliers))},jump={cand_jump:.1f}m"
@@ -1498,8 +1538,13 @@ class MapNode(Node):
             landmark_count = int(sum(points.shape[0] for points in point_3d_in_world_arrays))
             stats["landmarks"] = landmark_count
             if landmark_count > self.reloc_min_landmarks:
-                point_3d_in_world_list = np.concatenate(point_3d_in_world_arrays, axis=0)
-                point_2d_in_keyframe_list = np.concatenate(point_2d_in_keyframe_arrays, axis=0)
+                point_3d_in_world_list, point_2d_in_keyframe_list, fusion_note = self._fuse_candidates(
+                    point_3d_in_world_arrays, point_2d_in_keyframe_arrays, candidate_sims_used)
+                if fusion_note:
+                    stats["fusion"] = fusion_note
+                if len(point_3d_in_world_list) == 0:
+                    return self._relocalization_failed(
+                        f"fusion '{self.reloc_fusion}' kept no landmarks ({fusion_note})", "few_landmarks")
 
                 # A correspondence count says nothing about whether the geometry
                 # constrains a pose. If the 2D observations are all (nearly) the
@@ -1839,6 +1884,128 @@ class MapNode(Node):
         R = np.asarray(T)[:3, :3]
         return math.degrees(math.atan2(float(R[1, 0]), float(R[0, 0])))
 
+    def _fuse_candidates(self, pts3d_arrays, pts2d_arrays, sims):
+        """把多个候选的 2D-3D 对应合成一组，交给下游那一次 solvePnPRansac。
+
+        pool 分支必须与改动前逐字等价 —— 它是所有对照的基线，动了就没有基线了。
+        其余分支各自多解几次 PnP，只在离线评测里用，板上默认不走。"""
+        mode = self.reloc_fusion
+        if mode == "pool" or len(pts3d_arrays) <= 1:
+            return (np.concatenate(pts3d_arrays, axis=0),
+                    np.concatenate(pts2d_arrays, axis=0),
+                    "" if mode == "pool" else f"{mode}:只有一个候选，退化为池化")
+        if mode == "consensus":
+            # 用其余候选给最相似那个做交叉检验：各自解一次 PnP，若没有第二个候选落在
+            # top1 附近，就判定这次检索不可信、整次拒绝（宁可不报也不报错的位置）。
+            poses = []
+            for i, (p3, p2) in enumerate(zip(pts3d_arrays, pts2d_arrays)):
+                if len(p3) < 4:
+                    continue
+                ok, rv, tv, inl = cv2.solvePnPRansac(p3, p2, self.map_K, None)
+                if ok and inl is not None:
+                    # 🔴 tvec 是 world->camera 的平移，不是相机位置：相机中心 C = -R^T t。
+                    # 直接拿 tvec 比距离的话，两个候选即使给出同一个位置、只差一点朝向，
+                    # 距离也 ≈ |δ|·‖C‖ —— 门限的实际含义随「离地图原点多远」变化，
+                    # 30m 处 0.5m 只等效 0.95 度的朝向容差。
+                    R_i, _ = cv2.Rodrigues(rv)
+                    poses.append((i, (-R_i.T @ tv).reshape(3)))
+            if not poses:
+                return np.empty((0, 3)), np.empty((0, 2)), "consensus:逐候选全解不出"
+            i_top = int(np.argmax(sims))
+            t_top = next((t for i, t in poses if i == i_top), None)
+            if t_top is None:
+                return np.empty((0, 3)), np.empty((0, 2)), "consensus:最相似的那个解不出"
+            agree = [i for i, t in poses
+                     if i != i_top and float(np.linalg.norm(t - t_top)) <= self.reloc_consensus_m]
+            if not agree:
+                return (np.empty((0, 3)), np.empty((0, 2)),
+                        f"consensus:无人附议 top1（{len(poses)-1}个候选都在{self.reloc_consensus_m}m外）")
+            keep = sorted([i_top] + agree)
+            return (np.concatenate([pts3d_arrays[i] for i in keep], axis=0),
+                    np.concatenate([pts2d_arrays[i] for i in keep], axis=0),
+                    f"consensus:{len(keep)}/{len(pts3d_arrays)}个候选彼此附议")
+        if mode == "top1":
+            i = int(np.argmax(sims))
+            if len(pts3d_arrays[i]) < 4:             # 少于 4 点 solvePnPRansac 直接抛 cv2.error
+                return np.empty((0, 3)), np.empty((0, 2)), f"top1:第{i}个不足4点"
+            return pts3d_arrays[i], pts2d_arrays[i], f"top1:选了第{i}个(sim={sims[i]:.3f})"
+
+        # 逐候选各解一次，拿内点数当"哪个候选是对的"的凭据（上游 rerank_by_pnp_inliers）
+        solved = []
+        for i, (p3, p2) in enumerate(zip(pts3d_arrays, pts2d_arrays)):
+            if len(p3) < 4:       # solvePnPRansac 的下限
+                continue
+            ok, rvec, tvec, inl = cv2.solvePnPRansac(p3, p2, self.map_K, None)
+            if ok and inl is not None:
+                R_i, _ = cv2.Rodrigues(rvec)
+                tvec = (-R_i.T @ tvec).reshape(3)    # 同上：要的是相机中心不是 tvec
+                # -i 让内点数打平时偏向【更相似】的候选（候选按相似度降序排列，
+                # 下标越小越像）。别把 tvec 放进排序键 —— 前两项若都打平就会去比
+                # numpy 数组，抛 "truth value of an array is ambiguous"。
+                solved.append((len(inl), -i, tvec))
+        if not solved:
+            return (np.concatenate(pts3d_arrays, axis=0),
+                    np.concatenate(pts2d_arrays, axis=0),
+                    f"{mode}:逐候选全部解不出，退回池化")
+        solved.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        n_best, i_best, t_best = solved[0][0], -solved[0][1], solved[0][2]
+        if mode == "best_inliers":
+            return pts3d_arrays[i_best], pts2d_arrays[i_best], f"best_inliers:第{i_best}个({n_best}内点)"
+
+        # best_inliers_then_pool：先用最好的那个认定"对的地方"，再把和它一致的候选
+        # 并进来重解 —— 既保住池化凑地标数的好处，又挡住指向别处的候选。
+        keep = sorted(-ni for n, ni, t in solved
+                      if float(np.linalg.norm(t - t_best)) <= self.reloc_consensus_m)
+        return (np.concatenate([pts3d_arrays[i] for i in keep], axis=0),
+                np.concatenate([pts2d_arrays[i] for i in keep], axis=0),
+                f"best_then_pool:以第{i_best}个为准，并入{len(keep)}/{len(pts3d_arrays)}个候选")
+
+    def _purge_stale_constraints_if_lagging(self, recent_resid_m: float, used_timestamps: list):
+        """解和最近几条约束对不上 ⇒ 旧约束还在把解往上一个盆地拽，丢掉它们。
+
+        ⚠️ 要连续两次才动手：单次越限可能只是一帧坏观测，而清约束是不可逆的。
+        只保留最新的若干条而不是清空，是为了留住重新拟合所需的最少证据。"""
+        if self.map_odom_stale_resid_m <= 0.0:
+            return
+        if recent_resid_m <= self.map_odom_stale_resid_m:
+            self._stale_resid_streak = 0
+            return
+        self._stale_resid_streak += 1
+        if self._stale_resid_streak < 2:
+            return
+        keep = set(sorted(used_timestamps)[-self.map_odom_stale_keep:])
+        dropped = [ts for ts in list(self.relocalization_poses) if ts not in keep]
+        if not dropped:
+            return
+        for ts in dropped:
+            self.relocalization_poses.pop(ts, None)
+            self.relocalization_pose_weights.pop(ts, None)
+            self.relocalization_pose_quality.pop(ts, None)
+        self._stale_resid_streak = 0
+        self._stale_purges += 1
+        self.get_logger().warning(
+            f"map->odom stale purge #{self._stale_purges}: recent resid {recent_resid_m:.2f}m > "
+            f"{self.map_odom_stale_resid_m:.2f}m twice running -- dropped {len(dropped)} "
+            f"constraints, kept the newest {len(keep)}")
+
+    def _cumulative_rotation_deg(self, timestamps):
+        """每条约束到最新那条之间，车总共转过多少度。
+
+        ⚠️ 用相对旋转的转角，不取欧拉角 —— 位姿是相机光学约定，单独一个欧拉角在这里
+        是噪声（[[map-odom-yaw-log-was-noise]] 就栽在这）。"""
+        ts = sorted(timestamps)
+        if not ts:
+            return {}
+        cum, acc = {ts[-1]: 0.0}, 0.0
+        for j in range(len(ts) - 1, 0, -1):
+            a = self.pose_graph_used_pose.get(ts[j - 1])
+            b = self.pose_graph_used_pose.get(ts[j])
+            if a is not None and b is not None:      # 并发回调可能正好把它删了
+                c = (np.trace(a[:3, :3].T @ b[:3, :3]) - 1.0) / 2.0
+                acc += math.degrees(math.acos(max(-1.0, min(1.0, float(c)))))
+            cum[ts[j - 1]] = acc
+        return cum
+
     def compute_transform_from_map_to_odom(self):
         """
         Solve the optmization problem.
@@ -1850,6 +2017,10 @@ class MapNode(Node):
         }
         constant_pose_index_dict = { 1: True }
         used_timestamps = []
+        rot_cum = ({} if self.map_odom_half_life_deg <= 0.0 else
+                   self._cumulative_rotation_deg(
+                       [t for t in list(self.relocalization_poses)
+                        if t in self.pose_graph_used_pose]))
         newest_ns = max(self.relocalization_poses) if self.relocalization_poses else 0
         for timestamp, pose in self.relocalization_poses.items():
             if timestamp in self.pose_graph_used_pose:
@@ -1863,12 +2034,15 @@ class MapNode(Node):
                                 or (0.0, 0.0))[0]
                     if spread_m > self.map_odom_spread_ref_m:
                         weight *= self.map_odom_spread_ref_m / spread_m
-                if self.map_odom_half_life_s > 0.0:
+                if self.map_odom_half_life_deg > 0.0:
+                    weight *= 0.5 ** (rot_cum.get(timestamp, 0.0)
+                                      / self.map_odom_half_life_deg)
+                elif self.map_odom_half_life_s > 0.0:
                     age_s = (newest_ns - timestamp) / 1e9
                     weight *= 0.5 ** (age_s / self.map_odom_half_life_s)
 
                 relative_pose_constraint.append((0, 1, observation_T_from_map_to_odom, weight * np.array([10.0, 10.0, 10.0]), weight * np.array([10.0, 10.0, 10.0])))
-        relative_pose_constraint = relative_pose_constraint[-100:]
+        relative_pose_constraint = relative_pose_constraint[-self.map_odom_window:]
         optimized_parameters = pose_graph_solve(optimized_parameters, relative_pose_constraint, constant_pose_index_dict, max_iteration_num = 1000)
         T_new = optimized_parameters[0]
         obs = [c[2] for c in relative_pose_constraint]
@@ -1930,6 +2104,7 @@ class MapNode(Node):
                 f"cf_yaw={self._transform_yaw_deg(T_cf):+.1f}deg"
                 + (" [用的是闭式解，所以 gap 恒为 0]" if self.map_odom_closed_form else "")
             )
+            self._purge_stale_constraints_if_lagging(float(np.median(te_s[-k:])), used_timestamps)
         prev = self._last_T_map_to_odom_logged
         d_t = float(np.linalg.norm(T[:3, 3] - prev[:3, 3])) if prev is not None else 0.0
         d_yaw = (self._transform_yaw_deg(T) - self._transform_yaw_deg(prev)) if prev is not None else 0.0
@@ -2003,9 +2178,12 @@ class MapNode(Node):
         所以：拿不到最新位姿就退回关键帧那份（等于改动前的行为），并且把原因喊出来。"""
         pose, ts = self.latest_odom_pose, self.latest_odom_ns
         if pose is None:
-            if self.pose_graph_used_pose:
-                ts = max(self.pose_graph_used_pose)
-                pose = self.pose_graph_used_pose[ts]
+            # 先拷键再 .get()：并发写入时 max() 直接遍历会抛 RuntimeError，而取到键之后
+            # 再下标访问会抛 KeyError（实测先撞上的是后者）。单线程执行器下两者都不会发生。
+            keys = list(self.pose_graph_used_pose)
+            if keys:
+                ts = max(keys)
+                pose = self.pose_graph_used_pose.get(ts)
                 self.get_logger().warning(
                     f"nav target: no pose on {self.nav_odom_topic} yet -- falling back to "
                     f"the newest keyframe pose. Check `ros2 topic info {self.nav_odom_topic}` "
@@ -2047,7 +2225,10 @@ class MapNode(Node):
         t_stage = t_start
         self.get_logger().debug(f"try_publish_nav_path, timestamp: {timestamp}")
         t_stage = mark_stage("start_log", t_stage)
-        if self.T_from_map_to_odom is None:
+        # 🔴 整个函数只在这里读一次 T：判空和使用之间隔着十几行，而重定位那条回调会把它
+        # 置 None。单线程执行器下读到的必然是同一个值，多线程下就会 se3_inv(None) 崩掉。
+        T_map_to_odom = self.T_from_map_to_odom
+        if T_map_to_odom is None:
             self.get_logger().info("Relocalization not successful yet, skip publishing nav path", throttle_duration_sec=2.0)
             log_nav_timing("skip_no_relocalization")
             return
@@ -2058,7 +2239,7 @@ class MapNode(Node):
         if pose_in_odom is None:
             log_nav_timing("skip_no_odom_pose")
             return
-        pose_in_map = se3_inv(self.T_from_map_to_odom) @ pose_in_odom
+        pose_in_map = se3_inv(T_map_to_odom) @ pose_in_odom
         self.current_pose_in_map_pub.publish(np2msg(pose_in_map, self.get_clock().now().to_msg(), "world", "map"))
         pose_in_map_position = pose_in_map[:3, 3]
         t_stage = mark_stage("pose_in_map_publish", t_stage)
@@ -2154,6 +2335,9 @@ class MapNode(Node):
         replan_reason = self._nav_replan_reason(pose_in_map_position)
         if replan_reason is None:
             paths_in_map = self.cached_nav_path_in_map
+            if paths_in_map is None:   # 判过之后换 POI 的回调把缓存清了，下一拍重算即可
+                log_nav_timing("skip_cache_invalidated")
+                return
             t_stage = mark_stage("generate_path_cached", t_stage)
         else:
             with Timer(name = "generate nav path in map", text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=self.timer_logger):
@@ -2512,7 +2696,16 @@ def main(args=None):
         verbose_timer=parsed_args.verbose_timer,
     )
 
-    rclpy.spin(node)
+    # 默认仍是单线程，与改动前完全一致；>1 才让 nav 目标定时器和重定位并行。
+    # 板上 CPU 已超订，加线程不一定划算，所以必须显式开并单独做一轮 A/B。
+    threads = int(os.environ.get('TINYNAV_MAP_NODE_THREADS', '1'))
+    if threads > 1:
+        node.get_logger().info(f"map_node: MultiThreadedExecutor with {threads} threads")
+        executor = MultiThreadedExecutor(num_threads=threads)
+        executor.add_node(node)
+        executor.spin()
+    else:
+        rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
 

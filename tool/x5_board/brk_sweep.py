@@ -14,7 +14,7 @@ from carlib import Car
 
 VL = re.compile(r"vl=(-?[\d.]+)\s+vr=(-?[\d.]+)")
 PO = re.compile(r"x=(-?[\d.]+)\s+y=(-?[\d.]+)\s+theta=(-?[\d.]+)")
-BASE = 0.2035
+BASE = 0.2083
 
 
 def leg(car, v, w, dur):

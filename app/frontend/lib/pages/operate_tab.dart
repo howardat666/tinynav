@@ -1605,19 +1605,30 @@ class _CameraPanelState extends ConsumerState<_CameraPanel> {
     final mapInfo = ref.watch(mapInfoProvider).valueOrNull;
     final planning = ref.watch(planningStreamProvider).valueOrNull;
 
-    // Auto-select color topic on first load
-    ref.listen<AsyncValue<List<String>>>(imageTopicsProvider, (_, next) {
-      final topics = next.valueOrNull;
-      if (topics != null && ref.read(selectedPreviewTopicProvider) == null) {
-        final colorTopic = topics.firstWhere(
-          (t) => t.contains('color'),
+    // 首次加载默认选 infra1(left)，退而求其次才是 color：looper 模式下 color 被
+    // TINYNAV_DISABLE_COLOR 关着、选了也只有 "Waiting for stream…"，而 infra1 是
+    // SuperPoint 真正跑的那一路，也是默认唯一有画面的。
+    // ⚠️ 这里原来用 ref.listen，而 listen 只对【注册之后】的变化触发 —— imageTopicsProvider
+    // 若在本 widget 首次 build 之前就已 resolve，那次 loading->data 收不到，默认值永远不设。
+    // 改成直接判断当前值：topics 到了 build 自然会重跑，不依赖事件。
+    // 选 infra1(left) 而不是 color：looper 模式下 color 被 TINYNAV_DISABLE_COLOR 关着，
+    // 而且 orElse 的 contains('color') 会误匹配 /planning/height_color。
+    if (selectedTopic == null && topics.isNotEmpty) {
+      final preferred = topics.firstWhere(
+        (t) => t.contains('infra1'),
+        orElse: () => topics.firstWhere(
+          (t) => t.contains('/color/'),
           orElse: () => '',
-        );
-        if (colorTopic.isNotEmpty) {
-          ref.read(selectedPreviewTopicProvider.notifier).state = colorTopic;
-        }
+        ),
+      );
+      if (preferred.isNotEmpty) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted && ref.read(selectedPreviewTopicProvider) == null) {
+            ref.read(selectedPreviewTopicProvider.notifier).state = preferred;
+          }
+        });
       }
-    });
+    }
 
     if (selectedTopic != null) {
       ref.listen<AsyncValue<Uint8List>>(

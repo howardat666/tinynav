@@ -91,9 +91,21 @@ do_start() {
     # core (135% vs 34% of one core, measured).
     INSIGHT_PARAM="${INSIGHT_PARAM:-/userdata/install/lib/insight_full/insight_param}"
     if [[ -x "${INSIGHT_PARAM}" ]]; then
-        "${INSIGHT_PARAM}" vio_enabled false >/dev/null 2>&1 \
-            && echo "camera VIO paused (node_manager resumes it for bag recording)" \
-            || echo "NOTE: camera VIO switch unavailable -- is vio_enabled=true in user_params.json?" >&2
+        # Retry + read back: the one-shot version silently lost the race against
+        # insight_full's ~18 s socket bring-up and left VIO burning a core all day.
+        vio_off=0
+        for _ in $(seq 15); do
+            "${INSIGHT_PARAM}" vio_enabled false >/dev/null 2>&1
+            if "${INSIGHT_PARAM}" status 2>/dev/null | grep -q '"vio_enabled":false'; then
+                vio_off=1; break
+            fi
+            sleep 2
+        done
+        if [[ "${vio_off}" == 1 ]]; then
+            echo "camera VIO paused (node_manager resumes it for bag recording)"
+        else
+            echo "NOTE: camera VIO still on after 30s -- is vio_enabled=true in user_params.json?" >&2
+        fi
     fi
 
     mkdir -p "${LOG_DIR}" "${DB_PATH}"
@@ -134,10 +146,27 @@ do_start() {
     export TINYNAV_ODOM_SOURCE="${nav_src}"
     export TINYNAV_MAP_ODOM_SOURCE="${map_src}"
 
+    # map->odom 拟合三项（2026-09-20 用 5 份板上日志、2160 次拟合离线回放定的）。
+    # 都留成可覆盖：验证时逐项设 0 或改回默认就能关掉，不用重新部署。
+    #   窗口 100->5：用错 >0.5m 的占比 14.5%->1.1% / 18.2%->6.2%，且「跟不上」累计 113s->9.3s。
+    #     五份日志、两个指标上它是唯一没有一项劣于基线的配置，所以选它而不是转角半衰期。
+    #   consensus 0.5m：没有第二个候选附议 top1 就整次拒绝。p95 5.42m->0.42m，代价是
+    #     命中率 71.5%->70.1%（分母是全部查询，不是成功解 —— 用后者会奖励"多拒绝"）。
+    # 🔴 TINYNAV_MAP_ODOM_HALF_LIFE_DEG 默认关：它赢在个别日志的最大误差，但会把
+    #    2026_09_18_11_10 那份弄得比基线还差（8.9%->10.3%，max 1.25->1.32m）。
+    export TINYNAV_MAP_ODOM_WINDOW="${TINYNAV_MAP_ODOM_WINDOW:-5}"
+    export TINYNAV_MAP_ODOM_HALF_LIFE_DEG="${TINYNAV_MAP_ODOM_HALF_LIFE_DEG:-0.0}"
+    export TINYNAV_RELOC_FUSION="${TINYNAV_RELOC_FUSION:-consensus}"
+    export TINYNAV_RELOC_CONSENSUS_M="${TINYNAV_RELOC_CONSENSUS_M:-0.5}"
+
     # Colour preview alone wants 3.6 Mbit/s at 5 fps and the board's WiFi transmit
     # path caps near 2.5 (docs/x5/board_bringup.md 2.5). Drops it from the UI's topic
     # list entirely, so nothing subscribes to it either.
     export TINYNAV_DISABLE_COLOR="${TINYNAV_DISABLE_COLOR:-1}"
+
+    # infra1 预览默认 2 fps(0.5s)。单帧回调只花 5.34 ms，而 20 Hz 源的反序列化是恒定
+    # 开销(0.196 核，限速丢帧省不掉) —— 提到 10 fps 只多 0.042 核。depth 走另一个常量。
+    export TINYNAV_PREVIEW_SLOW_INTERVAL="${TINYNAV_PREVIEW_SLOW_INTERVAL:-0.1}"
 
     # Offline map build limits. Without all four the build is OOM-killed on this
     # board: measured rc=137 at 0.5% progress, 645 MiB resident.

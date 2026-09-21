@@ -44,7 +44,7 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--map", required=True, help="Reference map directory (the map we relocalize INTO)")
     p.add_argument("--query-map", default=None, help="Map whose infra1 frames are used as queries (default: --map)")
-    p.add_argument("--vocab", required=True, help="DBoW3 vocabulary (.dbow3 binary or ORBvoc.txt)")
+    p.add_argument("--vocab", default=None, help="DBoW3 vocabulary；仅 --loop-closure-mode bow 需要")
     p.add_argument("--transform-json", default=None, help="Shared SE(2) transform map_a<-map_b, required for cross-session")
     p.add_argument("--db-path", default="/jobtmp/reloc_db", help="Scratch dir for MapNode's nav_temp DB")
     p.add_argument("--out-prefix", required=True, help="Output prefix; writes <prefix>.json and <prefix>.csv")
@@ -67,6 +67,12 @@ def _parse_args() -> argparse.Namespace:
     # Retrieval is the night bottleneck: matching already converts 99.4% of retrieval hits
     # into correct poses, so success is capped by whatever the retrieval layer returns.
     # These two backends replace the ORB-trained DBoW3 index that caps night at 32%.
+    p.add_argument("--loop-closure-mode", choices=("bow", "vlad", "embedding"), default="bow",
+                   help="MapNode 的检索模式。新地图(maps2)自带 SuperPoint+VLAD，用 vlad 即可，"
+                        "不需要 --sp-map-features / --retrieval-backend 那套旧 ORB 地图的覆盖机制")
+    p.add_argument("--vlad-centres", default=None, help="--loop-closure-mode vlad 的词典 npz")
+    p.add_argument("--fusion", choices=("pool", "best_inliers", "best_inliers_then_pool", "top1"),
+                   default="pool", help="多候选怎么合成一个位姿；见 map_node._RELOC_FUSION_MODES")
     p.add_argument("--retrieval-backend", choices=("orb_dbow3", "sp_dbow3", "sp_vlad"),
                    default="orb_dbow3",
                    help="orb_dbow3 = the shipping index; sp_dbow3 needs --sp-vocab; "
@@ -160,8 +166,8 @@ def main() -> int:
     rclpy.init(args=None)
     orb_extractor = ORBFeatureTRTCompatible(**({"nfeatures": args.nfeatures} if args.nfeatures else {}))
     if args.features == "sp":
-        if not args.sp_model or not args.sp_map_features:
-            print("ERROR: --features sp needs --sp-model and --sp-map-features", file=sys.stderr)
+        if not args.sp_model:
+            print("ERROR: --features sp needs --sp-model", file=sys.stderr)
             return 2
         from tinynav.core.models_trt import SuperPointORT, SuperPointMatcher
         extractor = SuperPointORT(args.sp_model, threshold=args.sp_threshold,
@@ -180,8 +186,9 @@ def main() -> int:
         extractor=extractor,
         matcher=matcher,
         embedding_extractor=DummyEmbeddingEngine(),
-        loop_closure_mode="bow",
-        loop_closure_use_bow=True,
+        loop_closure_mode=args.loop_closure_mode,
+        loop_closure_use_bow=(args.loop_closure_mode == "bow"),
+        vlad_centres_path=args.vlad_centres,
         dbow3_vocabulary_path=args.vocab,
         verbose_timer=False,
     )
@@ -193,15 +200,20 @@ def main() -> int:
     node.K = node.map_K
     if args.top_k:
         node.relocalization_loop_top_k = int(args.top_k)
+    node.reloc_fusion = args.fusion
 
     if args.features == "sp":
         if args.retrieval_backend == "orb_dbow3":
             # The vocabulary is ORB-trained, so retrieval must stay on ORB; only the
             # matching layer changes and any delta is attributable to the descriptor.
             node.retrieval_extractor = orb_extractor
-        npz = np.load(args.sp_map_features)
+        if not args.sp_map_features:
+            # 新地图(maps2)的 features.db 里就是 SuperPoint，走 MapNode 原生那条路即可
+            npz = None
+        else:
+            npz = np.load(args.sp_map_features)
         alt: dict[int, dict] = {}
-        for key in npz.files:
+        for key in (npz.files if npz is not None else []):
             if not key.endswith("_kpts"):
                 continue
             ts = int(key[: -len("_kpts")])
@@ -214,8 +226,9 @@ def main() -> int:
                 "descps": desc[None, ...],
                 "mask": np.ones((1, kp.shape[0], 1), dtype=np.float32),
             }
-        node.alt_map_features = alt
-        print(f"[info] SuperPoint map features: {len(alt)} keyframes from {args.sp_map_features}")
+        node.alt_map_features = alt if alt else None
+        print(f"[info] SuperPoint map features: "
+              + (f"{len(alt)} keyframes from {args.sp_map_features}" if alt else "用地图自带的 features.db"))
 
     if args.retrieval_backend != "orb_dbow3":
         if args.features != "sp":

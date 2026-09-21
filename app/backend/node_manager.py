@@ -464,10 +464,9 @@ _IMAGE_TOPICS_LOOPER = [
     _HEIGHT_COLOR_TOPIC,
 ]
 _IMAGE_TOPICS_ALL = _IMAGE_TOPICS_REALSENSE  # fallback
-# 5 fps by default. infra1 needs 0.86 Mbit/s at that rate against a measured 0.874
-# uplink (docs/x5/board_bringup.md 2.5), which leaves nothing for ssh -- so the mono
-# topics get a slower cadence rather than being dropped. infra1 is the image
-# SuperPoint actually runs on, so it is the one worth keeping visible.
+# 🔴 这里原来的依据「infra1 需要 0.86 Mbit/s 而实测上行只有 0.874」已作废 —— 那是【USB WiFi
+# 网卡】时代的数。2026-09-20 走 ESP32 网桥实测上行 300~400 KB/s(2.4~3.2 Mbit/s)，而预览真实
+# 码率只有 27~43 KB/s，不到上行的 10%。带宽早就不是约束，限速只为省板上的 JPEG 编码 CPU。
 _PREVIEW_MIN_INTERVAL = float(os.environ.get('TINYNAV_PREVIEW_INTERVAL', '0.2'))
 # Downscale before encoding, which is what main does and x5 had dropped. The board was
 # JPEG-encoding the full 640x544 frame: 348160 pixels against 87040 at a 320 px edge,
@@ -489,7 +488,7 @@ def _resize_preview_frame(arr: np.ndarray, max_edge_px: int = _PREVIEW_MAX_EDGE_
     scale = max_edge_px / float(longest)
     new_size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
     return cv2.resize(arr, new_size, interpolation=cv2.INTER_AREA)
-_PREVIEW_SLOW_INTERVAL = float(os.environ.get('TINYNAV_PREVIEW_SLOW_INTERVAL', '0.5'))
+_PREVIEW_SLOW_INTERVAL = float(os.environ.get('TINYNAV_PREVIEW_SLOW_INTERVAL', '0.1'))
 _PREVIEW_SLOW_TOPICS = frozenset({
     '/camera/camera/infra1/image_rect_raw',
     '/camera/camera/infra2/image_rect_raw',
@@ -498,6 +497,19 @@ _PREVIEW_SLOW_TOPICS = frozenset({
 
 def _preview_interval(topic: str) -> float:
     return _PREVIEW_SLOW_INTERVAL if topic in _PREVIEW_SLOW_TOPICS else _PREVIEW_MIN_INTERVAL
+
+
+# 🔑 门限要留一点容差，否则固定周期门碰上定速源会退化成节奏不齐：相机实测 20.01 Hz(50ms 一帧)、
+# 门 0.1s，只要某帧抖到 99ms 就被丢，下一帧 149ms 才过，间隔在 75~200ms 之间乱跳 —— 一帧没丢，
+# 但眼睛看到的就是卡顿（2026-09-20 实测直方图 100-125ms:43 / 125-150ms:33 / 150-175ms:35）。
+# ⚠️ 容差必须是【绝对值且小于半个源周期】，不能按门限比例给：按比例给的话 0.2s 的门会放行
+# 早一整个源周期（150ms 就过，5fps 变 6.7fps）—— 离线测试当场抓到过。
+_PREVIEW_GATE_SLACK_S = float(os.environ.get('TINYNAV_PREVIEW_GATE_SLACK_S', '0.03'))
+
+
+def _preview_due(topic: str, now: float, last: float) -> bool:
+    iv = _preview_interval(topic)
+    return (now - last) >= iv - min(0.25 * iv, _PREVIEW_GATE_SLACK_S)
 
 # Colour preview needs 3.6 Mbit/s at 5 fps (67 kB/frame, +33% for base64) and the
 # board's WiFi transmit path caps out near 2.5 -- see docs/x5/board_bringup.md 2.5.
@@ -1346,7 +1358,7 @@ class BackendNode(Ros2NodeManager):
         # backward jump makes this delta negative and freezes the preview stream until
         # the wall clock catches back up to the stored timestamp.
         now = time.monotonic()
-        if now - self._last_frame_time.get(topic, 0.0) < _preview_interval(topic):
+        if not _preview_due(topic, now, self._last_frame_time.get(topic, 0.0)):
             return
         self._last_frame_time[topic] = now
         frame = bytes(msg.data)
@@ -1360,7 +1372,7 @@ class BackendNode(Ros2NodeManager):
 
     def _on_image(self, msg: Image, topic: str):
         now = time.monotonic()  # see _on_compressed_image: no RTC on this board
-        if now - self._last_frame_time.get(topic, 0.0) < _preview_interval(topic):
+        if not _preview_due(topic, now, self._last_frame_time.get(topic, 0.0)):
             return
         self._last_frame_time[topic] = now
 
