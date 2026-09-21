@@ -34,6 +34,14 @@ MAXBYTES = 4 << 20
 WIFI_UP = "/etc/init.d/looper/wifi-connect.sh"
 USB_DEV = "/sys/bus/usb/devices/1-1"
 WIFI_PROC = "/proc/net/rtl8710bu"
+# 固定副地址：换到手机热点后 DHCP 每次给的地址都不同，人就得去热点的设备列表里找。
+# 🔴 默认关闭。2026-09-21 实测这条路在本机走不通：网卡名 enxa4cb8fd549dc 正好 15 字符，
+# 已顶满 IFNAMSIZ，`ifconfig <dev>:1` 的别名名字超长被截回主接口 —— 命令不是"加副地址"
+# 而是"把主地址改掉"，板子当场从 192.168.19.102 掉到这个地址上失联。板上没有 `ip` 命令，
+# 没有别的加副地址的办法。要重开必须先解决名字长度（比如把网卡改名成短名）。
+PIN_IP = os.environ.get("NETHEAL_PIN_IP", "")
+PIN_MASK = os.environ.get("NETHEAL_PIN_MASK", "255.255.255.0")
+IFNAMSIZ_MAX = 15          # 内核 IFNAMSIZ=16 含结尾 NUL
 ALLOW_REBOOT = os.environ.get("NETHEAL_ALLOW_REBOOT") == "1"
 DRY = "--dry-run" in sys.argv
 # 真掉线才验梯度就太晚了。--force-fail 假装探测一直失败，配 --dry-run 就能把整条梯度和
@@ -50,18 +58,30 @@ def read(path, default=""):
         return default
 
 
-def sh(cmd, timeout=90):
-    """跑一条命令，返回 (rc, 输出尾部)。绝不抛异常 —— 自愈失败也得继续活着。"""
+def sh(cmd, timeout=90, quiet=False):
+    """跑一条命令，返回 (rc, 输出尾部)。绝不抛异常 —— 自愈失败也得继续活着。
+
+    🔴 rc 非零必须自己叫出来。原来 rc 只进日志字符串、从不作为判据，于是 dhcp-renew
+    连续 34 次 rc=-15（pkill 打死了自己那条 shell）淹在 INFO 里没人看见，那一级从来
+    没真跑起来过。负 rc = 被信号打死，-15 是 SIGTERM，多半是自杀。"""
     if DRY:
         return 0, "(dry-run) " + cmd
     try:
         p = subprocess.run(cmd, shell=True, timeout=timeout,
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        return p.returncode, p.stdout.decode("utf-8", "replace")[-300:]
+        rc, out = p.returncode, p.stdout.decode("utf-8", "replace")[-300:]
     except subprocess.TimeoutExpired:
-        return -1, "timeout"
+        rc, out = -1, "timeout"
     except OSError as e:
-        return -2, repr(e)
+        rc, out = -2, repr(e)
+    if rc != 0 and not quiet:
+        hint = ""
+        if rc == -15:
+            hint = "（SIGTERM：这条命令很可能被自己的 pkill 打死了）"
+        elif rc < 0:
+            hint = "（被信号 %d 打死）" % (-rc)
+        emit("ERROR 命令失败 rc=%s%s cmd=%s | %s" % (rc, hint, cmd, out.strip()[-160:]))
+    return rc, out
 
 
 def iface():
@@ -97,6 +117,25 @@ def ipv4(dev):
         return None
     m = re.search(r"inet (?:addr:)?(\d+\.\d+\.\d+\.\d+)", out)
     return m.group(1) if m else None
+
+
+def ensure_pinned(dev):
+    """保证网卡上挂着 PIN_IP 这个固定副地址。板上没有 `ip` 命令，只能用 busybox 的别名接口。
+    每轮都查是因为 USB 重新枚举、ifconfig down/up、dhcp-renew 都会把别名冲掉。"""
+    if not PIN_IP or not dev:
+        return
+    alias = "%s:1" % dev
+    # 🔴 前置断言，不是事后读回。内核接口名上限 IFNAMSIZ-1 = 15 字节，别名名超了会被
+    # 截回主接口 —— 命令从"加副地址"变成"改主地址"，板子当场失联，而 ifconfig 返回 rc=0。
+    # 读回来自检也没用：读的时候用的是同一个被截断的名字，自检必然和动作同谋。
+    if len(alias) > IFNAMSIZ_MAX:
+        emit("ERROR 固定副地址已停用：别名 %s 长 %d 字节 > %d，会被截回主接口把板子改失联"
+             % (alias, len(alias), IFNAMSIZ_MAX))
+        return
+    if ipv4(alias) == PIN_IP:
+        return
+    rc, out = sh("ifconfig %s %s netmask %s up" % (alias, PIN_IP, PIN_MASK), 20)
+    emit("挂固定副地址 %s=%s rc=%s %s" % (alias, PIN_IP, rc, out.strip()[-100:]))
 
 
 def _cksum(data):
@@ -193,15 +232,23 @@ def emit(line):
         pass
 
 
+def dhcp_renew(dev):
+    """🔴 两步必须分开跑。写成 `pkill ...; udhcpc -i <dev> ...` 一条命令时，执行它的这个
+    shell 自己的命令行里就含着 `udhcpc -i <dev>`，pkill 当场把自己连同后半句一起打死 ——
+    历史日志里 34 次 dhcp-renew 全是 rc=-15(SIGTERM)，udhcpc 一次都没真跑起来。
+    `udhcp[c]` 的括号只保护得了模式串本身，保护不了同一行里的那个真实命令。"""
+    # quiet：pkill 没匹配到进程就返回 1，那是常态不是故障，别让它每次都打 ERROR。
+    sh("pkill -f 'udhcp[c].*%s'" % dev, 20, quiet=True)
+    return sh("udhcpc -i %s -n -q -t 8" % dev, 40)
+
+
 def steps(dev):
     """梯度。每一项是 (名字, 动作, 之后等多少秒再复验)。"""
     if dev.startswith("enx"):
         # ESP32 网桥：wifi-connect 那级是 USB WiFi 专用脚本，对它无意义甚至有害。
         # 重新枚举等效于人工断电重启，是实测唯一能救回断死的手段。
         return [
-            ("dhcp-renew",
-             lambda: sh("pkill -f 'udhcp[c].*%s' 2>/dev/null; udhcpc -i %s -n -q -t 8" % (dev, dev), 40),
-             15),
+            ("dhcp-renew", lambda: dhcp_renew(dev), 15),
             ("link-bounce", lambda: sh("ifconfig %s down; sleep 2; ifconfig %s up" % (dev, dev), 30), 25),
             ("usb-reauthorize",
              lambda: sh("echo 0 > %s/authorized; sleep 3; echo 1 > %s/authorized" % (USB_DEV, USB_DEV), 30),
@@ -211,10 +258,8 @@ def steps(dev):
         # 2026-08-25 定案:掉线现场是 `link=1 carrier=1 ip=none` —— 关联好着,丢的是 IP
         # (速率塌到 CCK_1M 后 DHCP 续租失败)。所以第一步只重新拿 IP,不要动关联:第2级的
         # 拆重建会把"关联着但没 IP"打成"连都连不上"(association failed after 20s),那次
-        # 只能断电。pkill 模式用 udhcp[c] 括起来,否则会匹配到执行它的这个 shell 自己。
-        ("dhcp-renew",
-         lambda: sh("pkill -f 'udhcp[c].*%s' 2>/dev/null; udhcpc -i %s -n -q -t 8" % (dev, dev), 40),
-         15),
+        # 只能断电。自杀那个坑见 dhcp_renew 的注释。
+        ("dhcp-renew", lambda: dhcp_renew(dev), 15),
         # 不用 wpa_cli reassociate:板上的 wpa_supplicant 是 wifi-connect.sh 手工起的、
         # 没带 -C 控制套接字，wpa_cli 直接 rc=255 连不上 —— 那一级是空操作(2026-08-24 实测)。
         ("link-bounce", lambda: sh("ifconfig %s down; sleep 2; ifconfig %s up" % (dev, dev), 30), 25),
@@ -231,6 +276,7 @@ def main():
     gw = gateway()
     emit("netheal 起动 iface=%s gw=%s 周期=%.0fs 门限=%d次 dry_run=%s allow_reboot=%s"
          % (dev, gw, PERIOD_S, FAIL_N, DRY, ALLOW_REBOOT))
+    ensure_pinned(dev)
     t_start = time.time()
     fails = 0
     armed = FORCE_FAIL
@@ -242,6 +288,7 @@ def main():
         time.sleep(PERIOD_S)
         gw = gateway() or gw
         dev = iface() or dev
+        ensure_pinned(dev)
         # 拿不到网卡、或默认路由是 usb0 的链路本地地址，说明现在的状态本身不可信 ——
         # 这时候动手只会拿 None 去拼命令、或者去 ping 一个和 WiFi 无关的目标。
         if dev is None or gw is None or gw.startswith("169.254."):
