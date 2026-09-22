@@ -1786,6 +1786,15 @@ class PlanningNode(Node):
             # 直线探针的口径是因为诊断在轨迹库生成之前就发布了，那时还没有轨迹可判。
             'frontBlocked': bool(front_clearance <= self._front_gate_m()),
             'frontBlockedAtM': round(float(self._front_gate_m()), 2),
+            # 画给人看的车体尺寸。footprint 那条多边形是【绕控制点的扫掠碰撞圆】
+            # (0.1375)，比真实盘体(0.122，圆心在控制点前 20mm)大一圈 —— 只画它会让人以为
+            # 车就那么大。走已有的诊断消息，不新增话题。
+            'chassis': {
+                'bodyRadiusM': round(float(self.robot.body_radius or self.robot.hull_radius), 4),
+                'bodyOffsetXM': round(float(self.robot.body_offset_x), 4),
+                'hullRadiusM': round(float(self.robot.hull_radius), 4),
+                'safetyRadiusM': round(float(self.robot.safety_radius), 4),
+            } if self.robot.is_circle else None,
             'obstacleCells': int(np.count_nonzero(obstacle_mask)),
             'esdfAtRobotM': (None if not np.isfinite(esdf_at_robot)
                              else round(float(esdf_at_robot), 2)),

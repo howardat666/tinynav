@@ -265,6 +265,28 @@ class GridInfo {
       );
 }
 
+/// 圆形底盘的三个半径。碰撞圆是绕控制点的扫掠圆，比真实盘体大，所以要分开画。
+class Chassis {
+  final double bodyRadiusM;
+  final double bodyOffsetXM;
+  final double hullRadiusM;
+  final double safetyRadiusM;
+
+  const Chassis({
+    required this.bodyRadiusM,
+    required this.bodyOffsetXM,
+    required this.hullRadiusM,
+    required this.safetyRadiusM,
+  });
+
+  factory Chassis.fromJson(Map<String, dynamic> j) => Chassis(
+        bodyRadiusM: (j['bodyRadiusM'] as num?)?.toDouble() ?? 0.0,
+        bodyOffsetXM: (j['bodyOffsetXM'] as num?)?.toDouble() ?? 0.0,
+        hullRadiusM: (j['hullRadiusM'] as num?)?.toDouble() ?? 0.0,
+        safetyRadiusM: (j['safetyRadiusM'] as num?)?.toDouble() ?? 0.0,
+      );
+}
+
 /// planning_node's per-cycle numbers, published at 2 Hz for the diagnostics panel.
 class PlanningDiag {
   final double? frontClearanceM;
@@ -275,6 +297,7 @@ class PlanningDiag {
   final double? esdfAtRobotM;
   final double? cycleS;
   final double? stampLagS;
+  final Chassis? chassis;
 
   const PlanningDiag({
     this.frontClearanceM,
@@ -285,6 +308,7 @@ class PlanningDiag {
     this.esdfAtRobotM,
     this.cycleS,
     this.stampLagS,
+    this.chassis,
   });
 
   factory PlanningDiag.fromJson(Map<String, dynamic> j) => PlanningDiag(
@@ -296,6 +320,9 @@ class PlanningDiag {
         esdfAtRobotM: (j['esdfAtRobotM'] as num?)?.toDouble(),
         cycleS: (j['cycleS'] as num?)?.toDouble(),
         stampLagS: (j['stampLagS'] as num?)?.toDouble(),
+        chassis: j['chassis'] == null
+            ? null
+            : Chassis.fromJson(j['chassis'] as Map<String, dynamic>),
       );
 }
 

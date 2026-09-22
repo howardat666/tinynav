@@ -628,6 +628,7 @@ class _LocalPlanningViewState extends ConsumerState<_LocalPlanningView> {
                                   trajectory: p.trajectory,
                                   globalPath: p.globalPath,
                                   footprint: p.footprint,
+                                  chassis: p.diag?.chassis,
                                   gridInfo: p.gridInfo,
                                   odomPose: p.odomPose,
                                   showTrajectory: widget.showTrajectory,
