@@ -11,7 +11,6 @@ class LocalPlanningPainter extends CustomPainter {
   final List<TrajPoint> trajectory;
   final List<TrajPoint> globalPath;
   final List<TrajPoint> footprint;
-  final Chassis? chassis;
   final GridInfo? gridInfo;
   final Pose? odomPose;
   final bool showTrajectory;
@@ -23,7 +22,6 @@ class LocalPlanningPainter extends CustomPainter {
     required this.trajectory,
     this.globalPath = const [],
     this.footprint = const [],
-    this.chassis,
     this.gridInfo,
     this.odomPose,
     this.showTrajectory = true,
@@ -53,10 +51,12 @@ class LocalPlanningPainter extends CustomPainter {
     if (navTargetPose != null && pose != null)
       _drawNavTarget(canvas, cx, cy, scaleX, scaleY, pose, navTargetPose!);
 
-    if (showFootprint) _drawFootprint(canvas, cx, cy, scaleX, scaleY, pose);
+    final hub = showFootprint
+        ? _drawFootprint(canvas, cx, cy, scaleX, scaleY, pose)
+        : null;
 
     // Small arrow on top of everything
-    _drawRobotArrow(canvas, Offset(cx, cy), pose?.yaw ?? 0.0);
+    _drawRobotArrow(canvas, hub ?? Offset(cx, cy), pose?.yaw ?? 0.0);
   }
 
   void _drawTrajectory(Canvas canvas, double cx, double cy,
@@ -153,9 +153,11 @@ class LocalPlanningPainter extends CustomPainter {
     canvas.drawLine(Offset(px, py + r - arm), Offset(px, py + r + arm), cross);
   }
 
-  void _drawFootprint(Canvas canvas, double cx, double cy,
+  /// 返回轮廓形心 = 控制点(旋转中心)。箭头要画在这里，而画布中心是相机位置，
+  /// 两者差 0.087 m —— 箭头落在圆外面看着就像车没对齐。
+  Offset? _drawFootprint(Canvas canvas, double cx, double cy,
       double scaleX, double scaleY, Pose? pose) {
-    if (footprint.isEmpty || pose == null) return;
+    if (footprint.isEmpty || pose == null) return null;
 
     final pts = <Offset>[];
     for (int i = 0; i < footprint.length; i++) {
@@ -171,40 +173,25 @@ class LocalPlanningPainter extends CustomPainter {
     }
     path.close();
 
-    // 这条多边形是规划器的碰撞圆(绕控制点的扫掠圆)，不是车 —— 所以只描边、压淡。
+    canvas.drawPath(path, Paint()..color = const Color(0xFF64B5F6).withOpacity(0.32));
     canvas.drawPath(path,
         Paint()
-          ..color = const Color(0xFF29B6F6).withOpacity(0.55)
+          ..color = const Color(0xFF29B6F6)
           ..style = PaintingStyle.stroke
-          ..strokeWidth = 1.6
+          ..strokeWidth = 2.4
           ..strokeJoin = StrokeJoin.round);
 
-    // 顶点标记只对方形底盘有意义。圆盘发的是 16 边形，逐点画 4px 实心圆就糊成一圈点，
-    // 比车体本身还大 —— 这正是页面上「小车变成一堆圆点」的来源。
+    // 顶点标记只对方形底盘有意义。圆盘发的是 16 边形，逐点画实心圆会糊成一圈点，
+    // 比车体本身还大 —— 这就是页面上「小车变成一堆圆点」的来源。
     if (pts.length <= 8) {
       for (final p in pts) {
         canvas.drawCircle(p, 4, Paint()..color = const Color(0xFF29B6F6));
       }
     }
 
-    final ch = chassis;
-    if (ch == null || ch.bodyRadiusM <= 0) return;
-    // 车体圆。圆心从多边形的形心推出来(=控制点)，再沿朝向前移 bodyOffsetX ——
-    // 不去猜 odomPose 是哪个点，省得又把坐标系搞错。
     double sx = 0, sy = 0;
     for (final p in pts) { sx += p.dx; sy += p.dy; }
-    final hub = Offset(sx / pts.length, sy / pts.length);
-    final yaw = pose.yaw;
-    final body = Offset(hub.dx + math.cos(yaw) * ch.bodyOffsetXM * scaleX,
-                        hub.dy - math.sin(yaw) * ch.bodyOffsetXM * scaleY);
-    final rBody = ch.bodyRadiusM * scaleX;
-    canvas.drawCircle(body, rBody,
-        Paint()..color = const Color(0xFF64B5F6).withOpacity(0.28));
-    canvas.drawCircle(body, rBody,
-        Paint()
-          ..color = const Color(0xFF29B6F6)
-          ..style = PaintingStyle.stroke
-          ..strokeWidth = 2.4);
+    return Offset(sx / pts.length, sy / pts.length);
   }
 
   void _drawRobotArrow(Canvas canvas, Offset center, double yaw) {

@@ -65,12 +65,31 @@ if [[ ${with_web} -eq 1 ]]; then
         echo "--with-web: app/frontend/build/web/index.html missing -- build it first (see header)" >&2
         exit 1
     fi
-    paths+=(app/frontend/build/web)
+    # 🔴 整个 build/web 是 34 MB，大头是 canvaskit，而这条链路(板子->USB->ESP32->WiFi)
+    # 实测只有约 52 KB/s —— 全量必然超时，而中断点落在 canvaskit.wasm 上会把它截断，
+    # 网页整个打不开(2026-09-22 踩过)。改动之间实际变的通常只有 main.dart.js。
+    # 所以先问板子要 md5，只传对不上的。
+    echo "web: 比对 md5，只传变化的文件"
+    board_md5="$(sshpass -p "${BOARD_PASS}" ssh -o StrictHostKeyChecking=no "${BOARD}" \
+        "cd '${BOARD_ROOT}/app/frontend/build/web' 2>/dev/null && find . -type f -exec md5sum {} +" 2>/dev/null || true)"
+    web_changed=()
+    while IFS= read -r f; do
+        want="$(md5sum "app/frontend/build/web/${f}" | cut -d' ' -f1)"
+        have="$(printf '%s\n' "${board_md5}" | awk -v k="./${f}" '$2==k{print $1}')"
+        [[ "${want}" == "${have}" ]] || web_changed+=("app/frontend/build/web/${f}")
+    done < <(cd app/frontend/build/web && find . -type f -printf '%P\n')
+    if [[ ${#web_changed[@]} -eq 0 ]]; then
+        echo "web: 板上已是最新，跳过"
+    else
+        echo "web: 需要传 ${#web_changed[@]} 个文件"
+        paths+=("${web_changed[@]}")
+    fi
 fi
 
 echo "syncing ${paths[*]} -> ${BOARD}:${BOARD_ROOT}"
 
 # tar over ssh rather than scp -r: one round trip, and --exclude actually works.
+# z 不是可选项：链路约 52 KB/s，main.dart.js 3.0 MB 压完只剩 0.9 MB。
 tar czf - \
     --exclude='*.so' \
     --exclude='*.pyc' \
