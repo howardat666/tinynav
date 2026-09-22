@@ -1,0 +1,13 @@
+[Unit]
+Description=开机后存一份启动现场（切到手机热点后 PC 够不着板子，只能事后取；journald 开机头 55 秒还丢日志）
+After=board-app.service
+
+[Service]
+Type=oneshot
+Environment=BOOTREPORT_DELAY=120
+ExecStart=/bin/sh /userdata/x5/boot_report.sh
+RemainAfterExit=yes
+Nice=15
+
+[Install]
+WantedBy=multi-user.target

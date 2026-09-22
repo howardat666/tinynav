@@ -158,6 +158,23 @@ def t_skipped_round_still_records_rx():
     assert "last_rx = rx_packets" in nogw, "无网关分支 continue 前没记收包数"
 
 
+def t_boot_polls_fast_then_settles():
+    """开机期间网络就是关键路径：board-app 依赖 board-autotime，而 autotime 在等网络。
+    2026-09-22 实测网桥 t≈14s 就通了而 DHCP 要到 t=32s —— 主循环第一句 sleep(15s) 白睡掉了。
+    ⚠️ 不能改成"立刻检查"：那时网桥还没通，续租必失败再等 45s，更糟。要的是拿到地址前密集轮询。
+    ⚠️ 也必须有时限，否则网络真起不来时会变成每 3 秒一次的 udhcpc 风暴。"""
+    src = open("/home/dm/looper/tinynav-x5/tool/x5_board/board_netheal.py").read()
+    body = src.split("def main(")[1]
+    assert N.BOOT_PERIOD_S < N.PERIOD_S, "开机周期必须比常态短"
+    assert N.NOIP_BOOT_COOLDOWN_S < N.NOIP_COOLDOWN_S, "开机补救间隔必须比常态短"
+    assert "BOOT_PERIOD_S if boot_fast else PERIOD_S" in body, "要按开机/常态切换周期"
+    assert "BOOT_FAST_S" in body and "t_start" in body.split("boot_fast =")[1][:80], \
+        "快节奏必须有时限，否则是 udhcpc 风暴"
+    assert "ever_had_ip = True" in body, "拿到地址后要退出快节奏"
+    # 反向验证：常态那条路不能也跟着变快，否则抖一下就误触发梯度
+    assert N.PERIOD_S * N.FAIL_N >= 60, "常态判定时间不能被缩短(%.0fs)" % (N.PERIOD_S * N.FAIL_N)
+
+
 # ------------------------------------------------------- 没有默认路由不能空转
 def t_no_gateway_is_acted_on():
     """原来 gw 为空就 continue，于是"跑到新网段却没拿到地址"永远没人管 —— 而那恰恰
@@ -260,6 +277,7 @@ if __name__ == "__main__":
     check("固定地址按网段各纠正一次", t_fixed_ip_corrected_per_subnet)
     check("梯度兜底对 enx 不跑 USB WiFi 脚本", t_ladder_exhausted_skips_usb_wifi_script)
     check("跳过的轮次也记收包数", t_skipped_round_still_records_rx)
+    check("开机快轮询、拿到地址后退回常态", t_boot_polls_fast_then_settles)
     check("没有默认路由时会补跑 dhcp", t_no_gateway_is_acted_on)
     check("事件驱动的两条快速通道", t_fast_paths)
     check("USB 路径按网卡反查而非写死", t_usb_path_is_discovered)

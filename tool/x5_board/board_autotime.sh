@@ -71,4 +71,28 @@ else
     log "警告: 找不到 $FLAG，相机时间戳可能仍是错的"
 fi
 
+# 5. 🔴 验证而不是相信。2026-09-22 实测：上面那个 0->1 跳变【打了但没生效】——
+#    深度图 header 戳仍滞后 209.024 s，几乎正好等于 ntpdate 的 +208.877 s 跳变量。
+#    相机比对时早起 20 秒，它缓存的墙钟基准没跟着跳。而 planning 的同步 slop 只有 0.06 s
+#    ⇒ 零回调：局部视图全空、**导航完全不工作**，且一行报错都没有。
+#    所以这里实测一次，还是偏就重启相机固件（唯一确定能让它重取基准的办法）。
+CHK=/userdata/x5/check_cam_stamp.py
+CTL=/etc/init.d/looper/ota_project/scripts/insight-ctl
+[ -x "$CTL" ] || CTL=/etc/init.d/ota_project/scripts/insight-ctl
+if [ -f "$CHK" ]; then
+    . /userdata/x5/env.sh 2>/dev/null || true
+    export ROS_LOCALHOST_ONLY=1
+    out=$(timeout 30 python3 "$CHK" 8 1.0 2>&1); rc=$?
+    log "相机时间戳自检: $out (rc=$rc)"
+    if [ "$rc" = "1" ] && [ -x "$CTL" ]; then
+        log "时间戳仍偏，重启相机固件"
+        sh "$CTL" s99 restart >> "$LOG" 2>&1
+        sleep 25
+        out=$(timeout 30 python3 "$CHK" 8 1.0 2>&1); rc=$?
+        log "重启后复验: $out (rc=$rc)"
+    fi
+else
+    log "警告: 找不到 $CHK，时间戳没法自检"
+fi
+
 log "=== 完成: $(date '+%F %T') ==="

@@ -32,6 +32,15 @@ BACKOFF_S = 120.0          # 整条梯度都没救回来之后歇多久再重来
 NOGW_GRACE = 4             # 连续这么多轮没有默认路由（=60s）才补跑 dhcp，躲开开机时的枚举抖动
 NOGW_COOLDOWN_S = 120.0    # 补跑之间的最小间隔
 NOIP_COOLDOWN_S = 45.0     # "根本没有地址"这一类的补救间隔
+# 🔴 开机期间必须用短周期。2026-09-22 实测：网桥在板子 t≈14s 就通了，而 DHCP 要到 t=32s ——
+# 主循环第一句就是 sleep(PERIOD_S)，开机先白睡 15 秒，之后又赶不上趟。而 board-app 依赖
+# board-autotime、autotime 又在等网络，所以这 17 秒直接压在"网页多久能开"上（实测 58s）。
+# ⚠️ 不能简单改成"立刻检查"：那时网桥还没通，续租必失败，接着要等 NOIP_COOLDOWN_S=45s，
+#    反而更糟。要的是【拿到地址之前密集轮询】，拿到之后回到 15 秒常态。
+BOOT_PERIOD_S = float(os.environ.get("NETHEAL_BOOT_PERIOD", "2.0"))
+NOIP_BOOT_COOLDOWN_S = float(os.environ.get("NETHEAL_NOIP_BOOT_COOLDOWN", "3.0"))
+# 🔴 快节奏必须有时限：网络真的起不来时，每 3 秒打一次 udhcpc 会变成风暴。
+BOOT_FAST_S = float(os.environ.get("NETHEAL_BOOT_FAST_S", "120.0"))
 PENDING_MAX = 4            # 网卡重建后最多等这么多轮 carrier，超了就走正常梯度，别卡死
 RX_ALIVE_PKTS = 5          # 一个周期内收到这么多包就算"数据在流"（配合 ARP 判据一起用）
 LOG = "/userdata/x5/logs/board_netheal.log"
@@ -415,8 +424,13 @@ def main():
     down_since = None
     last_rc = None
     backoff_until = 0.0
+    ever_had_ip = False        # 拿到过地址之前一律用开机快节奏
     while True:
-        time.sleep(PERIOD_S)
+        boot_fast = (not ever_had_ip) and (time.time() - t_start < BOOT_FAST_S)
+        time.sleep(BOOT_PERIOD_S if boot_fast else PERIOD_S)
+        if not ever_had_ip and dev and ipv4(dev):
+            ever_had_ip = True
+            emit("拿到地址 %s，轮询周期 %.0fs -> %.0fs" % (ipv4(dev), BOOT_PERIOD_S, PERIOD_S))
         gw = gateway() or gw
         dev = iface() or dev
         ensure_pinned(dev)
@@ -455,7 +469,8 @@ def main():
                     continue           # 续上了就给地址一轮时间生效
                 # 续租失败就不要 continue：那会把这一轮的探测和梯度一起跳过
         # 快速通道 2：压根没有地址。等 6 次网关探测毫无意义 —— 没地址就探不了。
-        if dev and ipv4(dev) is None and time.time() - last_noip_fix > NOIP_COOLDOWN_S:
+        noip_cool = NOIP_BOOT_COOLDOWN_S if boot_fast else NOIP_COOLDOWN_S
+        if dev and ipv4(dev) is None and time.time() - last_noip_fix > noip_cool:
             last_noip_fix = time.time()
             rc, out = dhcp_renew(dev)
             emit("网卡没有地址，立即续租 rc=%s 之后 ip=%s gw=%s" % (rc, ipv4(dev), gateway()))
