@@ -1,0 +1,13 @@
+[Unit]
+Description=相机时间戳自检与修复（时钟跳变后相机不跟，会让 planning 零回调、导航静默失效）
+After=board-app.service
+Wants=board-app.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh /userdata/x5/fix_cam_stamp.sh
+RemainAfterExit=yes
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
