@@ -58,6 +58,12 @@ class _SensorModeDecided(Exception):
 _ROS2_NODE_LIST_TIMEOUT = float(os.environ.get('TINYNAV_ROS2_NODE_LIST_TIMEOUT', '8'))
 _ROS2_NODE_LIST_RETRIES = int(os.environ.get('TINYNAV_ROS2_NODE_LIST_RETRIES', '3'))
 
+# 录 bag 时保住 looper_bridge + planning_node。它们是局部视图/障碍热力图的唯一来源
+# （/planning/height_map、/planning/obstacle_mask），以前录制时被停掉，页面上那块就整段冻住。
+# 两个进程合计约 1.2 个核，而录制时 load 只有 2.3/8；实测开着录 bag 条数不掉。
+# 留个开关是因为 ros2 bag 丢消息不报错，真撞上再关。
+_BAG_KEEP_VIZ = os.environ.get('TINYNAV_BAG_KEEP_VIZ', '1') == '1'
+
 # build_map_node.py emits "MAPPING_PERCENT:<float>" lines on stdout so the
 # parent process can track progress without a separate bridge subprocess.
 _MAPPING_PERCENT_PREFIX = 'MAPPING_PERCENT:'
@@ -2194,7 +2200,7 @@ class BackendNode(Ros2NodeManager):
     def cmd_bag_start(self):
         if not self._manage_processes:
             raise RuntimeError('Bag recording is disabled in display backend role')
-        if self._sensor_mode == 'looper':
+        if self._sensor_mode == 'looper' and not _BAG_KEEP_VIZ:
             self._stop_sensor_procs()
         self._stop_all()
         # 建图的偏航质量取决于 VIO（轮速的偏航尺度有 2.4% 且左右不对称），所以 bag 里
