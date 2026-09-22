@@ -332,7 +332,13 @@ def _bridge_argv(*, for_map_build: bool = False) -> list[str]:
     # 5 slots at 5 Hz -- overflows, and each dropped frame is a keyframe that never makes
     # it into the map, silently.
     sync_window_s = '10.0' if for_map_build else '1.0'
-    return _node_argv('tool/looper_bridge_node.py') + [
+    # 关键帧的硬上限，也是重定位频率的真正天花板：门限(3cm/1°)在转弯时早就满足了，
+    # 但这条先判、一票否决，所以 1.5s 就是 0.67 Hz。map_node 的 1.0s 限流器比它还宽，
+    # 一直是摆设。轮速偏航在转弯时漂得最快，而 map->odom 的拟合又要攒几个解，
+    # 所以这里每压一点，转弯漂移就少一点。建图那条路不动：它决定地图密度，是另一回事。
+    live_kf_min = os.environ.get('TINYNAV_NAV_KEYFRAME_MIN_INTERVAL', '1.0')
+    extra = [] if for_map_build else ['--keyframe-min-interval', live_kf_min]
+    return _node_argv('tool/looper_bridge_node.py') + extra + [
         '--pose-topic', pose_topic,
         '--sync-queue-size', queue_size,
         '--sync-window-s', sync_window_s,

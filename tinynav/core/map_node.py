@@ -864,7 +864,9 @@ class MapNode(Node):
     # 0.83 s, so 0.5 s was rejecting 19% of perfectly usable frames to protect
     # against an overload that no longer exists.
     max_keyframe_age_s = 1.0
-    min_relocalization_interval_s = 1.0
+    # 必须【小于】bridge 的 --keyframe-min-interval，否则它就变成新的天花板。
+    min_relocalization_interval_s = float(
+        os.environ.get('TINYNAV_RELOC_MIN_INTERVAL_S', '0.8'))
 
     def keyframe_callback(self, keyframe_image_msg:Image, keyframe_odom_msg:Odometry):
         now_ns = self.get_clock().now().nanoseconds
