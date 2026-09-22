@@ -27,6 +27,13 @@ s() { echo; echo "======== $* ========"; }
   s "链路质量(板子->USB->ESP32->WiFi->AP 整条)"
   tail -15 "$DIR/link_quality.tsv" 2>/dev/null
   s "服务启动耗时"; systemd-analyze blame 2>/dev/null | head -10
+  # 🔴 board-app 失败时唯一说得出原因的东西。它只写 stderr -> journald，而 journald 在这块板上
+  # 活不过断电：2026-09-22 热点冷启动它连失败 4 次，事后零线索。所以趁 journal 还在赶紧抄一份。
+  s "board-app 本次开机的全部输出(失败原因只在这里)"
+  systemctl status board-app --no-pager -n 0 2>&1 | head -12
+  journalctl -u board-app -b --no-pager -o short-monotonic 2>&1 | tail -60
+  s "app_start.sh 自己的早退记录(跨重启保留)"; tail -25 /userdata/x5/logs/app_start.log 2>/dev/null
+  s "启动失败过的单元"; systemctl list-units --state=failed --no-pager --no-legend 2>&1 | head -10
   s "ESP32(冷启动里程碑 / 稳定性 / 卡死现场 / 各项丢包计数)"
   cd /userdata/x5 && . ./env.sh >/dev/null 2>&1
   export ROS_LOCALHOST_ONLY=1

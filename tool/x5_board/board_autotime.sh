@@ -31,11 +31,15 @@ IFACE=""
 i=0
 while [ $i -lt $WAIT_NET ]; do
     IFACE=$(detect_iface)
-    [ -n "$IFACE" ] && break
+    # 🔴 光有地址不够：2026-09-22 热点冷启动时网卡 0 秒就有个旧地址，而 DHCP 到 82 秒
+    # 才 bound，ntpdate 在没有 DNS 的窗口里三个服务器全报 name resolution 失败就放弃了。
+    [ -n "$IFACE" ] && route -n | awk '$1=="0.0.0.0"{f=1} END{exit !f}' && break
+    IFACE=""
     i=$((i + 1)); sleep 1
 done
 if [ -z "$IFACE" ]; then
-    log "没网(等 ${WAIT_NET}s 没有任何 en*/wl* 拿到 IP)，放弃对时"; exit 0
+    # 🔴 退 1 而不是 0：服务写着 Restart=on-failure，退 0 的话那条重试规则从来没生效过。
+    log "没网(等 ${WAIT_NET}s 没等到默认路由)，放弃对时"; exit 1
 fi
 log "出网网卡 $IFACE (等了 ${i}s)"
 
@@ -43,10 +47,15 @@ log "出网网卡 $IFACE (等了 ${i}s)"
 #    口没有载波，公网流量全被它吞成黑洞 —— 不删就对不上时。
 busybox ip route del default dev usb0 2>/dev/null && log "删掉 usb0 的黑洞默认路由"
 if ! route -n | awk '$1=="0.0.0.0"{print $8}' | grep -q "$IFACE"; then
+    # 🔴 别写死办公网网关：换到手机热点(10.140.21.x)后那个地址根本不可达，
+    # 装上去只是多一条黑洞路由。不知道网关就交给 netheal 的 udhcpc 去补。
     GW=$(route -n | awk -v i="$IFACE" '$1=="0.0.0.0" && $8==i {print $2; exit}')
-    [ -n "$GW" ] || GW=192.168.19.254
-    busybox ip route add default via "$GW" dev "$IFACE" 2>/dev/null \
-        && log "默认路由改到 $IFACE via $GW"
+    if [ -n "$GW" ]; then
+        busybox ip route add default via "$GW" dev "$IFACE" 2>/dev/null \
+            && log "默认路由改到 $IFACE via $GW"
+    else
+        log "$IFACE 上还没有网关，不瞎装路由"
+    fi
 fi
 
 # 3. 对时
@@ -57,7 +66,7 @@ for s in $SERVERS; do
     fi
     log "对时失败: $s"
 done
-[ $ok -eq 1 ] || { log "所有 NTP 都失败，退出"; exit 0; }
+[ $ok -eq 1 ] || { log "所有 NTP 都失败，退出(退 1 让 systemd 过 60s 再来)"; exit 1; }
 
 # 4. insight_full 的时钟偏移只在这个 flag 发生 0->1 跳变时重算。
 #    光是"值为 1"没用——它已经是 1 了，相机会一直用开机那个错的偏移打时间戳。

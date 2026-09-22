@@ -5,6 +5,10 @@ Description=Start the TinyNav app (backend + web UI + ROS nodes) at boot
 After=board-autotime.service
 Wants=board-autotime.service
 RequiresMountsFor=/userdata
+# 🔴 StartLimitBurst/StartLimitIntervalSec 是 [Unit] 选项 —— 原来写在 [Service] 里被静默忽略，
+# "最多 3 次"从来没生效过。窗口要大于 3*(RestartSec+ExecStart)，否则限不住。
+StartLimitIntervalSec=300
+StartLimitBurst=3
 
 [Service]
 # app_start.sh 自己 setsid 出 uvicorn 然后退出，所以是 oneshot；RemainAfterExit
@@ -20,7 +24,6 @@ TimeoutStartSec=180
 # 开机时相机固件可能还没就绪，失败就隔 30s 再来，最多 3 次。
 Restart=on-failure
 RestartSec=30
-StartLimitBurst=3
 
 [Install]
 WantedBy=multi-user.target

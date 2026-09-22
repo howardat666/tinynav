@@ -4,6 +4,9 @@ Description=Sync board clock over WiFi (X5 has no RTC)
 # 所以这里不能 After=network-online.target —— 脚本自己轮询等 IP。
 After=S99auto_startup.service
 Wants=S99auto_startup.service
+# StartLimit* 是 [Unit] 选项，写在 [Service] 里会被静默忽略
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 Type=oneshot
@@ -12,7 +15,6 @@ RemainAfterExit=no
 # 开机时 AP 可能还没就绪，失败就隔 60s 再来，最多 5 次
 Restart=on-failure
 RestartSec=60
-StartLimitBurst=5
 
 [Install]
 WantedBy=multi-user.target

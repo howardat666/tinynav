@@ -42,6 +42,14 @@ PORT="${PORT:-8000}"
 PIDFILE="${LOG_DIR}/app.pid"
 LOGFILE="${LOG_DIR}/app.log"
 SCHEMEFILE="${LOG_DIR}/app.scheme"
+# 跨重启保留。早退的理由以前只走 stderr -> journald，而这块板断电后 journal 整段没了：
+# 2026-09-22 热点冷启动 board-app 连失败 4 次，事后一条线索都没有。uptime 是单调的，
+# 开机头几十秒墙钟还没对上，只有它能排序。
+STARTLOG="${LOG_DIR}/app_start.log"
+note() {
+    mkdir -p "${LOG_DIR}" 2>/dev/null
+    printf '[%s up=%ss] %s\n' "$(date '+%F %T')" "$(cut -d' ' -f1 /proc/uptime)" "$*" >> "${STARTLOG}"
+}
 
 usage() { sed -n '3,20p' "$0" >&2; exit 1; }
 
@@ -50,6 +58,7 @@ usage() { sed -n '3,20p' "$0" >&2; exit 1; }
 # surfaces as an import error deep inside a map build, long after startup.
 load_env() {
     if [[ ! -f "${ENV_SH}" ]]; then
+        note "退出: 缺 ${ENV_SH}"
         echo "missing ${ENV_SH} -- ROS and its deps will not resolve" >&2
         exit 1
     fi
@@ -60,8 +69,11 @@ load_env() {
 app_pid() {
     [[ -f "${PIDFILE}" ]] || return 1
     local pid; pid="$(cat "${PIDFILE}" 2>/dev/null)"
-    [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null && { echo "${pid}"; return 0; }
-    return 1
+    [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null || return 1
+    # 🔴 pidfile 在 /userdata 上，断电后还留着，而 PID 会被重用 —— 只问 kill -0 的话，
+    # 开机时任何一个恰好占到这个号的进程都会被当成"app 还在跑"，board-app 当场 exit 1。
+    grep -qa uvicorn "/proc/${pid}/cmdline" 2>/dev/null || return 1
+    echo "${pid}"; return 0
 }
 
 do_start() {
@@ -70,10 +82,12 @@ do_start() {
         a) map_src=vio;   nav_src=vio   ;;
         b) map_src=vio;   nav_src=wheel ;;
         c) map_src=wheel; nav_src=wheel ;;
-        *) echo "scheme must be a, b or c (got '${scheme}')" >&2; usage ;;
+        *) note "退出: scheme 非法 '${scheme}'"; echo "scheme must be a, b or c (got '${scheme}')" >&2; usage ;;
     esac
 
+    note "start scheme=${scheme}"
     if pid="$(app_pid)"; then
+        note "退出: 判定 app 已在跑 pid=${pid}"
         echo "already running as pid ${pid} (scheme $(cat "${SCHEMEFILE}" 2>/dev/null || echo '?'))" >&2
         echo "stop it first: bash $0 stop" >&2
         exit 1
@@ -230,6 +244,7 @@ do_start() {
     # 词典只有 bow 用得上。以前这个检查是无条件的，vlad 模式下会因为一个用不到的文件
     # 直接拒绝启动。
     if [[ "${TINYNAV_LOOP_CLOSURE_MODE}" == "bow" && ! -f "${TINYNAV_DBOW3_VOCAB}" ]]; then
+        note "退出: bow 模式但缺词典 ${TINYNAV_DBOW3_VOCAB}"
         echo "vocabulary missing: ${TINYNAV_DBOW3_VOCAB} -- map build will fail" >&2
         exit 1
     fi
@@ -263,7 +278,8 @@ do_start() {
     # setsid so the whole thing survives this ssh session closing, and so that
     # stop can signal the process group -- the backend spawns ROS nodes as
     # children and signalling the pid alone orphans them.
-    cd "${BOARD_ROOT}" || exit 1
+    cd "${BOARD_ROOT}" || { note "退出: 进不去 ${BOARD_ROOT}"; exit 1; }
+    note "即将拉起 uvicorn (日志 ${LOGFILE})"
     setsid nohup python3 -m uvicorn app.backend.main:app \
         --host 0.0.0.0 --port "${PORT}" \
         >> "${LOGFILE}" 2>&1 < /dev/null &
@@ -275,11 +291,13 @@ do_start() {
     # planning node. Report what actually came up rather than just the pid.
     sleep 12
     if ! kill -0 "${pid}" 2>/dev/null; then
+        note "退出: uvicorn 起来后 12 秒内就死了，详见 ${LOGFILE}"
         echo "FAILED to start -- last 30 lines of ${LOGFILE}:" >&2
         tail -30 "${LOGFILE}" >&2
         rm -f "${PIDFILE}"
         exit 1
     fi
+    note "启动成功 pid=${pid} scheme=${scheme}"
     echo "started pid ${pid}, scheme ${scheme} (map=${map_src}, nav=${nav_src})"
     echo
     do_status
