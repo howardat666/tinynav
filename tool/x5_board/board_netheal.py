@@ -32,6 +32,7 @@ BACKOFF_S = 120.0          # 整条梯度都没救回来之后歇多久再重来
 NOGW_GRACE = 4             # 连续这么多轮没有默认路由（=60s）才补跑 dhcp，躲开开机时的枚举抖动
 NOGW_COOLDOWN_S = 120.0    # 补跑之间的最小间隔
 NOIP_COOLDOWN_S = 45.0     # "根本没有地址"这一类的补救间隔
+PENDING_MAX = 4            # 网卡重建后最多等这么多轮 carrier，超了就走正常梯度，别卡死
 RX_ALIVE_PKTS = 5          # 一个周期内收到这么多包就算"数据在流"（配合 ARP 判据一起用）
 LOG = "/userdata/x5/logs/board_netheal.log"
 MAXBYTES = 4 << 20
@@ -46,12 +47,16 @@ WIFI_PROC = "/proc/net/rtl8710bu"
 PIN_IP = os.environ.get("NETHEAL_PIN_IP", "")
 PIN_MASK = os.environ.get("NETHEAL_PIN_MASK", "255.255.255.0")
 IFNAMSIZ_MAX = 15          # 内核 IFNAMSIZ=16 含结尾 NUL
-# 续租时主动请求这个地址（DHCP 的 requested-ip，不是静态配置，也不是别名）。
-# 手机热点那一侧地址每次都不同，人就得去设备列表里翻，而小米热点页根本不显示 IP。
-# 请求成功 => 热点上永远是这个地址，网页地址固定。
-# 🔎 2026-09-21 板上实测：在网段对不上的 DEEP-RD 上请求它，服务器给别的地址、udhcpc
-#    照常拿到租约，不会卡住 —— 所以两边通用，不用按网络切换。
-REQUEST_IP = os.environ.get("NETHEAL_REQUEST_IP", "10.140.21.9")
+# 续租时主动请求约定地址（DHCP 的 requested-ip，不是静态配置，也不是别名）。键是 /24 前缀。
+# 🔴 **只对认这个选项的服务器有用，办公网不认**。2026-09-22 实测 DEEP-RD：请求 .102 时
+#    服务器直接 select 回旧租约 .42；换 -C 当新客户端后仍从池子里发 .125。给它配一条的
+#    代价是每次开机白跑一次续租、期间网卡 deconfigured 断 20~40 秒，纯亏。
+#    实验室网靠 board_mdns.py 播报 looper.local 解决，不靠固定地址。
+REQUEST_IPS = {}
+for _a in os.environ.get("NETHEAL_REQUEST_IPS", "10.140.21.9").split(","):
+    _a = _a.strip()
+    if _a:
+        REQUEST_IPS[_a.rsplit(".", 1)[0]] = _a
 ALLOW_REBOOT = os.environ.get("NETHEAL_ALLOW_REBOOT") == "1"
 DRY = "--dry-run" in sys.argv
 # 真掉线才验梯度就太晚了。--force-fail 假装探测一直失败，配 --dry-run 就能把整条梯度和
@@ -301,15 +306,25 @@ def drop_stale_default(gw):
     return sh("route del default gw %s" % gw, 20)
 
 
-def dhcp_renew(dev):
+def subnet_of(ip):
+    return ip.rsplit(".", 1)[0] if ip and ip.count(".") == 3 else ""
+
+
+def want_ip(dev):
+    """本网段的约定地址。当前地址优先，没地址就按网关猜 —— 换 AP 后地址还是旧网段的，
+    那次会请求错网段的地址，服务器忽略、照常发一个随机的，下一轮由一次性纠正补上。"""
+    return REQUEST_IPS.get(subnet_of(ipv4(dev))) or REQUEST_IPS.get(subnet_of(gateway()))
+
+
+def dhcp_renew(dev, req=None):
     """🔴 两步必须分开跑。写成 `pkill ...; udhcpc -i <dev> ...` 一条命令时，执行它的这个
     shell 自己的命令行里就含着 `udhcpc -i <dev>`，pkill 当场把自己连同后半句一起打死 ——
     历史日志里 34 次 dhcp-renew 全是 rc=-15(SIGTERM)，udhcpc 一次都没真跑起来。
     `udhcp[c]` 的括号只保护得了模式串本身，保护不了同一行里的那个真实命令。"""
     # quiet：pkill 没匹配到进程就返回 1，那是常态不是故障，别让它每次都打 ERROR。
     sh("pkill -f 'udhcp[c].*%s'" % dev, 20, quiet=True)
-    req = (" -r " + REQUEST_IP) if REQUEST_IP else ""
-    return sh("udhcpc -i %s -n -q -t 8%s" % (dev, req), 40)
+    want = req if req is not None else want_ip(dev)
+    return sh("udhcpc -i %s -n -q -t 8%s" % (dev, (" -r " + want) if want else ""), 40)
 
 
 def steps(dev):
@@ -339,6 +354,47 @@ def steps(dev):
     ]
 
 
+def status():
+    """一次性打印 netheal 此刻看到的**全部判据输入**，用来回答"它为什么这么判"。
+    跑法：`python3 /usr/local/sbin/board_netheal.py --status`（只读，不动任何东西）。
+    加这个是因为排查时最费时间的不是修，是搞清楚它当时看到了什么。"""
+    dev = iface()
+    gw = gateway()
+    print("网卡        = %s  (ifindex=%s carrier=%s operstate=%s)"
+          % (dev, ifindex(dev),
+             read("/sys/class/net/%s/carrier" % dev, "?").strip() if dev else "-",
+             read("/sys/class/net/%s/operstate" % dev, "?").strip() if dev else "-"))
+    print("本机地址    = %s" % (ipv4(dev) if dev else "-"))
+    print("默认网关    = %s%s" % (gw, "  ← 链路本地，会走无默认路由那条分支"
+                                  if gw and gw.startswith("169.254.") else ""))
+    print("网关 ARP    = %s" % ("已解析" if gw and arp_complete(gw) else "未解析/表里没有"))
+    ok, why = probe(gw)
+    print("ICMP 探测   = %s (%s)%s" % ("通" if ok else "不通", why,
+          "" if ok else "   ⚠️ 手机热点的网关不回 ICMP，不通不代表断网"))
+    r1 = rx_packets(dev)
+    time.sleep(2.0)
+    r2 = rx_packets(dev)
+    d = (r2 - r1) if (r1 is not None and r2 is not None) else None
+    print("2 秒收包    = %s 包%s" % (d, "  (>=%d 且 ARP 已解析就算链路在用)" % RX_ALIVE_PKTS
+                                     if d is not None else ""))
+    print("判活结论    = %s" % ("通" if ok else
+          ("通（ping 无回应但链路在用）" if (d is not None and d >= RX_ALIVE_PKTS
+                                            and gw and arp_complete(gw)) else "不通，会开始攒失败次数")))
+    print()
+    print("梯度        = %s" % ", ".join(n for n, _, _ in steps(dev or "enx0")))
+    print("USB 设备目录 = %s  (写死的那个 %s 存在=%s)"
+          % (usb_dev_path(), USB_DEV, os.path.exists(USB_DEV)))
+    print("请求地址    = %s   固定副地址=%s"
+          % (", ".join(sorted(REQUEST_IPS.values())) or "(关)",
+             PIN_IP or "(关，网卡名顶满 IFNAMSIZ 时必须关)"))
+    print("自动重启    = %s" % ("开" if ALLOW_REBOOT else "关"))
+    print("周期/门限   = %.0fs / %d 次 (=%.0fs 才动手)" % (PERIOD_S, FAIL_N, PERIOD_S * FAIL_N))
+    print()
+    print("最近 8 条日志:")
+    for ln in read(LOG).splitlines()[-8:]:
+        print("  " + ln)
+
+
 def main():
     dev = iface()
     gw = gateway()
@@ -349,10 +405,11 @@ def main():
     fails = 0
     nogw = 0
     last_nogw_fix = 0.0
-    req_ip_forced = False
+    req_ip_forced = set()   # 已经纠正过的网段，换 AP 后新网段仍要纠正一次
     last_idx = ifindex(iface())
     last_noip_fix = 0.0
     last_rx = None
+    pending_renew = 0
     armed = FORCE_FAIL
     rung = 0
     down_since = None
@@ -364,15 +421,39 @@ def main():
         dev = iface() or dev
         ensure_pinned(dev)
         # 快速通道 1：网卡重新出现（换 AP 时 USB 网卡会整个消失再回来）。
+        # 🔴 不能一看到序号变就立刻续租：网卡刚出现时内核还没把设备准备好，udhcpc 会
+        # 报 `SIOCGIFINDEX: No such device` 失败，接着 fails 攒够就升级到第 2 级
+        # link-bounce，把刚出现的网卡又弄没 —— 序号再变、再触发，自己把自己锁进循环。
+        # 2026-09-22 早上的反复断连和重启就是这么来的。改成：记下待办，等下一轮、
+        # 并且要求 carrier=1 再动手；这一类失败也不计入 fails。
         idx = ifindex(dev)
         if idx and last_idx and idx != last_idx:
-            rc, out = dhcp_renew(dev)
-            emit("网卡重新出现 ifindex %s->%s，立即续租 rc=%s 之后 ip=%s gw=%s"
-                 % (last_idx, idx, rc, ipv4(dev), gateway()))
-            gw = gateway() or gw
-            last_noip_fix = time.time()
+            emit("网卡重新出现 ifindex %s->%s，等它就绪后续租" % (last_idx, idx))
+            pending_renew = PENDING_MAX
+            last_rx = None       # 网卡重建了，收包计数从头开始，不能跨着做差
         if idx:
             last_idx = idx
+        if pending_renew and dev:
+            if read("/sys/class/net/%s/carrier" % dev).strip() != "1":
+                # 🔴 必须有次数上限：carrier 一直不为 1 就无限 continue 的话，梯度永远
+                # 升不上去，netheal 整个瘫掉 —— 和「没默认路由就 continue」是同一类死角。
+                pending_renew -= 1
+                if pending_renew:
+                    emit("网卡还没就绪(carrier!=1)，再等一轮(还剩%d次)" % pending_renew)
+                    last_rx = rx_packets(dev)   # 跳过这一轮也要记，否则下轮增量横跨两周期
+                    continue
+                emit("网卡等了%d轮还没就绪，放弃等待，走正常梯度" % PENDING_MAX)
+            else:
+                pending_renew = 0
+                rc, out = dhcp_renew(dev)
+                emit("网卡就绪，续租 rc=%s 之后 ip=%s gw=%s" % (rc, ipv4(dev), gateway()))
+                gw = gateway() or gw
+                last_noip_fix = time.time()
+                last_rx = rx_packets(dev)
+                if rc == 0:
+                    fails = 0          # 刚续上就别让上一轮攒的失败把梯度顶上去
+                    continue           # 续上了就给地址一轮时间生效
+                # 续租失败就不要 continue：那会把这一轮的探测和梯度一起跳过
         # 快速通道 2：压根没有地址。等 6 次网关探测毫无意义 —— 没地址就探不了。
         if dev and ipv4(dev) is None and time.time() - last_noip_fix > NOIP_COOLDOWN_S:
             last_noip_fix = time.time()
@@ -398,18 +479,23 @@ def main():
                 emit("无默认路由，补跑 dhcp-renew rc=%s 之后 gw=%s | %s"
                      % (rc, gateway(), out.strip().replace("\n", " / ")[-140:]))
             fails += 1
+            # 🔴 跳过这一轮也要记收包数。不记的话，无网关期间的增量会全部攒到恢复后的
+            # 第一轮上，那一轮的 d 必然很大 —— 判活的兜底("收够包+网关ARP在")就会把
+            # 一次真故障误判成正常。和上面 carrier 那条 continue 是同一个道理。
+            last_rx = rx_packets(dev) if dev else None
             continue
         nogw = 0
-        # 固定地址只在续租时才请求，而冷启动时如果热点已经开着，开机那次 udhcpc 会随便
-        # 拿一个地址、网络还是通的，于是永远不会续租 —— 地址就一直是随机的。这里补一刀：
-        # 已经在 REQUEST_IP 所在网段却不是那个地址，就主动换一次。每次开机最多一次。
-        if REQUEST_IP and not req_ip_forced and dev:
+        # 固定地址只在续租时才请求，而开机那次 udhcpc 会随便拿一个地址、网络还是通的，
+        # 于是永远不会续租 —— 地址就一直是随机的。这里补一刀：在已知网段却不是约定地址
+        # 就主动换一次。**按网段各记一次**，否则换过 AP 之后第二个网段就没人管了。
+        if dev and ipv4(dev):
             cur = ipv4(dev)
-            if cur and cur != REQUEST_IP and cur.rsplit(".", 1)[0] == REQUEST_IP.rsplit(".", 1)[0]:
-                req_ip_forced = True
-                rc, out = dhcp_renew(dev)
+            want = REQUEST_IPS.get(subnet_of(cur))
+            if want and want != cur and subnet_of(cur) not in req_ip_forced:
+                req_ip_forced.add(subnet_of(cur))
+                rc, out = dhcp_renew(dev, want)
                 emit("地址 %s 不是约定的 %s，换一次 rc=%s 之后 ip=%s"
-                     % (cur, REQUEST_IP, rc, ipv4(dev)))
+                     % (cur, want, rc, ipv4(dev)))
         ok, why = (False, "forced") if FORCE_FAIL else probe(gw)
         # 🔴 不能只信"对方回不回 ping"。2026-09-21 实测：手机热点的网关**根本不回 ICMP**
         # （ESP32 的 ICMP 对帐里几十个请求只换回 3 个回复），而数据一直在正常流动。
@@ -456,9 +542,16 @@ def main():
                 sh("sync; systemctl reboot", 30)
                 return
             # 歇之前必须把网卡留在"通电并在尝试关联"的状态，不能留在 down。
-            sh("sh %s" % WIFI_UP, 120)
-            emit("整条梯度都没救回来，已重新拉起网卡，歇 %.0fs 再从头试(要自动重启就设 "
-                 "NETHEAL_ALLOW_REBOOT=1) | %s" % (BACKOFF_S, snapshot(dev)))
+            # 🔴 但只对 USB WiFi 有意义。wifi-connect.sh 里 IFACE 写死成早已不存在的
+            # wlx80ea07cb5d4a，对 enx(ESP32 网桥) 跑它只会空等 30 秒 —— 而这是梯度全败、
+            # 最需要及时重试的时刻，却让 netheal 聋 30 秒，日志还谎称"已重新拉起网卡"。
+            if dev.startswith("enx"):
+                emit("整条梯度都没救回来，歇 %.0fs 再从头试(ESP32 网桥没有可拉起的网卡；"
+                     "要自动重启就设 NETHEAL_ALLOW_REBOOT=1) | %s" % (BACKOFF_S, snapshot(dev)))
+            else:
+                sh("sh %s" % WIFI_UP, 120)
+                emit("整条梯度都没救回来，已重新拉起网卡，歇 %.0fs 再从头试(要自动重启就设 "
+                     "NETHEAL_ALLOW_REBOOT=1) | %s" % (BACKOFF_S, snapshot(dev)))
             rung, backoff_until = 0, time.time() + BACKOFF_S
             continue
         name, act, wait = lad[rung]
@@ -479,4 +572,7 @@ def main():
 
 
 if __name__ == "__main__":
+    if "--status" in sys.argv:
+        status()
+        sys.exit(0)
     sys.exit(main())

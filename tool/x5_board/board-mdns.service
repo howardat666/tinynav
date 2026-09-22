@@ -1,0 +1,14 @@
+[Unit]
+Description=播报 looper.local —— 办公网 DHCP 无视 requested-ip，地址固定不了只能固定名字
+After=network.target
+
+[Service]
+Type=simple
+Environment=MDNS_NAME=looper
+ExecStart=/usr/bin/python3 -u /userdata/x5/bin/board_mdns.py
+Restart=always
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

@@ -20,7 +20,11 @@ import time
 OUT = os.environ.get("LQ_OUT", "/userdata/x5/logs/link_quality.tsv")
 PERIOD_S = float(os.environ.get("LQ_PERIOD", "30"))
 NPING = int(os.environ.get("LQ_NPING", "20"))
-COLS = ["时刻", "网卡", "ifindex", "本机IP", "网关", "发", "收", "丢%", "p50ms", "p90ms", "最大ms"]
+# 🔴 丢包率在手机热点上是**假数**：安卓热点的网关根本不回 ICMP（2026-09-22 实测，
+# 网桥的 ICMP 对帐里几十个请求只换回 3 个回复，而同期数据流了几 MB）。所以必须同时记
+# 「数据有没有在流」和「网关在不在 ARP 表里」，否则报表会把一条好链路判成全断。
+COLS = ["时刻", "网卡", "ifindex", "本机IP", "网关", "gwARP",
+        "发", "收", "丢%", "p50ms", "p90ms", "最大ms", "收包增", "发包增", "收字节增"]
 
 
 def read(path, default=""):
@@ -99,6 +103,24 @@ def ping_once(host, seq):
             s.close()
 
 
+def netstat(dev, k):
+    v = read("/sys/class/net/%s/statistics/%s" % (dev, k)).strip()
+    return int(v) if v.isdigit() else None
+
+
+def arp_complete(gw):
+    """网关在不在 ARP 表里且已解析。ARP 由对方协议栈回，和它回不回 ICMP 无关 ——
+    热点网关不回 ping 但一定回 ARP，所以这是比丢包率可靠得多的"对方还在"判据。"""
+    for line in read("/proc/net/arp").splitlines()[1:]:
+        f = line.split()
+        if len(f) >= 4 and f[0] == gw:
+            try:
+                return "是" if (int(f[2], 16) & 0x2) and f[3] != "00:00:00:00:00:00" else "否"
+            except ValueError:
+                return "?"
+    return "无"
+
+
 def measure(gw, n):
     """返回 (发, 收, [rtt...])。"""
     rtt = []
@@ -118,18 +140,30 @@ def pct(v, p):
     return "%.1f" % v[k]
 
 
+_PREV = {}
+
+
 def sample():
     dev = iface()
     gw = gateway()
     idx = read("/sys/class/net/%s/ifindex" % dev).strip() if dev else ""
     ip = ipv4(dev) if dev else None
+    d = ["", "", ""]
+    if dev:
+        cur = [netstat(dev, "rx_packets"), netstat(dev, "tx_packets"), netstat(dev, "rx_bytes")]
+        old = _PREV.get(idx)          # 按 ifindex 存：网卡重建过就不做差，否则算出个巨大的假增量
+        if old and all(x is not None for x in cur) and all(x is not None for x in old):
+            d = [str(max(0, c - o)) for c, o in zip(cur, old)]
+        _PREV.clear()
+        _PREV[idx] = cur
     if not gw:
-        return [time.strftime("%H:%M:%S"), dev or "-", idx or "-", ip or "-", "-", "0", "0", "", "", "", ""]
+        return ([time.strftime("%H:%M:%S"), dev or "-", idx or "-", ip or "-", "-", "无",
+                 "0", "0", "", "", "", ""] + d)
     sent, got, rtt = measure(gw, NPING)
     loss = "%.1f" % (100.0 * (1 - got / float(sent))) if sent else ""
-    return [time.strftime("%H:%M:%S"), dev or "-", idx or "-", ip or "-", gw,
-            str(sent), str(got), loss, pct(rtt, 50), pct(rtt, 90),
-            ("%.0f" % max(rtt)) if rtt else ""]
+    return ([time.strftime("%H:%M:%S"), dev or "-", idx or "-", ip or "-", gw, arp_complete(gw),
+             str(sent), str(got), loss, pct(rtt, 50), pct(rtt, 90),
+             ("%.0f" % max(rtt)) if rtt else ""] + d)
 
 
 def run():
@@ -153,7 +187,14 @@ def report(path):
     if len(rows) < 2:
         print("没有数据")
         return
-    body = [r for r in rows[1:] if len(r) >= 11]
+    body = [r for r in rows[1:] if len(r) >= 12]
+    # 采样周期按时间戳现算，不能用模块里的默认值 —— 采集时可能用了别的 LQ_PERIOD，
+    # 报表印一个错的周期会让"多少秒断流"整个算错。
+    def _sec(x):
+        h, m, sec = (int(v) for v in x.split(":"))
+        return h * 3600 + m * 60 + sec
+    gaps = [(_sec(body[i][0]) - _sec(body[i - 1][0])) % 86400 for i in range(1, len(body))]
+    step = sorted(gaps)[len(gaps) // 2] if gaps else PERIOD_S
     print("样本 %d 条，覆盖 %s ~ %s\n" % (len(body), body[0][0], body[-1][0]))
     # 按「本机IP + 网关」分段：换网就是新的一段
     segs = []
@@ -163,26 +204,42 @@ def report(path):
             segs.append([key, []])
         segs[-1][1].append(r)
     for (ip, gw), rs in segs:
-        loss = [float(r[7]) for r in rs if r[7]]
-        p50 = [float(r[8]) for r in rs if r[8]]
-        p90 = [float(r[9]) for r in rs if r[9]]
-        dead = sum(1 for r in rs if r[7] == "100.0")
+        num = lambda i: [float(r[i]) for r in rs if len(r) > i and r[i]]
+        loss, p50, p90 = num(8), num(9), num(10)
+        rxp, txp, rxb = num(12), num(13), num(14)
+        dead = sum(1 for r in rs if r[8] == "100.0")
         print("ip=%-15s 网关=%-15s  %s~%s  %d 次采样" % (ip, gw, rs[0][0], rs[-1][0], len(rs)))
+        # 先说"链路活没活"，再说丢包 —— 顺序是故意的：热点网关不回 ICMP，丢包率会是 100%
+        # 而链路完全正常，先看这一行才不会被那个数字带偏。
+        if rxp:
+            silent = sum(1 for v in rxp if v == 0)
+            print("   数据流 每%.0fs 收%.0f包/发%.0f包/%.1fKB(中位)   一个包都没收到的采样 %d 次(=%.0f 秒真静默)"
+                  % (step, sorted(rxp)[len(rxp) // 2], sorted(txp)[len(txp) // 2] if txp else 0,
+                     (sorted(rxb)[len(rxb) // 2] / 1024.0) if rxb else 0, silent, silent * step))
+        arps = [r[5] for r in rs if len(r) > 5]
+        if arps:
+            bad = sum(1 for a in arps if a != "是")
+            print("   网关ARP 已解析 %d/%d 次%s" % (len(arps) - bad, len(arps),
+                  "" if not bad else "  ⚠️ 有 %d 次没解析到，那才是真的够不着网关" % bad))
         if loss:
-            print("   丢包 平均%.1f%% 最差%.1f%%   全丢的采样 %d 次(=%.0f 秒断流)"
-                  % (sum(loss) / len(loss), max(loss), dead, dead * PERIOD_S))
+            note = "（网关不回 ICMP 时这一列无意义，以上面两行为准）" if (rxp and sum(rxp) > 0
+                    and sum(loss) / len(loss) > 90) else ""
+            print("   ICMP 丢包 平均%.1f%% 最差%.1f%%   全丢 %d 次 %s"
+                  % (sum(loss) / len(loss), max(loss), dead, note))
         if p50:
             print("   延迟 p50 中位%.0fms 最差%.0fms | p90 中位%.0fms 最差%.0fms"
                   % (sorted(p50)[len(p50) // 2], max(p50),
                      sorted(p90)[len(p90) // 2], max(p90)))
         idxs = sorted({r[2] for r in rs})
         if len(idxs) > 1:
-            print("   ⚠️ 期间网卡 ifindex 变过: %s（网卡消失过）" % ",".join(idxs))
+            print("   ⚠️ 期间网卡 ifindex 变过: %s（USB 网卡整个消失过，不是变慢）" % ",".join(idxs))
         print()
 
 
 if __name__ == "__main__":
     if "--report" in sys.argv:
-        report(sys.argv[sys.argv.index("--report") + 1])
+        i = sys.argv.index("--report") + 1
+        # 不传路径就用自己写的那个，别抛 IndexError —— 排查时最常用的就是"报告一下"
+        report(sys.argv[i] if i < len(sys.argv) else OUT)
     else:
         run()

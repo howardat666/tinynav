@@ -92,24 +92,70 @@ def t_pinned_alias_disabled():
 
 # --------------------------------------------------------------- 固定地址请求
 def t_requests_fixed_ip():
-    """热点每次给的地址都不同，而小米热点页不显示 IP，人根本找不到板子。
-    用 DHCP 自带的 requested-ip 让它每次都要同一个地址。板上实测：网段对不上时
-    服务器给别的地址、udhcpc 照常拿到租约，所以两个网络通用。"""
+    """DHCP 自带的 requested-ip 让板子每次都要同一个地址，人不用满网段扫。
+    🔴 但只能配给**认这个选项的**服务器。办公网实测不认（请求 .102 给回 .42，换 -C 当
+    新客户端给 .125），给它配一条只会每次开机白跑一次续租、断网 20~40 秒。"""
     calls = []
-    real = N.sh
+    real_sh, real_ip, real_gw = N.sh, N.ipv4, N.gateway
     N.sh = lambda c, t=90, quiet=False: (calls.append(c), (0, ""))[-1]
+    N.gateway = lambda: ""
     try:
-        assert N.REQUEST_IP, "默认该带一个请求地址"
-        N.dhcp_renew(DEV)
-        assert "-r %s" % N.REQUEST_IP in calls[1], calls[1]
-        # 反向验证：关掉它就不该再带 -r
+        assert "10.140.21" in N.REQUEST_IPS, "热点那侧认 requested-ip，必须留着"
+        assert "192.168.19" not in N.REQUEST_IPS, "办公网不认，配了只会白断网一次"
         calls.clear()
-        N.REQUEST_IP = ""
+        N.ipv4 = lambda d: "10.140.21.77"
+        N.dhcp_renew(DEV)
+        assert "-r 10.140.21.9" in calls[1], calls[1]
+        # 反向验证：办公网地址上不该带 -r
+        calls.clear()
+        N.ipv4 = lambda d: "192.168.19.42"
+        N.dhcp_renew(DEV)
+        assert "-r" not in calls[1], calls[1]
+        # 显式指定优先于按网段推断
+        calls.clear()
+        N.ipv4 = lambda d: "10.140.21.77"
+        N.dhcp_renew(DEV, "192.168.19.102")
+        assert "-r 192.168.19.102" in calls[1], calls[1]
+        # 反向验证：陌生网段不该瞎请求别的网段的地址
+        calls.clear()
+        N.ipv4 = lambda d: "172.16.0.5"
         N.dhcp_renew(DEV)
         assert "-r" not in calls[1], calls[1]
     finally:
-        N.REQUEST_IP = "10.140.21.9"
-        N.sh = real
+        N.sh, N.ipv4, N.gateway = real_sh, real_ip, real_gw
+
+
+def t_fixed_ip_corrected_per_subnet():
+    """开机那次 udhcpc 不带 -r，网络是通的所以永远不会续租 —— 要有一次性纠正。
+    🔴 而这个"一次"必须**按网段各记一次**：写成每次开机一个布尔时，先连热点纠正过一次，
+    之后换回实验室网就再也不会纠正，地址依旧随机。这就是 2026-09-22 的实际故障。"""
+    src = open("/home/dm/looper/tinynav-x5/tool/x5_board/board_netheal.py").read()
+    body = src.split("def main(")[1]
+    assert "req_ip_forced = set()" in body, "得按网段记，不能是布尔"
+    assert "req_ip_forced = False" not in body, "旧的全局一次性写法还在"
+    assert "req_ip_forced.add(subnet_of(" in body, "记的必须是网段而不是一个标志位"
+    assert "subnet_of(cur) not in req_ip_forced" in body, "判据也得按网段查"
+
+
+def t_ladder_exhausted_skips_usb_wifi_script():
+    """梯度全败的兜底里不能对 enx 跑 wifi-connect.sh：那脚本的 IFACE 写死成早就不存在的
+    wlx80ea07cb5d4a，只会空等 30 秒，而这正是最需要及时重试的时刻，日志还谎称拉起了网卡。
+    steps() 里早就把这一级从 enx 梯度里去掉了，兜底却漏了。"""
+    src = open("/home/dm/looper/tinynav-x5/tool/x5_board/board_netheal.py").read()
+    branch = src.split("rung >= len(lad)")[1][:900]
+    assert 'dev.startswith("enx")' in branch, "兜底要分平台"
+    enx_part = branch.split('dev.startswith("enx")')[1].split("else:")[0]
+    assert "WIFI_UP" not in enx_part, "enx 分支里还在跑 wifi-connect"
+    assert "WIFI_UP" in branch, "USB WiFi 那条路还得保留"
+
+
+def t_skipped_round_still_records_rx():
+    """每一条 continue 之前都要记下收包数。漏记的话，跳过期间的增量会全攒到恢复后的
+    第一轮，判活的兜底(收够包+网关ARP在)就会把一次真故障误判成正常。"""
+    src = open("/home/dm/looper/tinynav-x5/tool/x5_board/board_netheal.py").read()
+    body = src.split("def main(")[1]
+    nogw = body.split("nogw += 1")[1].split("nogw = 0")[0]
+    assert "last_rx = rx_packets" in nogw, "无网关分支 continue 前没记收包数"
 
 
 # ------------------------------------------------------- 没有默认路由不能空转
@@ -139,6 +185,16 @@ def t_fast_paths():
     body = src.split("def main(")[1]
     fast = body.split("ensure_pinned(dev)")[2].split("ok, why =")[0]
     assert "ifindex" in fast and "dhcp_renew" in fast, "缺少网卡重新出现这条快速通道"
+    # 🔴 不能一看到序号变就立刻续租：网卡刚出现时内核还没准备好，udhcpc 报
+    # SIOCGIFINDEX: No such device，失败又会把梯度顶到 link-bounce 把网卡弄没，循环。
+    assert "pending_renew" in fast, "序号变化后没有等就绪，会在设备没准备好时就 udhcpc"
+    assert "carrier" in fast, "没有检查 carrier 就动手"
+    # 🔴 等待必须有次数上限。今天已经在同一类死角上栽了两次：「没默认路由就 continue」
+    # 和「等 carrier 就无限 continue」——都让梯度永远升不上去，整个自愈瘫掉。
+    assert "PENDING_MAX" in fast, "等 carrier 没有次数上限，会无限 continue 把梯度卡死"
+    assert N.PENDING_MAX >= 2, "上限太小"
+    assert "last_rx = None" in fast, "网卡重建后没作废 last_rx，会跨着做差算出假增量"
+    assert fast.count("last_rx = rx_packets(dev)") >= 2, "跳过的轮次没更新 last_rx，增量会横跨两周期"
     assert "ipv4(dev) is None" in fast, "缺少没有地址这条快速通道"
     assert "NOIP_COOLDOWN_S" in fast, "没地址那条缺节流，真断网时会每轮打 udhcpc"
     assert "last_idx and idx != last_idx" in fast, "开机第一次观测就会误触发"
@@ -201,6 +257,9 @@ if __name__ == "__main__":
     check("rc 非零会报 ERROR", t_rc_is_loud)
     check("别名功能默认关且名字不超长", t_pinned_alias_disabled)
     check("续租会请求固定地址", t_requests_fixed_ip)
+    check("固定地址按网段各纠正一次", t_fixed_ip_corrected_per_subnet)
+    check("梯度兜底对 enx 不跑 USB WiFi 脚本", t_ladder_exhausted_skips_usb_wifi_script)
+    check("跳过的轮次也记收包数", t_skipped_round_still_records_rx)
     check("没有默认路由时会补跑 dhcp", t_no_gateway_is_acted_on)
     check("事件驱动的两条快速通道", t_fast_paths)
     check("USB 路径按网卡反查而非写死", t_usb_path_is_discovered)

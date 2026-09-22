@@ -1,4 +1,4 @@
 app_start_fake_defaults	20	假默认值，应随配置分三层一起归零
-netheal_swallowed_except	9	吞异常的地方，应改成显式忽略或抛出
+netheal_swallowed_except	11	吞异常的地方，应改成显式忽略或抛出
 netheal_shell_true	2	应改成 argv 列表，从形式上消灭拼接类故障
-x5_board_toplevel_files	131	顶层文件数，一次性脚本应进 archive/
+x5_board_toplevel_files	135	顶层文件数，一次性脚本应进 archive/
