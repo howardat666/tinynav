@@ -1,0 +1,12 @@
+# ESP32 当 USB 网卡时自动起来。按驱动匹配而不是按接口名：
+# 接口名是从 MAC 生成的(enx...)，换块板子就变，而驱动名不会。
+[Match]
+Driver=cdc_ncm
+
+[Network]
+# 🔴 DHCP 必须交给 board_netheal.py 的 udhcpc，这里不能再开一个客户端。
+# 2026-09-22 实测两个客户端各拿各的租约：udhcpc 拿 .42、networkd 拿 .102，
+# 路由表里并排挂两条默认路由(metric 0 和 100)，地址还会自己在两者之间跳。
+# 更要命的是手机热点上 udhcpc 会把地址钉到 10.140.21.9，networkd 另要一个把它盖掉。
+# 只让 networkd 负责把链路拉起来(仍然匹配、仍然 managed)，地址一概不碰。
+DHCP=no

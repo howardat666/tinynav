@@ -55,6 +55,26 @@ PC 侧 Ubuntu 的 `avahi-daemon` 本来就在跑。
 ⚠️ **安卓浏览器解析不了 `.local`**，所以手机看网页仍走热点上的固定地址 `10.140.21.9`。
 两个网络各用各的办法。
 
+### 🔴 两个 DHCP 客户端在抢同一块网卡
+
+查冷启动时间线时发现 `enxa4cb8fd549dc` 上跑着**两个** DHCP 客户端：
+
+```
+up≈63   udhcpc            bound: IP=192.168.19.42        ← board_netheal.py 的快速通道
+up≈81   systemd-networkd  DHCPv4 address 192.168.19.102  ← 25-usbnic.network 的 DHCP=yes
+```
+
+路由表里并排挂着两条默认路由（`metric 0` / `metric 100`）。后果：地址会自己跳（一小时内
+.42 → .102 → .125 → .42），而且**手机热点上 networkd 会把 udhcpc 用 `-r` 钉好的
+`10.140.21.9` 盖掉** —— 上次热点上先出现的 `10.140.21.248` 极可能就是它。
+
+**修法**：`DHCP=yes` → `DHCP=no`，保留 `[Match] Driver=cdc_ncm` 让 networkd 继续把链路
+拉起来、只是不碰地址。仓库副本 `tool/x5_board/25-usbnic.network`。
+
+🔑 **不用重启就验证了开机路径**：`networkctl reload` 时 networkd 会把地址整个撤掉，当场
+复现"开机那一刻没有地址"，实测 netheal 的「网卡没有地址，立即续租」**1 秒内补上**，
+而那正是开机走的同一条路。DNS 也还在（udhcpc 的 `default.script` 自己写 `resolv.conf`）。
+
 ### 🔴 复查网络代码查出的 5 个 bug
 
 | # | bug | 后果 | 状态 |
